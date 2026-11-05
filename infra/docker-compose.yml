@@ -58,6 +58,8 @@ services:
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
       AGENTS_FILE: /app/config/agents.yaml
       HUB_TOKEN: ${HUB_TOKEN}
+      BRIDGE_URL: ${BRIDGE_URL}
+      BRIDGE_TOKEN: ${BRIDGE_TOKEN}
     volumes:
       - ../config/agents.yaml:/app/config/agents.yaml:ro
       - ../hub/app:/app/app:ro

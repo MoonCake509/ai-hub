@@ -100,3 +100,31 @@
 **Ошибки**
 - Запрос с кириллицей в теле из git-bash отдавал `400 Missing required parameter: 'messages'`
   (curl подставлял cp1251, LiteLLM не мог разобрать JSON). Через UTF-8/ASCII — норма. Платформа ни при чём.
+
+## Этап 4. Адаптеры Codex и Qwen (мост с ноутбука) — 2026-11-06
+
+**Задача:** дергать Codex и Qwen через тот же API, что и модели. Оба живут только на ноутбуке:
+Codex на сервере не авторизован, Qwen — десктоп-приложение с CDP.
+
+**Сделано**
+- Ноутбук: `C:\Users\lavy\aihub-bridge\agent-poller.py` — тянет задания с хаба, локально запускает
+  `codex exec --json` или `node tools/qwen.js ask`, возвращает разобранный результат
+  (текст, usage, thread_id, elapsed). Автозапуск: `run-bridge.cmd` в Startup.
+- Хаб: очередь заданий и три эндпоинта — `POST /agents/{id}/run`, `GET /bridge/jobs`, `POST /bridge/result`.
+  Запуск агента = постановка в очередь + ожидание результата (долгий HTTP-запрос).
+- `config/agents.yaml`: у `codex` и `qwen-code` появилось поле `bridge_agent`.
+
+**Почему pull, а не прямой HTTP с сервера на ноутбук**
+Прямой вариант был реализован первым (`POST http://192.168.31.152:8010/run`) и не заработал:
+`bridge unreachable` — брандмауэр Windows на ноутбуке блокирует входящие (`BlockInbound`),
+а прав администратора на ноутбуке нет. Pull-схема не требует входящих портов вообще.
+
+**Как проверено**
+- `POST /agents/qwen-code/run` с ноутбука → `{"ok": true, "output": "HUB-QWEN-E2E", "elapsed": 23.13}`.
+- `POST /agents/codex/run` → `{"ok": true, "output": "HUB-CODEX-E2E", "elapsed": 39.91, "usage": {...}}`.
+- Очередь в `/health`: `queue`, `running`.
+
+**Ошибки**
+- Первый прогон codex дал `agent did not answer in time`: мост ходил со своим токеном (`brg-...`),
+  а хаб ждал `HUB_TOKEN` → 401 на `/bridge/jobs`. Исправлено переходом на единый токен.
+- Задание, поставленное до фикса, провисело в очереди и истекло по таймауту; повторный вызов прошёл за 39 с.

@@ -10,6 +10,7 @@ agents:
     transport: cli
     host: laptop
     status: verified
+    bridge_agent: codex
     command: "codex exec --json --skip-git-repo-check"
     notes: "бинарь вне PATH: AppData/Local/OpenAI/Codex/bin/*/codex.exe"
 
@@ -33,6 +34,7 @@ agents:
     transport: cdp
     host: laptop
     status: verified
+    bridge_agent: qwen
     notes: "только через CDP/DOM, API нет"
 
   - id: ollama-server

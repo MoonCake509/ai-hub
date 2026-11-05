@@ -50,3 +50,12 @@ cd /mnt/r/AI-Hub/infra && DOCKER_BUILDKIT=0 docker compose build hub
 
 WSL-IP меняется при перезапуске виртуалки. Проброс 4000/8000 обновляют задачи
 `AIHub-Net-OnLogon` и `AIHub-Net-Keep` (каждые 10 минут), лог — `C:\Users\user\aihub-net.log`.
+
+## Агент ноутбука (Codex, Qwen)
+
+- Скрипт: `C:\Users\lavy\aihub-bridge\agent-poller.py`, лог — `bridge.log` рядом.
+- Автозапуск: `aihub-bridge.cmd` в `Startup` (при входе пользователя). Задачи планировщика на ноутбуке
+  не создать — нет прав администратора.
+- Если задачи не выполняются: проверить лог, затем `hub.txt` (адрес хаба) и `token.txt` (должен совпадать
+  с `HUB_TOKEN` на сервере). Перезапуск: закрыть процесс `python.exe agent-poller.py` и запустить `run-bridge.cmd`.
+- Локальная отладка без хаба: `python bridge.py` поднимает HTTP на :8010 (только для проверки с ноутбука).

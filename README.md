@@ -89,3 +89,17 @@ curl -X POST http://192.168.31.95:8000/v1/chat/completions \
 ```
 
 Ключи провайдеров и `HUB_TOKEN` — только в `infra/.env` (в git не попадает).
+
+## Агенты
+
+- `GET /agents` — реестр (`config/agents.yaml`).
+- `POST /agents/{id}/run` `{"prompt": "...", "timeout": 240}` — запуск агента, ответ в общем формате:
+  `{"ok": true, "agent": "codex", "output": "...", "elapsed": 39.9}`.
+- Реализованы: `codex` и `qwen-code` (оба через мост на ноутбуке).
+
+Ноутбук не принимает входящие соединения (брандмауэр Windows, нет прав администратора),
+поэтому связь **pull**: агент ноутбука сам опрашивает `GET /bridge/jobs`, забирает задание,
+выполняет и отдаёт результат `POST /bridge/result`. Серверу не нужен доступ к портам ноутбука.
+
+Со стороны ноутбука: `C:\Users\lavy\aihub-bridge\agent-poller.py`, автозапуск —
+`run-bridge.cmd` в папке Startup. Конфиг: `hub.txt` (адрес хаба), `token.txt` (общий токен хаба).

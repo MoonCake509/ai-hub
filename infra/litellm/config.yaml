@@ -1,0 +1,19 @@
+# LiteLLM gateway — карта моделей.
+# Ключи провайдеров подставляются из окружения контейнера (см. infra/.env).
+# Провайдеры добавляются по мере подключения; сейчас объявлена только заглушка,
+# чтобы шлюз поднимался и отвечал на /health без внешних вызовов.
+
+model_list:
+  - model_name: healthcheck-stub
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_base: https://router.cheap/v1
+      api_key: os.environ/ROUTER_CHEAP_KEY
+
+litellm_settings:
+  drop_params: true
+  request_timeout: 120
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL

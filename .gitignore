@@ -1,0 +1,14 @@
+# секреты
+infra/.env
+*.env
+!*.env.example
+
+# данные контейнеров
+infra/data/
+data/
+
+# прочее
+*.log
+__pycache__/
+.venv/
+node_modules/

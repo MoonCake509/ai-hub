@@ -1,18 +1,64 @@
-# LiteLLM gateway — карта моделей.
-# Ключи провайдеров подставляются из окружения контейнера (см. infra/.env).
-# Провайдеры добавляются по мере подключения; сейчас объявлена только заглушка,
-# чтобы шлюз поднимался и отвечал на /health без внешних вызовов.
+# LiteLLM gateway — карта моделей AI-Hub.
+# Ключи провайдеров берутся из окружения контейнера (infra/.env), в репозитории их нет.
+#
+# router.cheap  — OpenAI-совместимый роутер (76 моделей)
+# claudehub     — OpenAI-совместимый шлюз (46 моделей)
+# Вызов: POST /v1/chat/completions {"model": "router.cheap/gpt-6.1-sol", ...}
 
 model_list:
-  - model_name: healthcheck-stub
+  # --- wildcard: любая модель провайдера без переписывания конфига ---
+  - model_name: "router.cheap/*"
     litellm_params:
-      model: openai/gpt-4o-mini
-      api_base: https://router.cheap/v1
+      model: "openai/*"
+      api_base: os.environ/ROUTER_CHEAP_BASE
+      api_key: os.environ/ROUTER_CHEAP_KEY
+
+  - model_name: "claudehub/*"
+    litellm_params:
+      model: "openai/*"
+      api_base: os.environ/CLAUDEHUB_BASE
+      api_key: os.environ/CLAUDEHUB_KEY
+
+  # --- короткие алиасы для частых моделей ---
+  - model_name: gpt-6.1-sol
+    litellm_params:
+      model: openai/gpt-6.1-sol
+      api_base: os.environ/ROUTER_CHEAP_BASE
+      api_key: os.environ/ROUTER_CHEAP_KEY
+
+  - model_name: deepseek-v4.1-flash
+    litellm_params:
+      model: openai/deepseek-v4.1-flash-1017
+      api_base: os.environ/ROUTER_CHEAP_BASE
+      api_key: os.environ/ROUTER_CHEAP_KEY
+
+  - model_name: qwen3.8-max
+    litellm_params:
+      model: openai/qwen3.8-max
+      api_base: os.environ/ROUTER_CHEAP_BASE
+      api_key: os.environ/ROUTER_CHEAP_KEY
+
+  - model_name: claude-opus-5
+    litellm_params:
+      model: openai/claude-opus-5
+      api_base: os.environ/CLAUDEHUB_BASE
+      api_key: os.environ/CLAUDEHUB_KEY
+
+  - model_name: claude-sonnet-5
+    litellm_params:
+      model: openai/claude-sonnet-5
+      api_base: os.environ/CLAUDEHUB_BASE
+      api_key: os.environ/CLAUDEHUB_KEY
+
+  - model_name: gemini-4-argon
+    litellm_params:
+      model: openai/gemini-4-argon
+      api_base: os.environ/ROUTER_CHEAP_BASE
       api_key: os.environ/ROUTER_CHEAP_KEY
 
 litellm_settings:
   drop_params: true
-  request_timeout: 120
+  request_timeout: 600
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY

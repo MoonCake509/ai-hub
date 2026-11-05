@@ -10,12 +10,13 @@ from pathlib import Path
 
 import httpx
 import yaml
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 
 VERSION = "0.1.0"
 LITELLM_URL = os.environ.get("LITELLM_URL", "http://litellm:4000").rstrip("/")
 MASTER_KEY = os.environ.get("LITELLM_MASTER_KEY", "")
+HUB_TOKEN = os.environ.get("HUB_TOKEN", "")
 AGENTS_FILE = Path(os.environ.get("AGENTS_FILE", "/app/config/agents.yaml"))
 
 app = FastAPI(title="AI-Hub", version=VERSION)
@@ -27,6 +28,14 @@ def load_agents() -> dict:
     with AGENTS_FILE.open(encoding="utf-8") as fh:
         return yaml.safe_load(fh) or {"agents": []}
 
+
+def require_token(request: Request) -> None:
+    """Если HUB_TOKEN задан, внешние вызовы обязаны предъявить его."""
+    if not HUB_TOKEN:
+        return
+    header = request.headers.get("authorization", "")
+    if header != f"Bearer {HUB_TOKEN}":
+        raise HTTPException(status_code=401, detail="invalid or missing hub token")
 
 @app.get("/health")
 def health() -> dict:
@@ -55,7 +64,7 @@ def _llm_headers() -> dict:
     return headers
 
 
-@app.get("/models")
+@app.get("/models", dependencies=[Depends(require_token)])
 async def models() -> JSONResponse:
     async with httpx.AsyncClient(timeout=30) as client:
         try:
@@ -65,7 +74,7 @@ async def models() -> JSONResponse:
     return JSONResponse(status_code=resp.status_code, content=resp.json())
 
 
-@app.post("/v1/chat/completions")
+@app.post("/v1/chat/completions", dependencies=[Depends(require_token)])
 async def chat(request: Request) -> Response:
     payload = await request.body()
     async with httpx.AsyncClient(timeout=300) as client:

@@ -79,3 +79,24 @@
   Решение: задача планировщика `AIHub-Keepalive` (`C:\Users\user\bin\aihub-keepalive.cmd`) запускает
   `wsl -d AIHub -u root -- bash -lc "exec sleep 2147483647"` и держит сессию.
   Проверка: `/proc/uptime` 27 с → 127 с, контейнеры `Up About a minute`, оба health-эндпоинта 200.
+
+## Этап 3. Реальные модели и авторизация — 2026-11-06
+
+**Задача:** подключить провайдеров к шлюзу и закрыть ядро токеном.
+
+**Сделано**
+- В `infra/litellm/config.yaml` два провайдера: `router.cheap` и `claudehub`, по схеме wildcard
+  (`model_name: router.cheap/*`, `model: openai/*`) плюс 6 коротких алиасов.
+- Ключи и базовые URL — в `infra/.env` (`ROUTER_CHEAP_KEY`, `CLAUDEHUB_KEY`, `*_BASE`), прокинуты в контейнер через compose.
+- `hub`: проверка `HUB_TOKEN` для `/models` и `/v1/*`; `/health` и `/agents` открыты.
+- Код `hub/app` смонтирован в контейнер (`../hub/app:/app/app:ro`) — правки применяются рестартом, без пересборки.
+
+**Как проверено**
+- `GET /v1/models` → 440 записей, алиасы на месте.
+- `deepseek-v4.1-flash` через `:8000` → ответ «Да»; `router.cheap/gpt-6.1-sol` → `AI-HUB-OK`; `claudehub/claude-opus-5` → `HUB-CLAUDE-OK`.
+- С ноутбука по LAN: `router.cheap/qwen3.8-max` через `:8000` → `LAN-HUB-OK`.
+- Авторизация: без токена `401`, с токеном `200`, `/agents` открыт.
+
+**Ошибки**
+- Запрос с кириллицей в теле из git-bash отдавал `400 Missing required parameter: 'messages'`
+  (curl подставлял cp1251, LiteLLM не мог разобрать JSON). Через UTF-8/ASCII — норма. Платформа ни при чём.

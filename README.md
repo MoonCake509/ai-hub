@@ -72,3 +72,20 @@
 - `http://192.168.31.95:8000/agents` — реестр агентов (`config/agents.yaml`).
 - `http://192.168.31.95:8000/models` — прокси к LiteLLM `/v1/models`.
 - `http://192.168.31.95:4000` — LiteLLM: `/health/liveliness`, `/health/readiness`, `/v1/*`.
+
+## Модели (LiteLLM)
+
+Два OpenAI-совместимых провайдера подключены в `infra/litellm/config.yaml`:
+
+- `router.cheap` — 76 моделей, доступ через префикс: `router.cheap/gpt-6.1-sol`.
+- `claudehub` — 46 моделей: `claudehub/claude-opus-5`.
+
+Алиасы: `gpt-6.1-sol`, `deepseek-v4.1-flash`, `qwen3.8-max`, `claude-opus-5`, `claude-sonnet-5`, `gemini-4-argon`.
+
+```
+curl -X POST http://192.168.31.95:8000/v1/chat/completions \
+  -H "Authorization: Bearer $HUB_TOKEN" -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"ping"}]}'
+```
+
+Ключи провайдеров и `HUB_TOKEN` — только в `infra/.env` (в git не попадает).

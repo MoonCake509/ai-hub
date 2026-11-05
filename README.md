@@ -54,7 +54,14 @@
 
 - [x] WSL2 + Ubuntu 24.04 на основном диске
 - [x] Docker Engine + Compose, проверено `docker run hello-world`
-- [ ] LiteLLM gateway
+- [x] LiteLLM gateway (порт 4000, Postgres подключён)
 - [ ] hub-agent
 - [ ] Веб-UI
 - [ ] Адаптеры агентов (Codex, OpenClaw, Hermes, Qwen)
+
+## Стек (infra/)
+
+- `infra/docker-compose.yml` — `postgres:16-alpine` + `ghcr.io/berriai/litellm:main-stable`.
+- `infra/.env` — секреты (в git не попадает), генерируются локально.
+- `infra/litellm/config.yaml` — карта моделей, подключается в контейнер.
+- Адрес шлюза: `http://192.168.31.95:4000` (LAN). Проверка: `/health/liveliness`, `/health/readiness`.

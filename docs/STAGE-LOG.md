@@ -26,3 +26,31 @@
 
 **Открыто**
 - Прямой канал Tailscale между ноутбуком и сервером не устанавливается (релей ~150 мс). Внутри дома используется LAN 192.168.31.95.
+
+## Этап 1. LiteLLM + Postgres (2026-11-06)
+
+**Задача:** поднять шлюз LiteLLM с базой, доступный с ноутбука.
+
+**Сделано**
+- `infra/docker-compose.yml`: `postgres:16-alpine` + `ghcr.io/berriai/litellm:main-stable`.
+- Секреты в `infra/.env` (не в git): пароль Postgres и мастер-ключ LiteLLM сгенерированы локально.
+- Данные Postgres — в именованном томе `pgdata` (bind-mount на `/mnt/r` не работает, см. ошибки).
+- Порт 4000 проброшен на Windows через `portproxy` → WSL IP; обновление IP автоматизировано
+  задачами планировщика `AIHub-Net-OnLogon` и `AIHub-Net-Keep` (каждые 10 минут).
+
+**Как проверено**
+- `docker compose ps` — оба контейнера Up, `postgres` healthy.
+- `curl 127.0.0.1:4000/health/liveliness` → `"I'm alive!"`, код 200.
+- `curl 127.0.0.1:4000/health/readiness` → `{"status":"healthy","db":"connected"}`, код 200.
+- С ноутбука: `curl http://192.168.31.95:4000/health/liveliness` → 200.
+
+**Ошибки и обходы**
+- `docker pull` падал с `tls: bad record MAC` из-за USB Wi-Fi адаптера сервера.
+  Обход: маршруты AWS/Cloudflare/GitHub мимо happ через роутер, DNS в Ubuntu на роутер,
+  отключён IPv6, `max-concurrent-downloads: 1`, до 20 повторов. LiteLLM скачался с 6-й попытки.
+- Postgres не инициализировался на bind-mount `/mnt/r/...`: `could not change permissions of directory`.
+  Решение: именованный том `pgdata` (живёт в ext4 внутри `R:\WSL\AIHub`).
+- LiteLLM стартует ~90 секунд — прогоняет 220 prisma-миграций при первом запуске.
+
+**Открыто**
+- Проводной Ethernet на сервере решит проблему обрывов радикально (сейчас кабеля нет).

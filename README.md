@@ -57,7 +57,9 @@
 - [x] LiteLLM gateway (порт 4000, Postgres подключён)
 - [x] hub-agent (FastAPI, порт 8000)
 - [ ] Веб-UI
-- [ ] Адаптеры агентов (Codex, OpenClaw, Hermes, Qwen)
+- [x] Адаптеры Codex и Qwen (pull-воркеры, ноутбук + сервер)
+- [x] Асинхронные задания + история прогонов (Postgres)
+- [ ] Адаптеры OpenClaw и Hermes
 
 ## Стек (infra/)
 
@@ -93,13 +95,41 @@ curl -X POST http://192.168.31.95:8000/v1/chat/completions \
 ## Агенты
 
 - `GET /agents` — реестр (`config/agents.yaml`).
-- `POST /agents/{id}/run` `{"prompt": "...", "timeout": 240}` — запуск агента, ответ в общем формате:
-  `{"ok": true, "agent": "codex", "output": "...", "elapsed": 39.9}`.
-- Реализованы: `codex` и `qwen-code` (оба через мост на ноутбуке).
+- Реализованы: `codex` (ноутбук), `qwen-code` (Qwen Desktop на ноутбуке), `qwen-server` (Qwen Desktop на сервере, CDP 9333).
 
-Ноутбук не принимает входящие соединения (брандмауэр Windows, нет прав администратора),
-поэтому связь **pull**: агент ноутбука сам опрашивает `GET /bridge/jobs`, забирает задание,
-выполняет и отдаёт результат `POST /bridge/result`. Серверу не нужен доступ к портам ноутбука.
+Связь **pull**: воркер сам опрашивает `GET /bridge/jobs?worker=<имя>&agents=<список>`,
+забирает только те задания, которые умеет обслуживать, выполняет и отдаёт результат
+`POST /bridge/result`. Входящие порты на ноутбуке и серверном хосте не нужны.
 
-Со стороны ноутбука: `C:\Users\lavy\aihub-bridge\agent-poller.py`, автозапуск —
-`run-bridge.cmd` в папке Startup. Конфиг: `hub.txt` (адрес хаба), `token.txt` (общий токен хаба).
+- Ноутбук: `C:\Users\lavy\aihub-bridge\worker_v2.py`, автозапуск — `run-bridge.cmd` (Startup),
+  конфиг `hub.txt`, `token.txt`.
+- Серверный хост: `C:\Users\user\aihub-worker\worker_v2.py`, задача планировщика `AIHub-Worker`,
+  обслуживает `qwen-server` через `node qwen.js` и CDP-порт 9333.
+
+## Задания (async)
+
+Запуск асинхронный: долгий HTTP не держится, обрыв связи не теряет результат.
+
+```
+POST /agents/{id}/run
+  {"prompt": "...", "timeout": 300, "idempotency_key": "любая-строка"}
+  -> 202 {"job_id": "...", "status": "queued", "created": true}
+```
+
+- `GET /jobs/{id}` — состояние, попытки, вывод: `queued | running | succeeded | failed | cancelled | timeout | unknown`.
+- `GET /jobs?limit=50&status=` — история прогонов (Postgres, схема `aihub`).
+- `POST /jobs/{id}/cancel` — отмена (queued → cancelled; running помечается, результат отбрасывается).
+
+Гарантии:
+
+- **Идемпотентность.** Тот же `idempotency_key` с тем же телом возвращает тот же `job_id`
+  (`created: false`); с другим телом — `409`.
+- **Аренда.** Воркер берёт задание в аренду (`LEASE_SECONDS`, по умолчанию 300) и продлевает её
+  heartbeat-ом. Если связь пропала дольше аренды, попытка и задание становятся `unknown`
+  с `needs_reconcile: true` — **автоматического повтора нет** (агент мог успеть выполнить работу).
+- **Outbox.** Воркер сначала пишет результат в локальный `outbox/`, затем досылает его до
+  подтверждения хаба; после перезапуска недосланное отправляется повторно.
+- **Рестарт хаба** не теряет задания: очередь и история в Postgres.
+
+Таблицы: `aihub.jobs`, `aihub.job_attempts`, `aihub.job_events` (события `created`, `leased`,
+`lease_expired`, `finished`, `cancelled`).

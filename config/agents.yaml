@@ -60,6 +60,6 @@ agents:
     name: Qwen Desktop (сервер)
     transport: cdp
     host: server
-    status: unverified
+    status: verified
     bridge_agent: qwen-server
     notes: "CDP 9333, node qwen.js; требует авторизации в приложении"

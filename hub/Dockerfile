@@ -5,8 +5,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# Зависимости ставятся из локальных колёс: pip по Wi-Fi рвёт TLS (bad record MAC).
+COPY wheels ./wheels
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --no-index --find-links=./wheels -r requirements.txt
 
 COPY app ./app
 

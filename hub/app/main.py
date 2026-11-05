@@ -1,18 +1,18 @@
-"""AI-Hub core agent.
+"""AI-Hub core agent (v0.3).
 
-Возможности:
-  * реестр агентов (/agents) из config/agents.yaml;
-  * прокси к LiteLLM (/models, /v1/chat/completions);
-  * запуск агентов на удалённых хостах через pull-мост (/agents/{id}/run →
-    /bridge/jobs + /bridge/result). Pull выбран потому, что ноутбук с Codex
-    не принимает входящие соединения: брандмауэр блокирует вход, прав админа нет.
+Асинхронная модель заданий по ревью архитектора (ARCH-001):
+  * POST /agents/{id}/run  -> 202 + job_id, задание в Postgres, без удержания HTTP;
+  * GET  /jobs/{id}        -> статус, попытки, результат;
+  * POST /jobs/{id}/cancel -> отмена очереди или запрос отмены исполнения;
+  * /bridge/*              -> pull-протокол воркеров: аренда, heartbeat, результат.
+Автоматического перезапуска после потери аренды нет: попытка помечается unknown.
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
-import time
-import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
@@ -20,16 +20,38 @@ import yaml
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 
-VERSION = "0.2.0"
+from . import db
+
+VERSION = "0.3.0"
 LITELLM_URL = os.environ.get("LITELLM_URL", "http://litellm:4000").rstrip("/")
 MASTER_KEY = os.environ.get("LITELLM_MASTER_KEY", "")
 HUB_TOKEN = os.environ.get("HUB_TOKEN", "")
 AGENTS_FILE = Path(os.environ.get("AGENTS_FILE", "/app/config/agents.yaml"))
+LEASE_SECONDS = int(os.environ.get("LEASE_SECONDS", "300"))
 
-app = FastAPI(title="AI-Hub", version=VERSION)
 
-JOBS: dict[str, dict] = {}
-JOB_EVENTS: dict[str, asyncio.Event] = {}
+async def _sweeper() -> None:
+    while True:
+        await asyncio.sleep(60)
+        try:
+            expired = await asyncio.to_thread(db.expire_leases)
+            if expired:
+                print(f"expired leases: {expired}", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"lease sweeper error: {exc}", flush=True)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await asyncio.to_thread(db.init)
+    task = asyncio.create_task(_sweeper())
+    try:
+        yield
+    finally:
+        task.cancel()
+
+
+app = FastAPI(title="AI-Hub", version=VERSION, lifespan=lifespan)
 
 
 def load_agents() -> dict:
@@ -47,7 +69,6 @@ def find_agent(agent_id: str) -> dict | None:
 
 
 def require_token(request: Request) -> None:
-    """Если HUB_TOKEN задан, вызовы обязаны предъявить его."""
     if not HUB_TOKEN:
         return
     if request.headers.get("authorization", "") != f"Bearer {HUB_TOKEN}":
@@ -55,14 +76,13 @@ def require_token(request: Request) -> None:
 
 
 @app.get("/health")
-def health() -> dict:
-    return {
-        "status": "ok",
-        "service": "hub-agent",
-        "version": VERSION,
-        "queue": sum(1 for j in JOBS.values() if j["status"] == "queued"),
-        "running": sum(1 for j in JOBS.values() if j["status"] == "running"),
-    }
+async def health() -> dict:
+    try:
+        await asyncio.to_thread(db.list_jobs, None, 1)
+        db_ok = True
+    except Exception as exc:  # noqa: BLE001
+        db_ok = str(exc)[:120]
+    return {"status": "ok", "service": "hub-agent", "version": VERSION, "db": db_ok}
 
 
 @app.get("/agents")
@@ -92,62 +112,89 @@ async def run_agent(agent_id: str, request: Request) -> JSONResponse:
     prompt = (payload.get("prompt") or "").strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="prompt is required")
-    timeout = int(payload.get("timeout") or 600)
+    timeout_s = int(payload.get("timeout") or 600)
+    idem = payload.get("idempotency_key") or request.headers.get("idempotency-key")
+    prompt_sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
 
-    job_id = uuid.uuid4().hex
-    JOBS[job_id] = {
-        "agent": bridge_agent,
-        "prompt": prompt,
-        "timeout": timeout,
-        "status": "queued",
-        "created": time.time(),
-    }
-    event = asyncio.Event()
-    JOB_EVENTS[job_id] = event
     try:
-        await asyncio.wait_for(event.wait(), timeout=timeout + 30)
-    except asyncio.TimeoutError:
-        JOBS[job_id]["status"] = "timeout"
-        raise HTTPException(status_code=504, detail="agent did not answer in time") from None
-    finally:
-        JOB_EVENTS.pop(job_id, None)
+        job, created = await asyncio.to_thread(
+            db.create_job, bridge_agent, prompt, prompt_sha, timeout_s, idem or None)
+    except ValueError:
+        raise HTTPException(status_code=409, detail="idempotency_key already used with another payload") from None
 
-    result = JOBS.pop(job_id, {}).get("result", {})
-    result.setdefault("agent", agent_id)
-    return JSONResponse(status_code=200, content=result)
+    return JSONResponse(status_code=202, content={
+        "job_id": job["id"],
+        "status": job["status"],
+        "created": created,
+        "agent": agent_id,
+    })
+
+
+@app.get("/jobs", dependencies=[Depends(require_token)])
+async def jobs(status: str | None = None, limit: int = 50) -> dict:
+    items = await asyncio.to_thread(db.list_jobs, status, min(limit, 200))
+    return {"count": len(items), "jobs": items}
+
+
+@app.get("/jobs/{job_id}", dependencies=[Depends(require_token)])
+async def job(job_id: str) -> dict:
+    data = await asyncio.to_thread(db.get_job, job_id)
+    if not data:
+        raise HTTPException(status_code=404, detail="job not found")
+    return data
+
+
+@app.post("/jobs/{job_id}/cancel", dependencies=[Depends(require_token)])
+async def cancel(job_id: str) -> dict:
+    status = await asyncio.to_thread(db.cancel_job, job_id)
+    if status == "not_found":
+        raise HTTPException(status_code=404, detail="job not found")
+    return {"job_id": job_id, "status": status}
 
 
 @app.get("/bridge/jobs", dependencies=[Depends(require_token)])
-def bridge_jobs(worker: str = "") -> JSONResponse:
-    """Выдаёт одно задание воркеру (pull) или пустой ответ."""
-    for job_id, job in JOBS.items():
-        if job["status"] == "queued":
-            job["status"] = "running"
-            job["worker"] = worker
-            job["started"] = time.time()
-            return JSONResponse({
-                "id": job_id,
-                "agent": job["agent"],
-                "prompt": job["prompt"],
-                "timeout": job["timeout"],
-            })
-    return JSONResponse({"job": None})
+async def bridge_jobs(worker: str = "", agents: str = "") -> JSONResponse:
+    leased = await asyncio.to_thread(db.lease_job, worker or "unknown", LEASE_SECONDS, agents)
+    if not leased:
+        return JSONResponse({"job": None})
+    return JSONResponse({
+        "id": leased["id"],
+        "attempt_id": leased["attempt_id"],
+        "agent": leased["agent_id"],
+        "prompt": leased["prompt"],
+        "timeout": leased["timeout_s"],
+        "lease_seconds": LEASE_SECONDS,
+    })
+
+
+@app.post("/bridge/heartbeat", dependencies=[Depends(require_token)])
+async def bridge_heartbeat(request: Request) -> dict:
+    payload = await request.json()
+    attempt_id = payload.get("attempt_id")
+    if not attempt_id:
+        raise HTTPException(status_code=400, detail="attempt_id is required")
+    alive = await asyncio.to_thread(db.heartbeat, attempt_id, LEASE_SECONDS)
+    return {"ok": alive}
 
 
 @app.post("/bridge/result", dependencies=[Depends(require_token)])
 async def bridge_result(request: Request) -> dict:
     payload = await request.json()
-    job_id = payload.get("job_id")
-    job = JOBS.get(job_id or "")
-    if job is None:
-        raise HTTPException(status_code=404, detail="unknown job")
-    job["result"] = payload
-    job["status"] = "done"
-    job["finished"] = time.time()
-    event = JOB_EVENTS.get(job_id)
-    if event is not None:
-        event.set()
-    return {"ok": True}
+    attempt_id = payload.get("attempt_id")
+    if not attempt_id:
+        raise HTTPException(status_code=400, detail="attempt_id is required")
+    outcome = await asyncio.to_thread(
+        db.finish_attempt,
+        attempt_id,
+        bool(payload.get("ok")),
+        payload.get("output"),
+        payload.get("error"),
+        payload.get("usage") or {},
+        payload.get("elapsed"),
+    )
+    if outcome == "not_found":
+        raise HTTPException(status_code=404, detail="unknown attempt")
+    return {"ok": outcome in ("applied", "duplicate"), "outcome": outcome}
 
 
 def _llm_headers() -> dict:

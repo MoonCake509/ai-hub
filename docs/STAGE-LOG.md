@@ -154,3 +154,33 @@ Codex на сервере не авторизован, Qwen — десктоп-�
 **Проверить после входа**
 - `powershell -Command "$env:QWEN_CDP_PORT=9333; node C:\Users\user\bin\qwen.js read"` → текст чата.
 - `POST /agents/qwen-server/run` → ответ агента.
+
+## Этап 6 — асинхронные задания и история прогонов (2026-11-06)
+
+Сделано по ARCH-001 с правками ревью архитектора (`docs/proposals/ARCH-001-review-codex.md`).
+
+- Postgres-слой `hub/app/db.py`: схема `aihub`, таблицы `jobs`, `job_attempts`, `job_events`;
+  клиент `pg8000` (без SQLAlchemy — образ собирается офлайн из колёс).
+- `hub/app/main.py` v0.3.0: `POST /agents/{id}/run` → `202 + job_id`; `GET /jobs/{id}`;
+  `GET /jobs`; `POST /jobs/{id}/cancel`; `/bridge/jobs|heartbeat|result`.
+- Аренда с heartbeat, истёкшая аренда → `unknown` + `needs_reconcile`, без автоповтора.
+- Идемпотентность по `Idempotency-Key`: повтор с тем же телом → тот же job, с другим → `409`.
+- Воркеры v2 (`worker_v2.py`) на ноутбуке и на серверном хосте: аренда, heartbeat-поток,
+  локальный `outbox` с досылкой после перезапуска.
+- Фильтр по возможностям: `GET /bridge/jobs?worker=X&agents=codex,qwen` — иначе серверный воркер
+  забирал задания Codex и падал с `agent 'codex' is not served by this worker`.
+- Зависимости ставятся из локальных колёс (`hub/wheels`): `pip` по Wi-Fi рвёт TLS.
+- Qwen Desktop на сервере авторизован; CDP-таргет чата — тип `webview` (`https://chat.qwen.ai/`),
+  а не `page` — `findTarget()` расширен; `qwen-server` переведён в `verified`.
+
+Проверено вживую:
+
+| Сценарий | Результат |
+|---|---|
+| Codex через хаб | `succeeded`, `FINAL-CODEX-V3`, worker `DESKTOP-BHMJN55` |
+| Qwen на сервере через хаб | `succeeded`, `FINAL-QWEN-V3`, worker `WIN-V76QC2G60Q1-host` |
+| Повтор с тем же `idempotency_key` | тот же `job_id`, `created: false` |
+| Тот же ключ, другой промпт | `409 idempotency_key already used with another payload` |
+| Отмена в очереди | `cancelled`, попыток 0 |
+| Рестарт хаба с заданием в очереди | задание осталось `queued` |
+| Аренда 20 с без heartbeat | `unknown`, `needs_reconcile: true`, попыток 1, повтора нет |

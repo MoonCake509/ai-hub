@@ -55,7 +55,7 @@
 - [x] WSL2 + Ubuntu 24.04 на основном диске
 - [x] Docker Engine + Compose, проверено `docker run hello-world`
 - [x] LiteLLM gateway (порт 4000, Postgres подключён)
-- [ ] hub-agent
+- [x] hub-agent (FastAPI, порт 8000)
 - [ ] Веб-UI
 - [ ] Адаптеры агентов (Codex, OpenClaw, Hermes, Qwen)
 
@@ -65,3 +65,10 @@
 - `infra/.env` — секреты (в git не попадает), генерируются локально.
 - `infra/litellm/config.yaml` — карта моделей, подключается в контейнер.
 - Адрес шлюза: `http://192.168.31.95:4000` (LAN). Проверка: `/health/liveliness`, `/health/readiness`.
+
+## Эндпоинты
+
+- `http://192.168.31.95:8000/health` — живость ядра.
+- `http://192.168.31.95:8000/agents` — реестр агентов (`config/agents.yaml`).
+- `http://192.168.31.95:8000/models` — прокси к LiteLLM `/v1/models`.
+- `http://192.168.31.95:4000` — LiteLLM: `/health/liveliness`, `/health/readiness`, `/v1/*`.

@@ -54,3 +54,28 @@
 
 **Открыто**
 - Проводной Ethernet на сервере решит проблему обрывов радикально (сейчас кабеля нет).
+
+## Этап 2. hub-agent (ядро) — 2026-11-06
+
+**Задача:** ядро платформы с реестром агентов и проксированием в LiteLLM.
+
+**Сделано**
+- `hub/app/main.py` — FastAPI: `/health`, `/agents`, `/agents/{id}`, `/models`, `/v1/chat/completions` (passthrough в LiteLLM с мастер-ключом).
+- `config/agents.yaml` — реестр из 7 агентов с полями id/name/transport/host/status.
+- `hub/Dockerfile` (python:3.12-slim + fastapi/uvicorn/httpx/pyyaml), сервис `hub` в `infra/docker-compose.yml`, порт 8000.
+- Добавлен `AIHub-Keepalive`: держит WSL-дистрибутив запущенным (см. ошибки).
+
+**Как проверено**
+- `curl 127.0.0.1:8000/health` → `{"status":"ok","service":"hub-agent","version":"0.1.0"}`.
+- `curl 127.0.0.1:8000/agents` → `count=7`.
+- `curl 127.0.0.1:8000/models` → ответ LiteLLM (`healthcheck-stub`), значит прокси и мастер-ключ работают.
+- С ноутбука: `http://192.168.31.95:8000/health` → 200, `/models` → 200, `:4000/health/readiness` → `db: connected`.
+
+**Ошибки и обходы**
+- Сборка образа падала на шаге `WORKDIR` с `tls: bad record MAC` (BuildKit тянет метаданные базового образа через нестабильный Wi-Fi).
+  Обход: сначала `docker pull python:3.12-slim` с повторами, затем сборка классическим билдером `DOCKER_BUILDKIT=0`.
+- **Контейнеры перезапускались каждые 1–2 минуты.** Причина: WSL-виртуалка завершалась сразу после выхода последнего процесса,
+  поэтому каждый `wsl.exe`-вызов поднимал её заново (uptime 25–27 с), а Docker пересоздавал контейнеры.
+  Решение: задача планировщика `AIHub-Keepalive` (`C:\Users\user\bin\aihub-keepalive.cmd`) запускает
+  `wsl -d AIHub -u root -- bash -lc "exec sleep 2147483647"` и держит сессию.
+  Проверка: `/proc/uptime` 27 с → 127 с, контейнеры `Up About a minute`, оба health-эндпоинта 200.

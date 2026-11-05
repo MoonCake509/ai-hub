@@ -29,3 +29,24 @@
 - Tailscale: сервер ↔ ноутбук идёт через DERP-релей (~150 мс), прямой канал не устанавливается,
   хотя LAN-адрес сервера (`192.168.31.95:41641`) ноутбуку известен. Для работы внутри дома
   использовать LAN, Tailscale — только для внешнего доступа.
+
+## WSL и контейнеры
+
+- Дистрибутив должен работать постоянно, иначе Docker перезапускает контейнеры при каждом обращении.
+  Держит его задача `AIHub-Keepalive` (при входе пользователя): `aihub-keepalive.cmd` → `wsl ... exec sleep 2147483647`.
+  Проверка: `wsl -d AIHub -u root -- cat /proc/uptime` — uptime должен расти, а не быть ~30 с.
+- Если задача не запущена: `schtasks /run /tn AIHub-Keepalive`, состояние — `schtasks /query /tn AIHub-Keepalive /v /fo list`.
+
+## Сборка образов
+
+BuildKit на этом канале рвёт соединение (`tls: bad record MAC`). Сборка:
+
+```
+docker pull python:3.12-slim     # с повторами
+cd /mnt/r/AI-Hub/infra && DOCKER_BUILDKIT=0 docker compose build hub
+```
+
+## Проброс портов в WSL
+
+WSL-IP меняется при перезапуске виртуалки. Проброс 4000/8000 обновляют задачи
+`AIHub-Net-OnLogon` и `AIHub-Net-Keep` (каждые 10 минут), лог — `C:\Users\user\aihub-net.log`.

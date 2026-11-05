@@ -1,0 +1,55 @@
+# Реестр агентов AI-Hub.
+# id       — стабильный идентификатор для API
+# transport— способ обращения: cli | http | cdp | acp
+# host     — где живёт агент: server | laptop
+# status   — verified | unverified | planned
+
+agents:
+  - id: codex
+    name: Codex CLI
+    transport: cli
+    host: laptop
+    status: verified
+    command: "codex exec --json --skip-git-repo-check"
+    notes: "бинарь вне PATH: AppData/Local/OpenAI/Codex/bin/*/codex.exe"
+
+  - id: openclaw-laptop
+    name: OpenClaw (ноутбук)
+    transport: cli
+    host: laptop
+    status: verified
+    command: "openclaw agent -m <prompt> --json"
+    notes: "gateway только на loopback, ходим через CLI"
+
+  - id: hermes-laptop
+    name: Hermes (ноутбук)
+    transport: http
+    host: laptop
+    status: verified
+    notes: "CLI + локальный HTTP-эндпоинт"
+
+  - id: qwen-code
+    name: Qwen Desktop
+    transport: cdp
+    host: laptop
+    status: verified
+    notes: "только через CDP/DOM, API нет"
+
+  - id: ollama-server
+    name: Ollama (сервер)
+    transport: http
+    host: server
+    status: unverified
+    notes: "не проверялся, сервер только поднят"
+
+  - id: hermes-server
+    name: Hermes (сервер)
+    transport: cli
+    host: server
+    status: unverified
+
+  - id: openclaw-server
+    name: OpenClaw (сервер)
+    transport: cli
+    host: server
+    status: unverified

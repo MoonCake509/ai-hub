@@ -40,6 +40,26 @@ services:
         max-size: "10m"
         max-file: "3"
 
+
+  hub:
+    build: ../hub
+    container_name: aihub-hub
+    restart: unless-stopped
+    depends_on:
+      - litellm
+    ports:
+      - "0.0.0.0:8000:8000"
+    environment:
+      LITELLM_URL: http://litellm:4000
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+      AGENTS_FILE: /app/config/agents.yaml
+    volumes:
+      - ../config/agents.yaml:/app/config/agents.yaml:ro
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 volumes:
   pgdata:
     driver: local

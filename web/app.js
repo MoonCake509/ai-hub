@@ -49,15 +49,35 @@ $('#token-btn').onclick = () => openGate('');
 $('#token-cancel').onclick = () => { if (token) closeGate(); };
 $('#token-save').onclick = async () => {
   const val = $('#token-input').value.trim();
-  if (!val) return;
+  const err = $('#token-err');
+  const status = $('#token-status');
+  err.textContent = '';
+  if (!val) { err.textContent = 'Поле пустое.'; return; }
   token = val;
+  $('#token-save').disabled = true;
+  status.className = 'msg';
+  status.textContent = 'Проверяю токен…';
   try {
-    await api('/health');
+    const health = await api('/health');
+    await api('/jobs?limit=1');            // проверка токена: /jobs защищён
     localStorage.setItem(TOKEN_KEY, token);
+    status.className = 'msg ok';
+    status.textContent = 'Ок, загружаю данные…';
     closeGate();
-    boot();
+    await boot();
   } catch (e) {
-    $('#token-err').textContent = e.message === 'unauthorized' ? 'Неверный токен.' : e.message;
+    token = '';
+    if (e.message === 'unauthorized' || /401/.test(e.message)) {
+      err.textContent = 'Неверный токен. Скопируй значение HUB_TOKEN целиком, без кавычек и пробелов.';
+    } else if (/Failed to fetch|NetworkError|load failed/i.test(e.message)) {
+      err.textContent = 'Хаб недоступен: ' + e.message;
+    } else {
+      err.textContent = 'Ошибка: ' + e.message;
+    }
+    status.textContent = '';
+    localStorage.removeItem(TOKEN_KEY);
+  } finally {
+    $('#token-save').disabled = false;
   }
 };
 $('#token-input').addEventListener('keydown', e => { if (e.key === 'Enter') $('#token-save').click(); });
@@ -307,6 +327,10 @@ async function boot() {
 }
 
 (async () => {
+  window.addEventListener('error', ev => {
+    const err = document.getElementById('token-err');
+    if (err && !document.getElementById('gate').hidden) err.textContent = 'Ошибка страницы: ' + (ev.message || 'js');
+  });
   if (!token) { openGate(''); return; }
   await boot();
   setInterval(health, 15000);

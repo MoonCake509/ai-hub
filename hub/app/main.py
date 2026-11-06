@@ -241,6 +241,14 @@ async def chat(request: Request) -> Response:
                     media_type=resp.headers.get("content-type", "application/json"))
 
 
+@app.middleware("http")
+async def no_cache_ui(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/ui"):
+        response.headers["Cache-Control"] = "no-store, must-revalidate"
+    return response
+
+
 if WEB_DIR.exists():
     app.mount("/ui", StaticFiles(directory=str(WEB_DIR), html=True), name="ui")
 

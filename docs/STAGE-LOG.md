@@ -272,3 +272,59 @@ prompt 413, duplicate, late + идемпотентный повтор, конк�
 Восстановление из атомарного дампа: RESTORE-OK jobs=34.
 UI ui15 в браузере: 50 → «ещё» → 100 строк, 100 уникальных id, после опроса 7 с
 осталось 100 (не схлопнулось); смена фильтра показывает только выбранный статус.
+
+
+## Этап 9.1.1 — выбор агента, провайдера и модели (2026-11-06)
+
+Сделано:
+- `config/agents.yaml`: у каждого агента появились `profiles` (провайдер/канал) и `default_profile`.
+  Профиль codex пересобран по реальному кэшу Codex (`~/.codex/models_cache.json`):
+  gpt-6.1-sol, gpt-6-astra, gpt-6-chat-thinking, gpt-6.1-terra, gpt-6-sol, gpt-reserve,
+  gpt-6-luna, gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna. Прежние gpt-5.x-codex были выдуманы
+  и отклонялись самим Codex («model is not supported ... ChatGPT account»).
+- `hub/app/main.py`: `GET /agent-profiles/{agent_id}`; `/run` принимает `model` и `profile`;
+  неизвестный профиль или модель вне профиля → 400 с перечнем допустимых.
+- `hub/app/db.py`: `jobs.requested_model` / `jobs.effective_model`; аренда отдаёт `requested_model`,
+  результат пишет `effective_model` из `usage.model`.
+- `agents/laptop/bridge.py`: codex принимает модель флагом `-m`, промпт передаётся через stdin
+  (в прежнем виде промпт как аргумент ломал разбор флагов).
+- `web/*`: ui19 — селекты «Провайдер»/«Модель», колонка «Модель» в истории.
+
+Проверено:
+- `tests/test_911.py` на стенде (aihub_test, :8100): 11 PASS.
+- Живой прогон: `gpt-6.1-sol` → «FIRST-MODEL», `gpt-6.1-terra` → «SECOND-MODEL», оба succeeded.
+- Неподдерживаемая модель: 400 + список допустимых.
+- UI: 10 моделей в селекте, колонка «Модель» показывает назначение.
+
+Ограничения:
+- Codex не сообщает фактическую модель в `usage`; `effective_model` для него пуст.
+  Для каналов, раскрывающих модель (claudehub/openclaw/hermes), поле заполняется.
+- Остальные агенты (Hermes, OpenClaw, Qwen) пока не принимают `model` — расширение отдельными изменениями.
+
+
+## Этап 9.1.1 — выбор агента, провайдера и модели (2026-11-06)
+
+Сделано:
+- `config/agents.yaml`: у каждого агента появились `profiles` (провайдер/канал) и `default_profile`.
+  Профиль codex пересобран по реальному кэшу Codex (`~/.codex/models_cache.json`):
+  gpt-6.1-sol, gpt-6-astra, gpt-6-chat-thinking, gpt-6.1-terra, gpt-6-sol, gpt-reserve,
+  gpt-6-luna, gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna. Прежние gpt-5.x-codex были выдуманы
+  и отклонялись самим Codex («model is not supported ... ChatGPT account»).
+- `hub/app/main.py`: `GET /agent-profiles/{agent_id}`; `/run` принимает `model` и `profile`;
+  неизвестный профиль или модель вне профиля → 400 с перечнем допустимых.
+- `hub/app/db.py`: `jobs.requested_model` / `jobs.effective_model`; аренда отдаёт `requested_model`,
+  результат пишет `effective_model` из `usage.model`.
+- `agents/laptop/bridge.py`: codex принимает модель флагом `-m`, промпт передаётся через stdin
+  (в прежнем виде промпт как аргумент ломал разбор флагов).
+- `web/*`: ui19 — селекты «Провайдер»/«Модель», колонка «Модель» в истории.
+
+Проверено:
+- `tests/test_911.py` на стенде (aihub_test, :8100): 11 PASS.
+- Живой прогон: `gpt-6.1-sol` → «FIRST-MODEL», `gpt-6.1-terra` → «SECOND-MODEL», оба succeeded.
+- Неподдерживаемая модель: 400 + список допустимых.
+- UI: 10 моделей в селекте, колонка «Модель» показывает назначение.
+
+Ограничения:
+- Codex не сообщает фактическую модель в `usage`; `effective_model` для него пуст.
+  Для каналов, раскрывающих модель (claudehub/openclaw/hermes), поле заполняется.
+- Остальные агенты (Hermes, OpenClaw, Qwen) пока не принимают `model` — расширение отдельными изменениями.

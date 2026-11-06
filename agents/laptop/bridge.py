@@ -97,15 +97,16 @@ def parse_codex(stdout: str) -> dict:
 
 def run_codex(prompt: str, timeout: int, model: str | None = None) -> dict:
     # Модель применяется флагом конкретного запуска, а не правкой глобального конфига.
+    # Промпт передаём через файл: Codex читает stdin, когда аргумент выглядит как флаг.
     cmd = [CODEX_EXE, "exec", "--json", "--skip-git-repo-check"]
     if model:
         cmd += ["-m", model]
-    cmd.append(prompt)
+    # Промпт через stdin: Codex читает его как входные данные, а не как флаг.
     started = time.time()
     proc = subprocess.run(
         cmd,
         capture_output=True,
-        stdin=subprocess.DEVNULL,
+        input=prompt.encode("utf-8"),
         timeout=timeout,
         creationflags=CREATE_NO_WINDOW,
     )

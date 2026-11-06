@@ -11,21 +11,23 @@ agents:
       - id: openai
         name: OpenAI (подписка Codex)
         models:
-          - gpt-5.3-codex
-          - gpt-5.2-codex
-          - gpt-5.1-codex
-          - gpt-5-codex
-      - id: oss
-        name: Open-source (llama.cpp)
-        models:
-          - dolphin-2.9-llama3-8b.Q4_K_M
+          - gpt-6.1-sol
+          - gpt-6-astra
+          - gpt-6-chat-thinking
+          - gpt-6.1-terra
+          - gpt-6-sol
+          - gpt-reserve
+          - gpt-6-luna
+          - gpt-5.6-sol
+          - gpt-5.6-terra
+          - gpt-5.6-luna
     name: Codex CLI
     transport: cli
     host: laptop
     status: verified
     bridge_agent: codex
     command: "codex exec --json --skip-git-repo-check"
-    notes: "бинарь вне PATH: AppData/Local/OpenAI/Codex/bin/*/codex.exe"
+    notes: "бинаря нет в PATH: AppData/Local/OpenAI/Codex/bin/*/codex.exe; список моделей из ~/.codex/models_cache.json"
 
   - id: openclaw-laptop
     default_profile: claudehub

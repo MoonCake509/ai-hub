@@ -196,6 +196,7 @@ def main() -> int:
         try:
             # Выбор модели передаётся только адаптерам, которые его применяют.
             if requested_model and agent_id in ("codex",):
+                # Локальный Codex на ноутбуке: выбор модели через адаптер.
                 result = spec["runner"](prompt, timeout, requested_model)
             else:
                 result = spec["runner"](prompt, timeout)

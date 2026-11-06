@@ -10,7 +10,7 @@
 import json, os, subprocess, sys, time, urllib.request, urllib.error, uuid
 
 BASE = "http://127.0.0.1:8100"
-TOKEN = open(r"C:/Users/user/aihub-worker/token.txt", encoding="utf-8").read().strip()
+TOKEN = os.environ.get("HUB_TOKEN") or sys.exit("HUB_TOKEN env required")
 WSL = r"C:\Program Files\WSL\wsl.exe"
 
 FAILURES = []
@@ -32,9 +32,9 @@ def api(method, path, body=None, timeout=90):
 
 
 def sql(q):
-    r = subprocess.run([WSL, "-d", "AIHub", "-e", "bash", "-lc",
-                        "docker exec aihub-postgres-test psql -U aihub_test -d aihub_test -t -A -c " + repr(q)],
-                       capture_output=True)
+    # Тест исполняется внутри WSL — docker доступен напрямую.
+    r = subprocess.run(["docker", "exec", "aihub-postgres-test", "psql", "-U", "aihub_test",
+                        "-d", "aihub_test", "-t", "-A", "-c", q], capture_output=True)
     return r.stdout.decode("utf-8", "replace").strip()
 
 
@@ -59,13 +59,13 @@ def test_model_selection():
     key = "ct-model-" + uuid.uuid4().hex[:8]
     code, j = api("POST", "/agents/codex/run",
                   {"prompt": "Say hi", "timeout": 30, "idempotency_key": key,
-                   "model": "gpt-5.3-codex"})
+                   "model": "gpt-6.1-sol"})
     check("запуск с model → 202", code == 202, str(code))
     if code != 202:
         return
     job_id = j["job_id"]
     requested = sql(f"select requested_model from aihub.jobs where id='{job_id}'")
-    check("requested_model сохранён в БД", requested == "gpt-5.3-codex", requested)
+    check("requested_model сохранён в БД", requested == "gpt-6.1-sol", requested)
 
     # Несовместимое сочетание: неизвестная модель
     code, e = api("POST", "/agents/codex/run",
@@ -85,7 +85,7 @@ def test_lease_carries_model():
     key = "ct-lease-" + uuid.uuid4().hex[:8]
     code, j = api("POST", "/agents/codex/run",
                   {"prompt": "Say OK", "timeout": 30, "idempotency_key": key,
-                   "model": "gpt-5.2-codex"})
+                   "model": "gpt-6.1-terra"})
     job_id = j.get("job_id", "")
     # Аренда: ищем именно наше задание, пропуская чужие queued
     d = {}
@@ -96,17 +96,17 @@ def test_lease_carries_model():
             break
         time.sleep(0.3)
     got_model = d.get("requested_model")
-    check("аренда пробрасывает requested_model", got_model == "gpt-5.2-codex", str(got_model))
+    check("аренда пробрасывает requested_model", got_model == "gpt-6.1-terra", str(got_model))
     # Отправляем результат как «выполнено воркером» (без реального Codex — стенд)
     if "attempt_id" in d:
         payload = {"job_id": job_id, "attempt_id": d["attempt_id"], "ok": True,
-                   "output": "OK", "usage": {"model": "gpt-5.2-codex"}, "elapsed": 1.0}
+                   "output": "OK", "usage": {"model": "gpt-6.1-terra"}, "elapsed": 1.0}
         code, r = api("POST", "/bridge/result", payload)
         check("результат applied", code == 200 and r.get("outcome") == "applied", str(r))
         code, job = api("GET", "/jobs/" + job_id)
-        check("effective_model из usage", job.get("effective_model") == "gpt-5.2-codex",
+        check("effective_model из usage", job.get("effective_model") == "gpt-6.1-terra",
               str(job.get("effective_model")))
-        check("requested_model в задании", job.get("requested_model") == "gpt-5.2-codex",
+        check("requested_model в задании", job.get("requested_model") == "gpt-6.1-terra",
               str(job.get("requested_model")))
 
 

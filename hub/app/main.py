@@ -163,6 +163,12 @@ async def run_agent(agent_id: str, request: Request) -> JSONResponse:
     # Несовместимое сочетание отклоняем до постановки в очередь.
     requested_model = (payload.get("model") or "").strip() or None
     requested_profile = (payload.get("profile") or "").strip() or None
+    # Адаптер должен уметь применять выбор; иначе явный запрос — ошибка, а не тихое игнорирование.
+    if (requested_model or requested_profile) and not item.get("model_selection"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"agent '{agent_id}' does not support model selection yet; "
+                   "адаптер пока игнорирует выбор провайдера/модели")
     prof = AGENT_PROFILES.get(agent_id) or {}
     known_profiles = prof.get("profiles") or []
     default_profile = prof.get("default_profile") or ""
@@ -188,7 +194,7 @@ async def run_agent(agent_id: str, request: Request) -> JSONResponse:
     try:
         job, created = await asyncio.to_thread(
             db.create_job, bridge_agent, prompt, prompt_sha, timeout_s, idem or None, MAX_QUEUE,
-            requested_model)
+            requested_model, requested_profile)
     except ValueError:
         raise HTTPException(status_code=409, detail="idempotency_key already used with another payload") from None
     except db.QueueFull as exc:
@@ -259,6 +265,7 @@ async def bridge_jobs(worker: str = "", agents: str = "") -> JSONResponse:
         "timeout": leased["timeout_s"],
         "lease_seconds": LEASE_SECONDS,
         "requested_model": leased.get("requested_model"),
+        "requested_profile": leased.get("requested_profile"),
     })
 
 

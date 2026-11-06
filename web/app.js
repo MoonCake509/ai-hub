@@ -3,7 +3,7 @@
 
 const API = window.location.pathname.startsWith('/ui') ? '' : '';
 const TOKEN_KEY = 'aihub_token';
-const BUILD = 'ui19';
+const BUILD = 'ui20';
 function storeGet(k) { try { return localStorage.getItem(k) || ''; } catch (e) { return ''; } }
 function storeSet(k, v) { try { localStorage.setItem(k, v); return true; } catch (e) { return false; } }
 function storeDel(k) { try { localStorage.removeItem(k); } catch (e) { /* заблокировано */ } }
@@ -265,12 +265,26 @@ async function loadAgents() {
 }
 
 // Профили и модели агента: заполняем селекты из реестра.
+// Если адаптер агента пока не применяет выбор — селекты отключены с причиной.
 async function loadAgentProfiles(agentId) {
   const profileSel = $('#run-profile');
   const modelSel = $('#run-model');
+  const hint = $('#run-model-hint');
   profileSel.innerHTML = '';
   modelSel.innerHTML = '';
+  profileSel.disabled = false;
+  modelSel.disabled = false;
+  if (hint) hint.textContent = '';
   if (!agentId) return;
+  const agent = agents.find(a => a.id === agentId);
+  if (agent && !agent.model_selection) {
+    profileSel.innerHTML = '<option value="">—</option>';
+    modelSel.innerHTML = '<option value="">—</option>';
+    profileSel.disabled = true;
+    modelSel.disabled = true;
+    if (hint) hint.textContent = 'Адаптер этого агента пока не применяет выбор провайдера/модели.';
+    return;
+  }
   try {
     const d = await api('/agent-profiles/' + encodeURIComponent(agentId));
     const profiles = d.profiles || [];
@@ -321,13 +335,14 @@ $('#run-form').onsubmit = async e => {
     const timeout = Number($('#run-timeout').value) || 300;
     // Если предыдущая отправка могла дойти до сервера, повтор идёт с тем же ключом:
     // иначе потерянный ответ превращается в дубль задания.
-    const reuse = pendingRun && pendingRun.agent === agent
-      && pendingRun.prompt === prompt && pendingRun.timeout === timeout;
-    const key = reuse ? pendingRun.key : newKey();
-    pendingRun = { agent, prompt, timeout, key };
-    const body = { prompt, timeout, idempotency_key: key };
     const model = $('#run-model').value;
     const profile = $('#run-profile').value;
+    const reuse = pendingRun && pendingRun.agent === agent
+      && pendingRun.prompt === prompt && pendingRun.timeout === timeout
+      && pendingRun.model === model && pendingRun.profile === profile;
+    const key = reuse ? pendingRun.key : newKey();
+    pendingRun = { agent, prompt, timeout, key, model, profile };
+    const body = { prompt, timeout, idempotency_key: key };
     if (model) body.model = model;
     if (profile) body.profile = profile;
     const r = await api('/agents/' + encodeURIComponent($('#run-agent').value) + '/run', {
@@ -433,9 +448,17 @@ async function loadJobs(more) {
       tr.append(el('td', '', fmtDur(j.created_at, j.finished_at, j.status === 'running')));
       tr.append(el('td', '', String(j.attempts ?? 0)));
       const modelCell = el('td', 'model');
-      modelCell.textContent = j.effective_model || j.requested_model || '—';
-      if (j.effective_model && j.requested_model && j.effective_model !== j.requested_model) {
-        modelCell.title = 'запрошено: ' + j.requested_model + ' \u2192 фактически: ' + j.effective_model;
+      if (j.effective_model) {
+        modelCell.textContent = j.effective_model;
+        if (j.requested_model && j.effective_model !== j.requested_model) {
+          modelCell.title = 'запрошено: ' + j.requested_model + ' \u2192 фактически: ' + j.effective_model;
+        }
+      } else if (j.requested_model) {
+        modelCell.textContent = j.requested_model + ' (факт. не раскрыта)';
+        modelCell.title = 'Запрошена ' + j.requested_model
+          + '; фактическая модель инструментом не раскрыта.';
+      } else {
+        modelCell.textContent = '—';
       }
       tr.append(modelCell);
       tr.append(el('td', 'prompt', j.prompt_preview || ''));

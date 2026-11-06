@@ -86,6 +86,8 @@ button:disabled { opacity: .5; cursor: default; }
 .msg { font-size: 12px; margin: 0; min-height: 16px; }
 .msg.ok { color: var(--ok); }
 .msg.error { color: var(--err); }
+.hint { font-size: 12px; margin: 0; color: var(--muted, #8a8f98); min-height: 0; }
+.hint:empty { display: none; }
 
 .filters { display: flex; gap: 6px; flex-wrap: wrap; }
 .chip {

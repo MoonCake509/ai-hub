@@ -22,6 +22,7 @@ agents:
           - gpt-5.6-terra
           - gpt-5.6-luna
     name: Codex CLI
+    model_selection: true
     transport: cli
     host: laptop
     status: verified
@@ -30,6 +31,7 @@ agents:
     notes: "бинаря нет в PATH: AppData/Local/OpenAI/Codex/bin/*/codex.exe; список моделей из ~/.codex/models_cache.json"
 
   - id: openclaw-laptop
+    model_selection: false
     default_profile: claudehub
     profiles:
       - id: claudehub
@@ -53,6 +55,7 @@ agents:
     notes: "gateway только на loopback, ходим через CLI"
 
   - id: hermes-laptop
+    model_selection: false
     default_profile: claudehub
     profiles:
       - id: claudehub
@@ -76,6 +79,7 @@ agents:
     notes: "режим одного запроса; через хаб — pull-воркер ноутбука"
 
   - id: qwen-code
+    model_selection: false
     default_profile: qwen-sub
     profiles:
       - id: qwen-sub
@@ -92,6 +96,7 @@ agents:
     notes: "только через CDP/DOM, API нет"
 
   - id: llm-server
+    model_selection: false
     default_profile: local
     profiles:
       - id: local
@@ -107,6 +112,7 @@ agents:
     notes: "127.0.0.1:11434, OpenAI-совместимый; ctx 8192, max_tokens 1024"
 
   - id: hermes-server
+    model_selection: false
     default_profile: claudehub
     profiles:
       - id: claudehub
@@ -129,6 +135,7 @@ agents:
     command: "hermes -z <prompt>"
 
   - id: openclaw-server
+    model_selection: false
     default_profile: claudehub
     profiles:
       - id: claudehub
@@ -151,6 +158,7 @@ agents:
     command: "openclaw agent --message-file <file> --json"
 
   - id: qwen-server
+    model_selection: false
     default_profile: qwen-sub
     profiles:
       - id: qwen-sub

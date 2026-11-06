@@ -56,6 +56,7 @@ DDL = [
         result_error text,
         result_usage jsonb,
         requested_model text,
+        requested_profile text,
         effective_model text,
         lease_until timestamptz,
         worker text
@@ -128,7 +129,8 @@ def init() -> None:
         for stmt in DDL:
             conn.run(_qualify(stmt))
         # Миграция на месте: новые колонки для выбора модели (9.1).
-        for col, decl in (("requested_model", "text"), ("effective_model", "text")):
+        for col, decl in (("requested_model", "text"), ("effective_model", "text"),
+                      ("requested_profile", "text")):
             try:
                 conn.run(_qualify(
                     f"alter table aihub.jobs add column if not exists {col} {decl}"))
@@ -163,7 +165,8 @@ class QueueFull(Exception):
 
 def create_job(agent_id: str, prompt: str, prompt_sha: str, timeout_s: int,
                idempotency_key: str | None, max_queue: int | None = None,
-               requested_model: str | None = None) -> tuple[dict, bool]:
+               requested_model: str | None = None,
+               requested_profile: str | None = None) -> tuple[dict, bool]:
     """Возвращает (job, created). При совпадении ключа с другим телом — ValueError."""
     job_id = uuid.uuid4().hex
     with _lock:
@@ -176,9 +179,13 @@ def create_job(agent_id: str, prompt: str, prompt_sha: str, timeout_s: int,
             if idempotency_key:
                 existing = _one(conn, "select * from aihub.jobs where idempotency_key = :k", k=idempotency_key)
                 if existing:
+                    # Модель и профиль — часть назначения: смена модели под тем же
+                    # ключом не должна молча вернуть задание со старым назначением.
                     if (existing["prompt_sha"] != prompt_sha
                             or existing["agent_id"] != agent_id
-                            or int(existing["timeout_s"]) != int(timeout_s)):
+                            or int(existing["timeout_s"]) != int(timeout_s)
+                            or (existing.get("requested_model") or None) != (requested_model or None)
+                            or (existing.get("requested_profile") or None) != (requested_profile or None)):
                         raise ValueError("idempotency_key_conflict")
                     conn.run("commit")
                     return existing, False
@@ -187,10 +194,11 @@ def create_job(agent_id: str, prompt: str, prompt_sha: str, timeout_s: int,
                 if depth >= max_queue:
                     raise QueueFull(depth)
             conn.run(_qualify(
-                "insert into aihub.jobs(id, agent_id, prompt, prompt_sha, timeout_s, idempotency_key, requested_model)"
-                " values (:i, :a, :p, :s, :t, :k, :rm)"),
+                "insert into aihub.jobs(id, agent_id, prompt, prompt_sha, timeout_s, idempotency_key,"
+                " requested_model, requested_profile)"
+                " values (:i, :a, :p, :s, :t, :k, :rm, :rp)"),
                 i=job_id, a=agent_id, p=prompt, s=prompt_sha, t=timeout_s, k=idempotency_key,
-                rm=requested_model,
+                rm=requested_model, rp=requested_profile,
             )
             conn.run(_qualify("insert into aihub.job_events(job_id, event) values (:j, 'queued')"), j=job_id)
             conn.run("commit")
@@ -213,7 +221,7 @@ def get_job(job_id: str) -> dict | None:
             i=job_id,
         )
         # Миграция на месте: старые таблицы без новых колонок.
-        for col in ("requested_model", "effective_model"):
+        for col in ("requested_model", "effective_model", "requested_profile"):
             if col not in job:
                 try:
                     conn.run(_qualify(
@@ -229,13 +237,13 @@ def list_jobs(status: str | None, limit: int = 50, offset: int = 0) -> list[dict
         conn = connect()
         if status:
             return _rows(conn, "select id, agent_id, status, created_at, finished_at, attempts,"
-                               " requested_model, effective_model,"
+                               " requested_model, requested_profile, effective_model,"
                                " left(prompt, 160) as prompt_preview"
                                " from aihub.jobs where status = :s order by created_at desc"
                                " limit :l offset :o",
                          s=status, l=limit, o=offset)
         return _rows(conn, "select id, agent_id, status, created_at, finished_at, attempts,"
-                          " requested_model, effective_model,"
+                          " requested_model, requested_profile, effective_model,"
                           " left(prompt, 160) as prompt_preview"
                           " from aihub.jobs order by created_at desc limit :l offset :o",
                     l=limit, o=offset)
@@ -291,7 +299,8 @@ def lease_job(worker: str, lease_seconds: int = 300, agents: str = "") -> dict |
                           worker = :w,
                           attempts = j.attempts + 1
                      from c where j.id = c.id
-                   returning j.id, j.agent_id, j.prompt, j.timeout_s, j.attempts, j.requested_model""",
+                   returning j.id, j.agent_id, j.prompt, j.timeout_s, j.attempts, j.requested_model,
+                        j.requested_profile""",
                 lease=str(int(lease_seconds)), w=worker, agents=agents,
             )
             if not row:

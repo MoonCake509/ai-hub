@@ -34,6 +34,8 @@ LEASE_SECONDS = int(os.environ.get("LEASE_SECONDS", "300"))
 MAX_PROMPT_CHARS = int(os.environ.get("MAX_PROMPT_CHARS", "20000"))
 MAX_QUEUE = int(os.environ.get("MAX_QUEUE", "50"))
 MAX_RESULT_CHARS = int(os.environ.get("MAX_RESULT_CHARS", "100000"))
+MIN_TIMEOUT_S = int(os.environ.get("MIN_TIMEOUT_S", "10"))
+MAX_TIMEOUT_S = int(os.environ.get("MAX_TIMEOUT_S", "7200"))
 
 
 async def _sweeper() -> None:
@@ -122,7 +124,14 @@ async def run_agent(agent_id: str, request: Request) -> JSONResponse:
         raise HTTPException(
             status_code=413,
             detail=f"prompt too long: {len(prompt)} > {MAX_PROMPT_CHARS} chars")
-    timeout_s = int(payload.get("timeout") or 600)
+    try:
+        raw_timeout = payload.get("timeout")
+        timeout_s = int(600 if raw_timeout is None else raw_timeout)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="timeout must be an integer") from None
+    if not (MIN_TIMEOUT_S <= timeout_s <= MAX_TIMEOUT_S):
+        raise HTTPException(status_code=400,
+                            detail=f"timeout out of range: {timeout_s} not in [{MIN_TIMEOUT_S}, {MAX_TIMEOUT_S}]")
     idem = payload.get("idempotency_key") or request.headers.get("idempotency-key")
     prompt_sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
 
@@ -161,6 +170,12 @@ async def job(job_id: str) -> dict:
     if not data:
         raise HTTPException(status_code=404, detail="job not found")
     return data
+
+
+@app.get("/late-results", dependencies=[Depends(require_token)])
+async def late_results(limit: int = 50) -> dict:
+    items = await asyncio.to_thread(db.list_late, max(1, min(limit, 200)))
+    return {"count": len(items), "items": items}
 
 
 @app.get("/jobs/{job_id}/events", dependencies=[Depends(require_token)])
@@ -222,10 +237,14 @@ async def bridge_result(request: Request) -> dict:
         payload.get("error"),
         payload.get("usage") or {},
         payload.get("elapsed"),
+        payload.get("job_id"),
     )
     if outcome == "not_found":
         raise HTTPException(status_code=404, detail="unknown attempt")
-    return {"ok": outcome in ("applied", "duplicate"), "outcome": outcome}
+    # late/stale: результат сохранён в late_results — воркер может удалять outbox,
+    # но задание не переоткрывается и статус не переписывается.
+    return {"ok": outcome in ("applied", "duplicate", "late", "stale"),
+            "outcome": outcome, "recorded": outcome != "not_found"}
 
 
 def _llm_headers() -> dict:

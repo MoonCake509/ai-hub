@@ -59,6 +59,17 @@ DDL = [
         usage jsonb
     )""",
     "create index if not exists attempts_job on aihub.job_attempts(job_id, attempt_no desc)",
+    """create table if not exists aihub.late_results (
+        id bigserial primary key,
+        job_id text,
+        attempt_id text not null,
+        attempt_status text,
+        payload jsonb not null,
+        received_at timestamptz not null default now(),
+        reviewed_at timestamptz,
+        note text
+    )""",
+    "create unique index if not exists late_attempt on aihub.late_results(attempt_id)",
     """create table if not exists aihub.job_events (
         id bigserial primary key,
         job_id text not null references aihub.jobs(id) on delete cascade,
@@ -128,22 +139,34 @@ def create_job(agent_id: str, prompt: str, prompt_sha: str, timeout_s: int,
     job_id = uuid.uuid4().hex
     with _lock:
         conn = connect()
-        if idempotency_key:
-            existing = _one(conn, "select * from aihub.jobs where idempotency_key = :k", k=idempotency_key)
-            if existing:
-                if existing["prompt_sha"] != prompt_sha:
-                    raise ValueError("idempotency_key_conflict")
-                return existing, False
-        if max_queue:
-            depth = _one(conn, "select count(*) as n from aihub.jobs where status = 'queued'")["n"]
-            if depth >= max_queue:
-                raise QueueFull(depth)
-        conn.run(
-            "insert into aihub.jobs(id, agent_id, prompt, prompt_sha, timeout_s, idempotency_key)"
-            " values (:i, :a, :p, :s, :t, :k)",
-            i=job_id, a=agent_id, p=prompt, s=prompt_sha, t=timeout_s, k=idempotency_key,
-        )
-        event(job_id, "queued")
+        conn.run("begin")
+        try:
+            # Проверка места в очереди и вставка должны быть одной операцией:
+            # иначе два процесса увидят одинаково свободное место и превысят лимит.
+            conn.run("select pg_advisory_xact_lock(7401)")
+            if idempotency_key:
+                existing = _one(conn, "select * from aihub.jobs where idempotency_key = :k", k=idempotency_key)
+                if existing:
+                    if (existing["prompt_sha"] != prompt_sha
+                            or existing["agent_id"] != agent_id
+                            or int(existing["timeout_s"]) != int(timeout_s)):
+                        raise ValueError("idempotency_key_conflict")
+                    conn.run("commit")
+                    return existing, False
+            if max_queue:
+                depth = _one(conn, "select count(*) as n from aihub.jobs where status = 'queued'")["n"]
+                if depth >= max_queue:
+                    raise QueueFull(depth)
+            conn.run(
+                "insert into aihub.jobs(id, agent_id, prompt, prompt_sha, timeout_s, idempotency_key)"
+                " values (:i, :a, :p, :s, :t, :k)",
+                i=job_id, a=agent_id, p=prompt, s=prompt_sha, t=timeout_s, k=idempotency_key,
+            )
+            conn.run("insert into aihub.job_events(job_id, event) values (:j, 'queued')", j=job_id)
+            conn.run("commit")
+        except Exception:
+            conn.run("rollback")
+            raise
         return get_job(job_id), True
 
 
@@ -175,6 +198,14 @@ def list_jobs(status: str | None, limit: int = 50, offset: int = 0) -> list[dict
                           " left(prompt, 160) as prompt_preview"
                           " from aihub.jobs order by created_at desc limit :l offset :o",
                     l=limit, o=offset)
+
+
+def list_late(limit: int = 50) -> list[dict]:
+    with _lock:
+        conn = connect()
+        return _rows(conn, "select id, job_id, attempt_id, attempt_status, received_at,"
+                           " reviewed_at, note, payload"
+                           " from aihub.late_results order by received_at desc limit :l", l=limit)
 
 
 def count_jobs(status: str | None = None) -> int:
@@ -257,9 +288,32 @@ def heartbeat(attempt_id: str, lease_seconds: int = 300) -> bool:
         return bool(row)
 
 
+def _store_late(conn, job_id: str | None, attempt_id: str, attempt_status: str | None,
+                ok: bool, output: str | None, error: str | None,
+                usage: dict | None, elapsed: float | None) -> None:
+    """Складывает неприменённый результат отдельно: он не теряется и не меняет статус задания."""
+    payload = json.dumps({
+        "ok": ok, "output": output, "error": error,
+        "usage": usage or {}, "elapsed": elapsed,
+    }, ensure_ascii=False)
+    conn.run(
+        "insert into aihub.late_results(job_id, attempt_id, attempt_status, payload)"
+        " values (:j, :a, :s, :p::jsonb) on conflict (attempt_id) do nothing",
+        j=job_id, a=attempt_id, s=attempt_status, p=payload,
+    )
+
+
 def finish_attempt(attempt_id: str, ok: bool, output: str | None, error: str | None,
-                   usage: dict | None, elapsed: float | None) -> str:
-    """Идемпотентно закрывает попытку. Возвращает applied|duplicate|stale|not_found."""
+                   usage: dict | None, elapsed: float | None,
+                   job_id_hint: str | None = None) -> str:
+    """Идемпотентно закрывает попытку.
+
+    applied   — результат сохранён в задание;
+    duplicate — эта попытка уже закрыта тем же результатом, повтор ничего не меняет;
+    late      — аренда истекла (или задание уже закрыто иначе): результат сохранён в late_results;
+    stale     — попытка не последняя, задание закрыто другой попыткой: результат в late_results;
+    not_found — такой попытки нет.
+    """
     with _lock:
         conn = connect()
         conn.run("begin")
@@ -267,20 +321,33 @@ def finish_attempt(attempt_id: str, ok: bool, output: str | None, error: str | N
             attempt = _one(conn, "select * from aihub.job_attempts where id = :a", a=attempt_id)
             if not attempt:
                 conn.run("rollback")
+                if job_id_hint:
+                    _store_late(conn, job_id_hint, attempt_id, None, ok, output, error, usage, elapsed)
+                    conn.run("commit")
+                    return "late"
                 return "not_found"
-            if attempt["status"] != "running":
+            if attempt["status"] in ("succeeded", "failed"):
                 conn.run("rollback")
                 return "duplicate"
+            if attempt["status"] != "running":
+                _store_late(conn, attempt["job_id"], attempt_id, attempt["status"],
+                            ok, output, error, usage, elapsed)
+                conn.run("commit")
+                return "late"
             job = _one(conn, "select * from aihub.jobs where id = :j for update", j=attempt["job_id"])
             if not job or job["status"] != "running":
-                conn.run("rollback")
+                _store_late(conn, attempt["job_id"], attempt_id,
+                            attempt["status"], ok, output, error, usage, elapsed)
+                conn.run("commit")
                 return "stale"
             latest = _one(
                 conn,
                 "select max(attempt_no) as n from aihub.job_attempts where job_id = :j", j=job["id"],
             )
             if latest and latest["n"] != attempt["attempt_no"]:
-                conn.run("rollback")
+                _store_late(conn, job["id"], attempt_id, attempt["status"],
+                            ok, output, error, usage, elapsed)
+                conn.run("commit")
                 return "stale"
             status = "succeeded" if ok else "failed"
             conn.run(
@@ -340,18 +407,30 @@ def expire_leases() -> int:
     """Истёкшая аренда: попытка → unknown, задание → unknown (без автоповтора)."""
     with _lock:
         conn = connect()
-        rows = _rows(
+        # Один оператор: попытка, задание и событие меняются вместе. Иначе результат,
+        # принятый между UPDATE-ами, мог быть перетёрт статусом unknown.
+        row = _one(
             conn,
-            """update aihub.job_attempts a
-                  set status = 'unknown', finished_at = now()
-                from aihub.jobs j
-               where a.status = 'running' and a.lease_until < now()
-                 and j.id = a.job_id and j.status = 'running'
-               returning a.id, a.job_id""",
+            """with expired as (
+                   update aihub.job_attempts a
+                      set status = 'unknown', finished_at = now()
+                     from aihub.jobs j
+                    where a.status = 'running' and a.lease_until < now()
+                      and j.id = a.job_id and j.status = 'running'
+                   returning a.id, a.job_id
+               ),
+               jobs_upd as (
+                   update aihub.jobs j
+                      set status = 'unknown', needs_reconcile = true, finished_at = now()
+                     from expired e
+                    where j.id = e.job_id and j.status = 'running'
+                   returning j.id
+               ),
+               ev as (
+                   insert into aihub.job_events(job_id, attempt_id, event)
+                   select e.job_id, e.id, 'lease_expired' from expired e
+                   returning 1
+               )
+               select (select count(*) from expired) as n""",
         )
-        for row in rows:
-            conn.run("update aihub.jobs set status = 'unknown', needs_reconcile = true where id = :j",
-                     j=row["job_id"])
-            conn.run("insert into aihub.job_events(job_id, attempt_id, event) values (:j, :a, 'lease_expired')",
-                     j=row["job_id"], a=row["id"])
-        return len(rows)
+        return int(row["n"])

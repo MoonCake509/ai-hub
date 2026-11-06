@@ -56,38 +56,6 @@ services:
         condition: service_started
     ports:
       - "0.0.0.0:8000:8000"
-    environment:
-      LITELLM_URL: http://litellm:4000
-      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
-      AGENTS_FILE: /app/config/agents.yaml
-      HUB_TOKEN: ${HUB_TOKEN}
-      DATABASE_URL: postgresql://llmproxy:${POSTGRES_PASSWORD}@postgres:5432/litellm
-      LEASE_SECONDS: "${LEASE_SECONDS:-300}"
-      MAX_QUEUE: "${MAX_QUEUE:-50}"
-      MAX_PROMPT_CHARS: "${MAX_PROMPT_CHARS:-20000}"
-      MAX_RESULT_CHARS: "${MAX_RESULT_CHARS:-100000}"
-      BRIDGE_URL: ${BRIDGE_URL}
-      BRIDGE_TOKEN: ${BRIDGE_TOKEN}
-    volumes:
-      - ../config/agents.yaml:/app/config/agents.yaml:ro
-      - ../web:/app/web:ro
-      - ../hub/app:/app/app:ro
-    logging:
-      options:
-        max-size: "10m"
-        max-file: "3"
-
-
-  hub-tls:
-    build: ../hub
-    container_name: aihub-hub-tls
-    restart: unless-stopped
-    depends_on:
-      postgres:
-        condition: service_healthy
-      litellm:
-        condition: service_started
-    ports:
       - "0.0.0.0:8443:8443"
     environment:
       LITELLM_URL: http://litellm:4000
@@ -98,6 +66,8 @@ services:
       LEASE_SECONDS: "${LEASE_SECONDS:-300}"
       MAX_QUEUE: "${MAX_QUEUE:-50}"
       MAX_PROMPT_CHARS: "${MAX_PROMPT_CHARS:-20000}"
+      TLS_CERT: /certs/hub.crt
+      TLS_KEY: /certs/hub.key
       MAX_RESULT_CHARS: "${MAX_RESULT_CHARS:-100000}"
       BRIDGE_URL: ${BRIDGE_URL}
       BRIDGE_TOKEN: ${BRIDGE_TOKEN}
@@ -110,8 +80,8 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8443",
-              "--ssl-keyfile", "/certs/hub.key", "--ssl-certfile", "/certs/hub.crt"]
+    command: ["python", "-m", "app.serve"]
+
 volumes:
   pgdata:
     driver: local

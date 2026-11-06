@@ -201,7 +201,8 @@ def deliver(path: str) -> bool:
             time.sleep(5)
             continue
         if code == 200:
-            if resp.get("outcome") in ("applied", "duplicate"):
+            # late/stale тоже означают «хаб сохранил»: результат лежит в late_results.
+            if resp.get("outcome") in ("applied", "duplicate", "late", "stale"):
                 try:
                     os.remove(path)
                 except OSError:
@@ -324,8 +325,10 @@ def main() -> int:
 
         payload["elapsed_total"] = round(time.time() - started, 2)
         path = outbox_path(job_id, attempt_id)
-        with open(path, "w", encoding="utf-8") as fh:
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, ensure_ascii=False)
+        os.replace(tmp_path, path)
         deliver(path)
         drain_outbox()
         time.sleep(1)

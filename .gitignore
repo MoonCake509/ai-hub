@@ -14,3 +14,7 @@ __pycache__/
 node_modules/
 hub/wheels/
 infra/certs/*.key
+
+# рабочие дампы БД не входят в дерево исходников
+backups/
+*.dump

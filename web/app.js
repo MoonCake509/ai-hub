@@ -3,7 +3,11 @@
 
 const API = window.location.pathname.startsWith('/ui') ? '' : '';
 const TOKEN_KEY = 'aihub_token';
-let token = localStorage.getItem(TOKEN_KEY) || '';
+const BUILD = 'ui10';
+function storeGet(k) { try { return localStorage.getItem(k) || ''; } catch (e) { return ''; } }
+function storeSet(k, v) { try { localStorage.setItem(k, v); return true; } catch (e) { return false; } }
+function storeDel(k) { try { localStorage.removeItem(k); } catch (e) { /* заблокировано */ } }
+let token = storeGet(TOKEN_KEY);
 let currentJob = null;
 let currentStatus = '';
 let agents = [];
@@ -62,51 +66,122 @@ async function api(path, opts = {}) {
 }
 
 // ---------- токен ----------
-function openGate(msg) {
-  $('#gate').hidden = false;
-  $('#token-err').textContent = msg || '';
-  $('#token-input').value = '';
-  $('#token-input').focus();
-}
-function closeGate() { $('#gate').hidden = true; }
+function node(id) { return document.getElementById(id); }
 
-$('#token-btn').onclick = () => openGate('');
-$('#token-cancel').onclick = () => { if (token) closeGate(); };
-$('#token-save').onclick = async () => {
-  const val = $('#token-input').value.trim();
-  const err = $('#token-err');
-  const status = $('#token-status');
-  err.textContent = '';
-  if (!val) { err.textContent = 'Поле пустое.'; return; }
+function openGate(msg) {
+  const gate = node('gate');
+  if (!gate) return;
+  gate.hidden = false;
+  const err = node('token-err');
+  if (err) err.textContent = msg || '';
+  const input = node('token-input');
+  if (input) { input.value = ''; input.focus(); }
+}
+function closeGate() { const g = node('gate'); if (g) g.hidden = true; }
+
+function setStatus(text, cls) {
+  const st = node('token-status');
+  if (st) { st.className = 'msg ' + (cls || ''); st.textContent = text || ''; }
+}
+function setErr(text) {
+  const err = node('token-err');
+  if (err) err.textContent = text || '';
+}
+
+async function saveToken() {
+  const input = node('token-input');
+  const btn = node('token-save');
+  const val = input ? input.value.trim() : '';
+  setErr('');
+  if (!val) { setErr('Поле пустое.'); return; }
   token = val;
-  $('#token-save').disabled = true;
-  status.className = 'msg';
-  status.textContent = 'Проверяю токен…';
+  if (btn) btn.disabled = true;
+  setStatus('Проверяю токен…', '');
   try {
-    const health = await api('/health');
-    await api('/jobs?limit=1');            // проверка токена: /jobs защищён
-    localStorage.setItem(TOKEN_KEY, token);
-    status.className = 'msg ok';
-    status.textContent = 'Ок, загружаю данные…';
+    await api('/jobs?limit=1', { timeout: 8000 });   // единственный защищённый запрос на этом шаге
+    token = '';                                      // временно, чтобы boot() шёл с проверенным токеном
+    token = val;
+    storeSet(TOKEN_KEY, val);
+    setStatus('Ок, загружаю данные…', 'ok');
     closeGate();
     await boot();
-    status.textContent = '';
+    setStatus('', '');
   } catch (e) {
-    token = '';
-    if (e.message === 'unauthorized' || /401/.test(e.message)) {
-      err.textContent = 'Неверный токен. Скопируй значение HUB_TOKEN целиком, без кавычек и пробелов.';
-    } else if (/Failed to fetch|NetworkError|load failed/i.test(e.message)) {
-      err.textContent = 'Хаб недоступен: ' + e.message;
+    const msg = String(e && e.message || e);
+    if (msg === 'unauthorized' || /401/.test(msg)) {
+      setErr('Неверный токен. Скопируй HUB_TOKEN целиком, без кавычек и пробелов.');
+      storeDel(TOKEN_KEY);
+      token = '';
     } else {
-      err.textContent = 'Ошибка: ' + e.message;
+      setErr('Ошибка: ' + msg);
     }
-    status.textContent = '';
-    localStorage.removeItem(TOKEN_KEY);
+    setStatus('', '');
   } finally {
-    $('#token-save').disabled = false;
+    if (btn) btn.disabled = false;
   }
-};
-$('#token-input').addEventListener('keydown', e => { if (e.key === 'Enter') $('#token-save').click(); });
+}
+
+// Диагностика: одна кнопка, чтобы не гадать, где обрыв.
+async function diagnose() {
+  const out = node('diag');
+  if (!out) return;
+  out.hidden = false;
+  const lines = [];
+  const add = (k, v) => lines.push(k + ': ' + v);
+  out.textContent = 'Собираю…';
+  add('сборка UI', BUILD);
+  add('страница', location.href);
+  add('браузер', navigator.userAgent);
+  try { localStorage.setItem('_t', '1'); localStorage.removeItem('_t'); add('localStorage', 'доступен'); }
+  catch (e) { add('localStorage', 'ЗАБЛОКИРОВАН — ' + e.message); }
+  add('токен в поле', (node('token-input') && node('token-input').value.trim() ? 'есть, ' + node('token-input').value.trim().length + ' симв.' : 'пусто'));
+  add('токен в браузере', token ? 'есть, ' + token.length + ' симв.' : 'нет');
+
+  const probe = async (path, withToken) => {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 8000);
+    const headers = {};
+    if (withToken && (node('token-input') || {}).value) headers.Authorization = 'Bearer ' + node('token-input').value.trim();
+    const t0 = performance.now();
+    try {
+      const r = await fetch(path, { headers, cache: 'no-store', signal: ctrl.signal });
+      const body = (await r.text()).slice(0, 120).replace(/\s+/g, ' ');
+      add((withToken ? 'с токеном ' : '') + path, r.status + ' за ' + Math.round(performance.now() - t0) + ' мс | ' + body);
+    } catch (e) {
+      add((withToken ? 'с токеном ' : '') + path, 'ОШИБКА ' + e.name + ': ' + e.message);
+    } finally { clearTimeout(timer); }
+  };
+  await probe('/health', false);
+  await probe('/agents', false);
+  await probe('/jobs?limit=1', true);
+
+  add('JS-ошибки', window.__jsErrors && window.__jsErrors.length ? window.__jsErrors.join(' | ') : 'нет');
+  out.textContent = lines.join('\n');
+}
+
+// Глобальный перехват ошибок: без этого «ничего не происходит» неотличимо от ошибки скрипта.
+window.__jsErrors = [];
+window.addEventListener('error', ev => {
+  const msg = (ev.message || 'js error') + (ev.filename ? ' @' + ev.filename.split('/').pop() + ':' + ev.lineno : '');
+  window.__jsErrors.push(msg);
+  if (node('gate') && !node('gate').hidden) setErr('Ошибка страницы: ' + msg);
+});
+window.addEventListener('unhandledrejection', ev => {
+  window.__jsErrors.push('promise: ' + (ev.reason && ev.reason.message || ev.reason));
+});
+
+function wireGate() {
+  const btnSave = node('token-save');
+  const btnCancel = node('token-cancel');
+  const btnDiag = node('token-diag');
+  const input = node('token-input');
+  const btnToken = node('token-btn');
+  if (btnSave) btnSave.onclick = () => { saveToken().catch(e => setErr('Сбой: ' + e.message)); };
+  if (btnCancel) btnCancel.onclick = () => { if (token) closeGate(); };
+  if (btnDiag) btnDiag.onclick = () => { diagnose().catch(e => setErr('Диагностика: ' + e.message)); };
+  if (btnToken) btnToken.onclick = () => openGate('');
+  if (input) input.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); saveToken(); } });
+}
 
 // ---------- здоровье ----------
 async function health() {
@@ -360,10 +435,9 @@ async function boot() {
 }
 
 (async () => {
-  window.addEventListener('error', ev => {
-    const err = document.getElementById('token-err');
-    if (err && !document.getElementById('gate').hidden) err.textContent = 'Ошибка страницы: ' + (ev.message || 'js');
-  });
+  wireGate();
+  const b = document.getElementById('build');
+  if (b) b.textContent = BUILD;
   if (!token) { openGate(''); return; }
   await boot();
   setInterval(health, 15000);

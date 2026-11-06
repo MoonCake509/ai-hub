@@ -4,11 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AI-Hub — задания и агенты</title>
-<link rel="stylesheet" href="styles.css?v=8">
+<link rel="stylesheet" href="styles.css?v=10">
 </head>
 <body>
 <header class="top">
-  <div class="brand">AI-Hub<span class="ver" id="version"></span></div>
+  <div class="brand">AI-Hub<span class="ver" id="version"></span><span class="ver" id="build"></span></div>
   <div class="state">
     <span class="dot" id="health-dot"></span>
     <span id="health-text">проверка…</span>
@@ -24,7 +24,9 @@
     <div class="row">
       <button class="primary" id="token-save">Сохранить и войти</button>
       <button class="ghost" id="token-cancel">Отмена</button>
+      <button class="ghost" id="token-diag" type="button">Диагностика</button>
     </div>
+    <pre id="diag" class="diag" hidden></pre>
     <p class="msg" id="token-status"></p>
     <p class="err" id="token-err"></p>
   </div>
@@ -101,6 +103,6 @@
   <ol id="d-events" class="events"></ol>
 </aside>
 
-<script src="app.js?v=9"></script>
+<script src="app.js?v=10"></script>
 </body>
 </html>

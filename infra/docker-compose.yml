@@ -67,6 +67,7 @@ services:
       BRIDGE_TOKEN: ${BRIDGE_TOKEN}
     volumes:
       - ../config/agents.yaml:/app/config/agents.yaml:ro
+      - ../web:/app/web:ro
       - ../hub/app:/app/app:ro
     logging:
       options:

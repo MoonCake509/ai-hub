@@ -18,7 +18,8 @@ from pathlib import Path
 import httpx
 import yaml
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, RedirectResponse, Response
+from fastapi.staticfiles import StaticFiles
 
 from . import db
 
@@ -27,6 +28,7 @@ LITELLM_URL = os.environ.get("LITELLM_URL", "http://litellm:4000").rstrip("/")
 MASTER_KEY = os.environ.get("LITELLM_MASTER_KEY", "")
 HUB_TOKEN = os.environ.get("HUB_TOKEN", "")
 AGENTS_FILE = Path(os.environ.get("AGENTS_FILE", "/app/config/agents.yaml"))
+WEB_DIR = Path(os.environ.get("WEB_DIR", "/app/web"))
 LEASE_SECONDS = int(os.environ.get("LEASE_SECONDS", "300"))
 
 
@@ -144,6 +146,15 @@ async def job(job_id: str) -> dict:
     return data
 
 
+@app.get("/jobs/{job_id}/events", dependencies=[Depends(require_token)])
+async def job_events(job_id: str) -> dict:
+    data = await asyncio.to_thread(db.get_job, job_id)
+    if not data:
+        raise HTTPException(status_code=404, detail="job not found")
+    items = await asyncio.to_thread(db.events, job_id)
+    return {"job_id": job_id, "events": items}
+
+
 @app.post("/jobs/{job_id}/cancel", dependencies=[Depends(require_token)])
 async def cancel(job_id: str) -> dict:
     status = await asyncio.to_thread(db.cancel_job, job_id)
@@ -228,3 +239,12 @@ async def chat(request: Request) -> Response:
             raise HTTPException(status_code=502, detail=f"litellm unreachable: {exc}") from exc
     return Response(content=resp.content, status_code=resp.status_code,
                     media_type=resp.headers.get("content-type", "application/json"))
+
+
+if WEB_DIR.exists():
+    app.mount("/ui", StaticFiles(directory=str(WEB_DIR), html=True), name="ui")
+
+
+@app.get("/")
+async def root() -> RedirectResponse:
+    return RedirectResponse(url="/ui/")

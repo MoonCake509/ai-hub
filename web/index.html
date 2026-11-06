@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI-Hub — задания и агенты</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">AI-Hub<span class="ver" id="version"></span></div>
+  <div class="state">
+    <span class="dot" id="health-dot"></span>
+    <span id="health-text">проверка…</span>
+  </div>
+  <button class="ghost" id="token-btn">Токен</button>
+</header>
+
+<div class="gate" id="gate" hidden>
+  <div class="gate-box">
+    <h2>Нужен токен хаба</h2>
+    <p>Токен хранится в браузере и уходит только в заголовке <code>Authorization</code>.</p>
+    <input id="token-input" type="password" placeholder="HUB_TOKEN" autocomplete="off">
+    <div class="row">
+      <button class="primary" id="token-save">Сохранить и войти</button>
+      <button class="ghost" id="token-cancel">Отмена</button>
+    </div>
+    <p class="err" id="token-err"></p>
+  </div>
+</div>
+
+<main class="layout">
+  <section class="panel agents">
+    <div class="panel-head"><h2>Агенты</h2><span class="muted" id="agents-count"></span></div>
+    <div id="agents-list" class="agents-list"></div>
+
+    <div class="panel-head run-head"><h2>Запуск</h2></div>
+    <form id="run-form" class="run-form">
+      <label>Агент
+        <select id="run-agent" required></select>
+      </label>
+      <label>Промпт
+        <textarea id="run-prompt" rows="5" placeholder="Что должен сделать агент" required></textarea>
+      </label>
+      <label>Таймаут, с
+        <input id="run-timeout" type="number" min="10" max="3600" value="300">
+      </label>
+      <button class="primary" id="run-submit" type="submit">Запустить</button>
+      <p class="msg" id="run-msg"></p>
+    </form>
+  </section>
+
+  <section class="panel jobs">
+    <div class="panel-head">
+      <h2>История</h2>
+      <div class="filters">
+        <button class="chip active" data-status="">все</button>
+        <button class="chip" data-status="running">running</button>
+        <button class="chip" data-status="queued">queued</button>
+        <button class="chip" data-status="succeeded">succeeded</button>
+        <button class="chip" data-status="failed">failed</button>
+        <button class="chip" data-status="unknown">unknown</button>
+        <button class="chip" data-status="cancelled">cancelled</button>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table id="jobs-table">
+        <thead>
+          <tr><th>Создано</th><th>Агент</th><th>Статус</th><th>Длит.</th><th>Попытки</th><th>Промпт</th></tr>
+        </thead>
+        <tbody id="jobs-body"></tbody>
+      </table>
+      <p class="empty" id="jobs-empty" hidden>Заданий нет</p>
+    </div>
+  </section>
+</main>
+
+<aside class="detail" id="detail" hidden>
+  <div class="detail-head">
+    <div>
+      <div class="muted">Задание</div>
+      <div class="mono" id="d-id"></div>
+    </div>
+    <div class="row">
+      <button class="danger" id="d-cancel" hidden>Отменить</button>
+      <button class="ghost" id="d-close">Закрыть</button>
+    </div>
+  </div>
+
+  <div class="meta" id="d-meta"></div>
+  <p class="msg" id="d-note"></p>
+
+  <h3>Вывод</h3>
+  <pre id="d-output" class="output">—</pre>
+
+  <h3>Попытки</h3>
+  <div id="d-attempts" class="attempts"></div>
+
+  <h3>События</h3>
+  <ol id="d-events" class="events"></ol>
+</aside>
+
+<script src="app.js"></script>
+</body>
+</html>

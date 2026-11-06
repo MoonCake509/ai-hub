@@ -158,11 +158,24 @@ def list_jobs(status: str | None, limit: int = 50) -> list[dict]:
     with _lock:
         conn = connect()
         if status:
-            return _rows(conn, "select id, agent_id, status, created_at, finished_at, attempts"
+            return _rows(conn, "select id, agent_id, status, created_at, finished_at, attempts,"
+                               " left(prompt, 160) as prompt_preview"
                                " from aihub.jobs where status = :s order by created_at desc limit :l",
                          s=status, l=limit)
-        return _rows(conn, "select id, agent_id, status, created_at, finished_at, attempts"
+        return _rows(conn, "select id, agent_id, status, created_at, finished_at, attempts,"
+                          " left(prompt, 160) as prompt_preview"
                           " from aihub.jobs order by created_at desc limit :l", l=limit)
+
+
+def events(job_id: str) -> list[dict]:
+    with _lock:
+        conn = connect()
+        return _rows(
+            conn,
+            "select event, attempt_id, at, payload from aihub.job_events"
+            " where job_id = :j order by id",
+            j=job_id,
+        )
 
 
 def lease_job(worker: str, lease_seconds: int = 300, agents: str = "") -> dict | None:
@@ -259,7 +272,8 @@ def finish_attempt(attempt_id: str, ok: bool, output: str | None, error: str | N
             )
             conn.run(
                 "update aihub.jobs set status = :s, finished_at = now(), result_output = :o,"
-                " result_error = :e, result_usage = :u::jsonb, lease_until = null where id = :j",
+                " result_error = :e, result_usage = :u::jsonb, lease_until = null,"
+                " needs_reconcile = false where id = :j",
                 s=status, o=output, e=error, u=json.dumps(usage or {}, ensure_ascii=False), j=job["id"],
             )
             conn.run(

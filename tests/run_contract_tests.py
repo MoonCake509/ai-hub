@@ -1,51 +1,64 @@
-"""Одна команда: останавливает воркеры, гоняет контрактные тесты на сервере, поднимает воркеры.
+"""Одна команда: поднимает изолированный стенд, гоняет контрактные тесты, убирает за собой.
 
-Использование (с ноутбука):  python tests/run_contract_tests.py
+    python tests/run_contract_tests.py
 
-Тесты пишут в рабочую БД тестовые задания (префикс CT-), поэтому воркеры на время
-прогона останавливаются — иначе они перехватывают задания раньше теста.
+Живые воркеры НЕ останавливаются. Рабочая БД и очередь не изменяются:
+стенд — отдельный контейнер на 127.0.0.1:8100 со схемой aihub_test.
 """
 from __future__ import annotations
 
 import os
-import re
 import subprocess
 import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SSH = ["ssh", "-o", "BatchMode=yes",
-       "-o", "UserKnownHostsFile=C:/Users/lavy/.ssh/known_hosts_lan",
-       "-o", "ConnectTimeout=25", "-i", os.path.expanduser("~/.ssh/cubeworld_server"),
-       "User@192.168.31.95"]
+WSL = r"C:\Program Files\WSL\wsl.exe"
 
 
-def laptop_worker_pids() -> list[int]:
-    out = subprocess.run(["wmic", "process", "where", "name='pythonw.exe'",
-                          "get", "ProcessId,CommandLine", "/format:list"],
-                         capture_output=True).stdout.decode("cp866", "replace")
-    return [int(m) for b in out.split("\n\n") if "worker_v2.py" in b
-            for m in re.findall(r"ProcessId=(\d+)", b)]
+def wsl(cmd: str, timeout: int = 300) -> tuple[int, str]:
+    r = subprocess.run([WSL, "-d", "AIHub", "-e", "bash", "-lc", cmd],
+                       capture_output=True, timeout=timeout)
+    return r.returncode, (r.stdout + r.stderr).decode("utf-8", "replace")
 
 
 def main() -> int:
-    stopped = laptop_worker_pids()
-    for pid in stopped:
-        subprocess.run(["taskkill", "/f", "/pid", str(pid)], capture_output=True)
-    subprocess.run(SSH + ["schtasks /end /tn AIHub-Worker"], capture_output=True)
-    print(f"воркеры остановлены (ноутбук: {stopped})")
-    time.sleep(1)
+    print("== поднимаю стенд (aihub-hub-test, 127.0.0.1:8100, схема aihub_test)")
+    code, out = wsl("cd /mnt/r/AI-Hub/infra && docker compose -f docker-compose.test.yml "
+                    "--env-file .env up -d 2>&1 | tail -5")
+    print(out.strip())
+    if code != 0:
+        return 1
+
     try:
+        for _ in range(40):
+            code, out = wsl("curl -s -m 3 http://127.0.0.1:8100/health", timeout=30)
+            if '"db":true' in out:
+                print("стенд готов:", out.strip())
+                break
+            time.sleep(2)
+        else:
+            print("стенд не поднялся:", out[-500:])
+            return 1
+
+        print("== контрактные тесты")
         with open(os.path.join(HERE, "contract_tests.py"), "rb") as fh:
-            r = subprocess.run(SSH + ["python -u -X utf8 -"], stdin=fh,
-                               capture_output=True, timeout=600)
+            r = subprocess.run(
+                ["ssh", "-o", "BatchMode=yes",
+                 "-o", "UserKnownHostsFile=C:/Users/lavy/.ssh/known_hosts_lan",
+                 "-o", "ConnectTimeout=25", "-i", os.path.expanduser("~/.ssh/cubeworld_server"),
+                 "User@192.168.31.95", "python -u -X utf8 -"],
+                stdin=fh, capture_output=True, timeout=600)
         sys.stdout.write(r.stdout.decode("utf-8", "replace"))
         sys.stderr.write(r.stderr.decode("utf-8", "replace")[-500:])
         return r.returncode
     finally:
-        subprocess.run(SSH + ["schtasks /run /tn AIHub-Worker"], capture_output=True)
-        subprocess.run(["wscript", r"C:\Users\lavy\aihub-bridge\start-worker.vbs"], capture_output=True)
-        print("воркеры запущены снова")
+        print("== убираю стенд и тестовую схему")
+        _, out = wsl("cd /mnt/r/AI-Hub/infra && docker compose -f docker-compose.test.yml "
+                     "--env-file .env down 2>&1 | tail -3; "
+                     "docker exec aihub-postgres psql -U llmproxy -d litellm "
+                     "-c 'drop schema if exists aihub_test cascade'")
+        print(out.strip())
 
 
 if __name__ == "__main__":

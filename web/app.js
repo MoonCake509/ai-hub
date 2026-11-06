@@ -3,7 +3,7 @@
 
 const API = window.location.pathname.startsWith('/ui') ? '' : '';
 const TOKEN_KEY = 'aihub_token';
-const BUILD = 'ui15';
+const BUILD = 'ui16';
 function storeGet(k) { try { return localStorage.getItem(k) || ''; } catch (e) { return ''; } }
 function storeSet(k, v) { try { localStorage.setItem(k, v); return true; } catch (e) { return false; } }
 function storeDel(k) { try { localStorage.removeItem(k); } catch (e) { /* заблокировано */ } }
@@ -329,28 +329,48 @@ document.querySelectorAll('.chip').forEach(chip => {
 const moreBtn = $('#more');
 if (moreBtn) moreBtn.onclick = () => { if (!listBusy) loadJobs(true); };
 
+async function fetchJobsPage(limit, offset) {
+  const q = '/jobs?limit=' + limit + '&offset=' + offset
+    + (currentStatus ? '&status=' + encodeURIComponent(currentStatus) : '');
+  return api(q);
+}
+
 async function loadJobs(more) {
   if (listBusy) return;
   listBusy = true;
   const gen = more ? listGen : ++listGen;
   try {
-    // Первая страница — 50; «показать ещё» догружает следующую пачку.
-    // Обычный опрос перезапрашивает столько, сколько уже показано, чтобы список не схлопывался
-    // после 200 строк (был баг: min(200, ...) обрезал показанные 250).
+    // Сервер отдаёт не больше 200 строк за запрос. Если на экране больше,
+    // опрос дочитывает окно по страницам — иначе список схлопывался до 200.
     const limit = more ? 50 : Math.max(50, jobsLoaded);
     const offset = more ? jobsLoaded : 0;
-    const q = '/jobs?limit=' + limit + '&offset=' + offset
-      + (currentStatus ? '&status=' + encodeURIComponent(currentStatus) : '');
-    const data = await api(q);
+    let jobs = [];
+    let total = 0;
+    let hasMore = false;
+    if (more) {
+      const data = await fetchJobsPage(limit, offset);
+      jobs = data.jobs || [];
+      total = data.total ?? jobs.length;
+      hasMore = !!data.has_more;
+    } else {
+      let got = 0;
+      while (got < limit) {
+        const data = await fetchJobsPage(Math.min(200, limit - got), offset + got);
+        const page = data.jobs || [];
+        jobs = jobs.concat(page);
+        total = data.total ?? jobs.length;
+        hasMore = !!data.has_more;
+        got += page.length;
+        if (page.length === 0 || !data.has_more || got >= limit) break;
+        if (gen !== listGen) return;
+      }
+    }
     if (gen !== listGen) return;  // устаревший ответ: фильтр сменили или пришёл новый опрос
-    const jobs = data.jobs || [];
     const body = $('#jobs-body');
     if (!more) { body.innerHTML = ''; seenJobs.clear(); }
-    let appended = 0;
     for (const j of jobs) {
       if (seenJobs.has(j.id)) continue;  // защита от дублей при пересечении страниц
       seenJobs.add(j.id);
-      appended += 1;
       const tr = el('tr');
       tr.dataset.id = j.id;
       if (currentJob && currentJob.id === j.id) tr.classList.add('selected');
@@ -366,10 +386,10 @@ async function loadJobs(more) {
       body.append(tr);
     }
     jobsLoaded = more ? offset + jobs.length : jobs.length;
-    jobsTotal = data.total ?? jobsLoaded;
+    jobsTotal = total;
     $('#jobs-empty').hidden = jobsLoaded > 0;
     const moreBtnEl = $('#more');
-    if (moreBtnEl) moreBtnEl.hidden = !(data.has_more || jobsLoaded < jobsTotal);
+    if (moreBtnEl) moreBtnEl.hidden = !(hasMore || jobsLoaded < jobsTotal);
   } catch (e) {
     if (e.message !== 'unauthorized') $('#health-text').textContent = 'ошибка истории: ' + e.message;
   } finally {

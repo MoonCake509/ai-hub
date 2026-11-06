@@ -1,15 +1,19 @@
-"""Контрактные тесты хаба против живого сервера (через SSH на сервер).
+"""Контрактные тесты хаба против ИЗОЛИРОВАННОГО СТЕНДА (порт 8100, схема aihub_test).
 
-Запуск с ноутбука:  python tests/run_contract_tests.py
-Прямо на сервере:   python tests/contract_tests.py
+Запуск одной командой с ноутбука:  python tests/run_contract_tests.py
 
-Покрывает замечания ревью 7.1–7.3:
+Стенд поднимается автоматически (infra/docker-compose.test.yml), живые воркеры
+НЕ останавливаются, рабочая БД и очередь не изменяются. Все проверки идут против
+схемы aihub_test, которая после прогона удаляется.
+
+Покрывает замечания ревью 7.1–7.3 и 8.1:
 - конфликт payload с тем же Idempotency-Key (агент/таймаут, не только prompt) → 409;
 - границы timeout → 400;
 - превышение длины prompt → 413;
-- lease-expired + late-result: статус не меняется, payload в late_results, повтор идемпотентен;
+- реальный expire_leases (LEASE_SECONDS=3 на стенде) + late-result:
+  статус не меняется, payload в late_results, повтор идемпотентен;
 - повтор применённого результата → duplicate, не late;
-- конкурентный приём при заполненной очереди: лимит не превышается.
+- конкурентный приём при заполненной очереди в ДВУХ процессах: лимит не превышается.
 """
 from __future__ import annotations
 
@@ -22,10 +26,11 @@ import urllib.error
 import urllib.request
 import uuid
 
-BASE = os.environ.get("AIHUB_BASE", "http://127.0.0.1:8000")
+BASE = os.environ.get("AIHUB_BASE", "http://127.0.0.1:8100")
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 TOKEN_FILE = os.environ.get("AIHUB_TOKEN_FILE", r"C:/Users/user/aihub-worker/token.txt")
 WSL = r"C:\Program Files\WSL\wsl.exe"
+SCHEMA = "aihub_test"
 
 FAILURES: list[str] = []
 
@@ -46,6 +51,8 @@ def api(method, path, body=None, timeout=60):
 
 
 def sql(query):
+    # Все обращения — только к тестовой схеме. Рабочая aihub не читается и не меняется.
+    query = query.replace("aihub.", SCHEMA + ".")
     r = subprocess.run([WSL, "-d", "AIHub", "-e", "bash", "-lc",
                         "docker exec aihub-postgres psql -U llmproxy -d litellm -t -A -c " + repr(query)],
                        capture_output=True)
@@ -118,8 +125,18 @@ def test_late_result():
         check("late: аренда тестового задания", False, "воркер перехватил")
         return
     attempt = att["attempt_id"]
-    sql(f"update aihub.job_attempts set status='unknown', finished_at=now() where id='{attempt}'")
-    sql(f"update aihub.jobs set status='unknown', needs_reconcile=true, finished_at=now() where id='{job_id}'")
+    # Ждём настоящего истечения аренды (на стенде LEASE_SECONDS=3), без прямого SQL.
+    deadline = time.time() + 30
+    status = ""
+    job = {}
+    while time.time() < deadline:
+        _, job = api("GET", "/jobs/" + job_id)
+        status = job["status"]
+        if status == "unknown":
+            break
+        time.sleep(1)
+    check("late: sweeper сам перевёл в unknown", status == "unknown", status)
+    check("late: needs_reconcile выставлен", bool(job.get("needs_reconcile")))
     payload = {"job_id": job_id, "attempt_id": attempt, "ok": True,
                "output": "CT-LATE-OK", "usage": {}, "elapsed": 1.0}
     code, r = api("POST", "/bridge/result", payload)
@@ -164,7 +181,7 @@ def test_duplicate_result():
 
 
 def test_concurrent_queue():
-    # Лимит проверяем напрямую через БД-функцию под нагрузкой: 8 потоков, лимит 5.
+    """Два ОТДЕЛЬНЫХ процесса (не потоки в одном): 4 параллельных создания в каждом, лимит 5."""
     script = r'''
 import concurrent.futures as cf, sys
 sys.path.insert(0, "/app")
@@ -175,26 +192,29 @@ def mk(i):
         return "created"
     except db.QueueFull:
         return "full"
-with cf.ThreadPoolExecutor(8) as ex:
-    res = list(ex.map(mk, range(8)))
+with cf.ThreadPoolExecutor(4) as ex:
+    res = list(ex.map(mk, range(4)))
 print("created:", res.count("created"), "full:", res.count("full"))
 '''
-    # чистим очередь openclaw, чтобы лимит был детерминирован
     sql("update aihub.jobs set status='cancelled', finished_at=now() where status='queued' and agent_id='openclaw'")
-    r = subprocess.run([WSL, "-d", "AIHub", "-e", "bash", "-lc",
-                        "docker exec -i aihub-hub python - <<'PY'\n" + script + "\nPY"],
-                       capture_output=True, timeout=120)
-    out = r.stdout.decode("utf-8", "replace")
-    print("  queue concurrency:", out.strip())
-    created = int(out.split("created:")[1].split()[0]) if "created:" in out else -1
+    cmd = [WSL, "-d", "AIHub", "-e", "bash", "-lc",
+           "docker exec -i -e SCHEMA=aihub_test aihub-hub-test python - <<'PY'\n" + script + "\nPY"]
+    # два процесса одновременно — проверка межпроцессного инварианта advisory-блокировки
+    procs = [subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE) for _ in range(2)]
+    outs = [p.communicate(timeout=120) for p in procs]
+    total_created = 0
+    for out, err in outs:
+        text = out.decode("utf-8", "replace")
+        print("  process:", text.strip(), err.decode("utf-8", "replace")[-200:])
+        if "created:" in text:
+            total_created += int(text.split("created:")[1].split()[0])
     n = sql("select count(*) from aihub.jobs where status='queued' and agent_id='openclaw'")
-    check("конкурентная очередь: не более 5", created <= 5 and int(n or 0) <= 5, f"created={created} db={n}")
+    check("конкурентная очередь (2 процесса): не более 5",
+          total_created <= 5 and int(n or 0) <= 5, f"created={total_created} db={n}")
 
 
 if __name__ == "__main__":
     TOKEN = open(TOKEN_FILE, encoding="utf-8").read().strip()
-    sql("update aihub.jobs set status='cancelled', finished_at=now() where status in ('queued','running') and agent_id='openclaw'")
-    sql("update aihub.job_attempts set status='cancelled', finished_at=now() where status='running'")
     for fn in (test_idem_conflict, test_timeout_bounds, test_prompt_limit,
                test_duplicate_result, test_late_result, test_concurrent_queue):
         print("==", fn.__name__)

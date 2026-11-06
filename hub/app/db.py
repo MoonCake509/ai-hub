@@ -21,6 +21,22 @@ import pg8000.native
 _lock = threading.RLock()
 _conn: pg8000.native.Connection | None = None
 
+# Тестовый стенд работает в отдельной схеме той же БД: рабочие таблицы не затрагиваются.
+# Схема подставляется через search_path при подключении, а не правкой SQL-текстов.
+SCHEMA = os.environ.get("SCHEMA", "aihub")
+if not SCHEMA.replace("_", "").isalnum():
+    raise ValueError(f"недопустимое имя схемы: {SCHEMA!r}")
+
+
+def _qualify(sql: str) -> str:
+    """Переводит литералы схемы `aihub.` на активную схему.
+
+    Для прода это тождественная замена. Для стенда все обращения уходят в aihub_test.
+    """
+    if SCHEMA == "aihub":
+        return sql
+    return sql.replace("aihub.", SCHEMA + ".")
+
 DDL = [
     "create schema if not exists aihub",
     """create table if not exists aihub.jobs (
@@ -105,12 +121,14 @@ def connect() -> pg8000.native.Connection:
 def init() -> None:
     with _lock:
         conn = connect()
+        # Сначала создаём саму схему — её имя подменять нельзя.
+        conn.run(f"create schema if not exists {SCHEMA}")
         for stmt in DDL:
-            conn.run(stmt)
+            conn.run(_qualify(stmt))
 
 
 def _rows(conn, sql: str, **params) -> list[dict]:
-    result = conn.run(sql, **params)
+    result = conn.run(_qualify(sql), **params)
     cols = [c["name"] for c in conn.columns] if conn.columns else []
     return [dict(zip(cols, row)) for row in result]
 
@@ -157,12 +175,12 @@ def create_job(agent_id: str, prompt: str, prompt_sha: str, timeout_s: int,
                 depth = _one(conn, "select count(*) as n from aihub.jobs where status = 'queued'")["n"]
                 if depth >= max_queue:
                     raise QueueFull(depth)
-            conn.run(
+            conn.run(_qualify(
                 "insert into aihub.jobs(id, agent_id, prompt, prompt_sha, timeout_s, idempotency_key)"
-                " values (:i, :a, :p, :s, :t, :k)",
+                " values (:i, :a, :p, :s, :t, :k)"),
                 i=job_id, a=agent_id, p=prompt, s=prompt_sha, t=timeout_s, k=idempotency_key,
             )
-            conn.run("insert into aihub.job_events(job_id, event) values (:j, 'queued')", j=job_id)
+            conn.run(_qualify("insert into aihub.job_events(job_id, event) values (:j, 'queued')"), j=job_id)
             conn.run("commit")
         except Exception:
             conn.run("rollback")
@@ -257,13 +275,13 @@ def lease_job(worker: str, lease_seconds: int = 300, agents: str = "") -> dict |
                 conn.run("commit")
                 return None
             attempt_id = uuid.uuid4().hex
-            conn.run(
+            conn.run(_qualify(
                 "insert into aihub.job_attempts(id, job_id, attempt_no, worker, lease_until)"
-                " values (:a, :j, :n, :w, now() + (:lease || ' seconds')::interval)",
+                " values (:a, :j, :n, :w, now() + (:lease || ' seconds')::interval)"),
                 a=attempt_id, j=row["id"], n=row["attempts"], w=worker, lease=str(int(lease_seconds)),
             )
-            conn.run(
-                "insert into aihub.job_events(job_id, attempt_id, event) values (:j, :a, 'leased')",
+            conn.run(_qualify(
+                "insert into aihub.job_events(job_id, attempt_id, event) values (:j, :a, 'leased')"),
                 j=row["id"], a=attempt_id,
             )
             conn.run("commit")
@@ -296,9 +314,9 @@ def _store_late(conn, job_id: str | None, attempt_id: str, attempt_status: str |
         "ok": ok, "output": output, "error": error,
         "usage": usage or {}, "elapsed": elapsed,
     }, ensure_ascii=False)
-    conn.run(
+    conn.run(_qualify(
         "insert into aihub.late_results(job_id, attempt_id, attempt_status, payload)"
-        " values (:j, :a, :s, :p::jsonb) on conflict (attempt_id) do nothing",
+        " values (:j, :a, :s, :p::jsonb) on conflict (attempt_id) do nothing"),
         j=job_id, a=attempt_id, s=attempt_status, p=payload,
     )
 
@@ -350,20 +368,20 @@ def finish_attempt(attempt_id: str, ok: bool, output: str | None, error: str | N
                 conn.run("commit")
                 return "stale"
             status = "succeeded" if ok else "failed"
-            conn.run(
+            conn.run(_qualify(
                 "update aihub.job_attempts set status = :s, finished_at = now(), output = :o,"
-                " error = :e, usage = :u::jsonb where id = :a",
+                " error = :e, usage = :u::jsonb where id = :a"),
                 s=status, o=output, e=error, u=json.dumps(usage or {}, ensure_ascii=False), a=attempt_id,
             )
-            conn.run(
+            conn.run(_qualify(
                 "update aihub.jobs set status = :s, finished_at = now(), result_output = :o,"
                 " result_error = :e, result_usage = :u::jsonb, lease_until = null,"
-                " needs_reconcile = false where id = :j",
+                " needs_reconcile = false where id = :j"),
                 s=status, o=output, e=error, u=json.dumps(usage or {}, ensure_ascii=False), j=job["id"],
             )
-            conn.run(
+            conn.run(_qualify(
                 "insert into aihub.job_events(job_id, attempt_id, event, payload)"
-                " values (:j, :a, :e, :p::jsonb)",
+                " values (:j, :a, :e, :p::jsonb)"),
                 j=job["id"], a=attempt_id, e=status,
                 p=json.dumps({"elapsed": elapsed}, ensure_ascii=False),
             )
@@ -388,13 +406,13 @@ def cancel_job(job_id: str) -> str:
                 conn.run("rollback")
                 return "already_finished"
             if job["status"] == "queued":
-                conn.run("update aihub.jobs set status = 'cancelled', finished_at = now() where id = :j", j=job_id)
+                conn.run(_qualify("update aihub.jobs set status = 'cancelled', finished_at = now() where id = :j"), j=job_id)
                 status = "cancelled"
             else:
-                conn.run("update aihub.jobs set needs_reconcile = true where id = :j", j=job_id)
+                conn.run(_qualify("update aihub.jobs set needs_reconcile = true where id = :j"), j=job_id)
                 status = "cancel_requested"
-            conn.run(
-                "insert into aihub.job_events(job_id, event) values (:j, :e)", j=job_id, e=status,
+            conn.run(_qualify(
+                "insert into aihub.job_events(job_id, event) values (:j, :e)"), j=job_id, e=status,
             )
             conn.run("commit")
         except Exception:

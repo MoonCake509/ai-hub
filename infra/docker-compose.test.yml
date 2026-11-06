@@ -1,0 +1,27 @@
+# Тестовый стенд AI Hub: отдельная БД, отдельный порт, своя схема.
+# Живой хаб, его воркеры и рабочая БД не затрагиваются.
+services:
+  hub-test:
+    build:
+      context: ../hub
+      dockerfile: Dockerfile
+    image: aihub-hub:test
+    container_name: aihub-hub-test
+    environment:
+      DATABASE_URL: postgresql://llmproxy:${POSTGRES_PASSWORD}@postgres:5432/litellm
+      AGENTS_YAML: /app/config/agents.yaml
+      HUB_TOKEN: ${HUB_TOKEN}
+      SCHEMA: aihub_test
+      LEASE_SECONDS: "3"
+      MAX_QUEUE: "50"
+      MAX_PROMPT_CHARS: "20000"
+      MAX_RESULT_CHARS: "100000"
+    volumes:
+      - ../hub/app:/app/app:ro
+      - ../config/agents.yaml:/app/config/agents.yaml:ro
+    networks:
+      - default
+    ports:
+      - "127.0.0.1:8100:8000"
+    command: ["python", "-m", "app.serve"]
+    # TLS на стенде не нужен: serve.py сам отключит его без сертификатов

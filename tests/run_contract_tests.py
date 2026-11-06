@@ -24,7 +24,7 @@ def wsl(cmd: str, timeout: int = 300) -> tuple[int, str]:
 
 def main() -> int:
     print("== поднимаю стенд (aihub-hub-test, 127.0.0.1:8100, отдельная БД aihub_test)")
-    code, out = wsl("cd /mnt/r/AI-Hub/infra && docker compose -f docker-compose.test.yml "
+    code, out = wsl("cd /mnt/r/AI-Hub/infra && docker compose -p aihub-test -f docker-compose.test.yml "
                     "--env-file .env up -d --build 2>&1 | tail -10; echo exit=$?")
     print(out.strip())
     if "exit=0" not in out:
@@ -55,7 +55,7 @@ def main() -> int:
         return r.returncode
     finally:
         print("== убираю стенд (контейнеры и данные тестовой БД)")
-        _, out = wsl("cd /mnt/r/AI-Hub/infra && docker compose -f docker-compose.test.yml "
+        _, out = wsl("cd /mnt/r/AI-Hub/infra && docker compose -p aihub-test -f docker-compose.test.yml "
                      "--env-file .env down -v 2>&1 | tail -5")
         print(out.strip())
 

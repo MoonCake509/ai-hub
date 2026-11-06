@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AI-Hub — задания и агенты</title>
-<link rel="stylesheet" href="styles.css?v=16">
+<link rel="stylesheet" href="styles.css?v=19">
 </head>
 <body>
 <header class="top">
@@ -48,6 +48,12 @@
       <label>Лимит времени, с
         <input id="run-timeout" type="number" min="10" max="3600" value="300">
       </label>
+      <label>Провайдер
+        <select id="run-profile" required></select>
+      </label>
+      <label>Модель
+        <select id="run-model" required></select>
+      </label>
       <button class="primary" id="run-submit" type="submit">Запустить</button>
       <p class="msg" id="run-msg"></p>
     </form>
@@ -69,7 +75,7 @@
     <div class="table-wrap">
       <table id="jobs-table">
         <thead>
-          <tr><th>Создано</th><th>Агент</th><th>Статус</th><th>Время</th><th>Попытки</th><th>Задание</th></tr>
+          <tr><th>Создано</th><th>Агент</th><th>Статус</th><th>Время</th><th>Попытки</th><th>Модель</th><th>Задание</th></tr>
         </thead>
         <tbody id="jobs-body"></tbody>
       </table>
@@ -104,6 +110,6 @@
   <ol id="d-events" class="events"></ol>
 </aside>
 
-<script src="app.js?v=16"></script>
+<script src="app.js?v=19"></script>
 </body>
 </html>

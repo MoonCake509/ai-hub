@@ -3,7 +3,7 @@
 
 const API = window.location.pathname.startsWith('/ui') ? '' : '';
 const TOKEN_KEY = 'aihub_token';
-const BUILD = 'ui16';
+const BUILD = 'ui19';
 function storeGet(k) { try { return localStorage.getItem(k) || ''; } catch (e) { return ''; } }
 function storeSet(k, v) { try { localStorage.setItem(k, v); return true; } catch (e) { return false; } }
 function storeDel(k) { try { localStorage.removeItem(k); } catch (e) { /* заблокировано */ } }
@@ -258,8 +258,55 @@ async function loadAgents() {
     agentNames.set(a.id, a.name || a.id);
     if (a.bridge_agent) agentNames.set(a.bridge_agent, a.name || a.bridge_agent);
   }
-  if (agents.length) select.value = agents[0].id;
+  if (agents.length) {
+    select.value = agents[0].id;
+    await loadAgentProfiles(agents[0].id);
+  }
 }
+
+// Профили и модели агента: заполняем селекты из реестра.
+async function loadAgentProfiles(agentId) {
+  const profileSel = $('#run-profile');
+  const modelSel = $('#run-model');
+  profileSel.innerHTML = '';
+  modelSel.innerHTML = '';
+  if (!agentId) return;
+  try {
+    const d = await api('/agent-profiles/' + encodeURIComponent(agentId));
+    const profiles = d.profiles || [];
+    for (const p of profiles) {
+      const opt = el('option', '', p.name || p.id);
+      opt.value = p.id;
+      profileSel.append(opt);
+    }
+    if (profiles.length) {
+      profileSel.value = profiles[0].id;
+      await loadProfileModels(agentId, profiles[0].id, profiles);
+    }
+  } catch (e) {
+    profileSel.innerHTML = '<option value="">—</option>';
+    modelSel.innerHTML = '<option value="">—</option>';
+  }
+}
+
+async function loadProfileModels(agentId, profileId, profiles) {
+  const modelSel = $('#run-model');
+  modelSel.innerHTML = '';
+  const p = (profiles || []).find(x => x.id === profileId);
+  const models = (p && p.models) || [];
+  for (const m of models) {
+    const opt = el('option', '', m);
+    opt.value = m;
+    modelSel.append(opt);
+  }
+}
+
+$('#run-agent').onchange = () => loadAgentProfiles($('#run-agent').value);
+$('#run-profile').onchange = async () => {
+  const agentId = $('#run-agent').value;
+  const d = await api('/agent-profiles/' + encodeURIComponent(agentId)).catch(() => ({profiles:[]}));
+  await loadProfileModels(agentId, $('#run-profile').value, d.profiles || []);
+};
 
 // ---------- запуск ----------
 $('#run-form').onsubmit = async e => {
@@ -279,6 +326,10 @@ $('#run-form').onsubmit = async e => {
     const key = reuse ? pendingRun.key : newKey();
     pendingRun = { agent, prompt, timeout, key };
     const body = { prompt, timeout, idempotency_key: key };
+    const model = $('#run-model').value;
+    const profile = $('#run-profile').value;
+    if (model) body.model = model;
+    if (profile) body.profile = profile;
     const r = await api('/agents/' + encodeURIComponent($('#run-agent').value) + '/run', {
       method: 'POST', body: JSON.stringify(body),
     });
@@ -381,6 +432,12 @@ async function loadJobs(more) {
       tr.append(st);
       tr.append(el('td', '', fmtDur(j.created_at, j.finished_at, j.status === 'running')));
       tr.append(el('td', '', String(j.attempts ?? 0)));
+      const modelCell = el('td', 'model');
+      modelCell.textContent = j.effective_model || j.requested_model || '—';
+      if (j.effective_model && j.requested_model && j.effective_model !== j.requested_model) {
+        modelCell.title = 'запрошено: ' + j.requested_model + ' \u2192 фактически: ' + j.effective_model;
+      }
+      tr.append(modelCell);
       tr.append(el('td', 'prompt', j.prompt_preview || ''));
       tr.onclick = () => openJob(j.id);
       body.append(tr);

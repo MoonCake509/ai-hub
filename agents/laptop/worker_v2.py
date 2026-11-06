@@ -187,15 +187,23 @@ def main() -> int:
 
         lease = int(job.get("lease_seconds") or 300)
         timeout = int(job.get("timeout") or spec["timeout"])
+        requested_model = job.get("requested_model")
         stop = threading.Event()
         threading.Thread(target=heartbeat_loop, args=(base, attempt_id, lease, stop), daemon=True).start()
 
-        log(f"job {job_id} attempt={attempt_id} agent={agent_id} timeout={timeout}")
+        log(f"job {job_id} attempt={attempt_id} agent={agent_id} timeout={timeout} model={requested_model}")
         started = time.time()
         try:
-            result = spec["runner"](prompt, timeout)
+            # Выбор модели передаётся только адаптерам, которые его применяют.
+            if requested_model and agent_id in ("codex",):
+                result = spec["runner"](prompt, timeout, requested_model)
+            else:
+                result = spec["runner"](prompt, timeout)
             ok = result.get("exit_code") == 0
             payload = {"job_id": job_id, "attempt_id": attempt_id, "ok": ok, **result}
+            # Фактическая модель: если инструмент её раскрывает — сохраняем, иначе null.
+            if result.get("model") is None:
+                payload["model"] = requested_model
             if not ok and not payload.get("error"):
                 code = result.get("exit_code")
                 tail = (result.get("output") or "").strip()[-500:]

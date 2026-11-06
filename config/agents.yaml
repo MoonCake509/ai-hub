@@ -6,6 +6,19 @@
 
 agents:
   - id: codex
+    default_profile: openai
+    profiles:
+      - id: openai
+        name: OpenAI (подписка Codex)
+        models:
+          - gpt-5.3-codex
+          - gpt-5.2-codex
+          - gpt-5.1-codex
+          - gpt-5-codex
+      - id: oss
+        name: Open-source (llama.cpp)
+        models:
+          - dolphin-2.9-llama3-8b.Q4_K_M
     name: Codex CLI
     transport: cli
     host: laptop
@@ -15,6 +28,20 @@ agents:
     notes: "бинарь вне PATH: AppData/Local/OpenAI/Codex/bin/*/codex.exe"
 
   - id: openclaw-laptop
+    default_profile: claudehub
+    profiles:
+      - id: claudehub
+        name: ClaudeHub (claudehub)
+        models:
+          - claude-opus-5
+          - claude-sonnet-4.5
+          - claude-haiku-4
+      - id: router-cheap
+        name: Router.cheap
+        models:
+          - deepseek-v4.1-flash
+          - gpt-6.1-sol
+          - qwen3.8-max
     name: OpenClaw (ноутбук)
     transport: cli
     host: laptop
@@ -24,6 +51,20 @@ agents:
     notes: "gateway только на loopback, ходим через CLI"
 
   - id: hermes-laptop
+    default_profile: claudehub
+    profiles:
+      - id: claudehub
+        name: ClaudeHub (claudehub)
+        models:
+          - deepseek-v4.1-flash
+          - claude-opus-5
+          - claude-sonnet-4.5
+      - id: router-cheap
+        name: Router.cheap
+        models:
+          - deepseek-v4.1-flash
+          - gpt-6.1-sol
+          - qwen3.8-max
     name: Hermes (ноутбук)
     transport: cli
     host: laptop
@@ -33,6 +74,14 @@ agents:
     notes: "режим одного запроса; через хаб — pull-воркер ноутбука"
 
   - id: qwen-code
+    default_profile: qwen-sub
+    profiles:
+      - id: qwen-sub
+        name: Qwen (подписка)
+        models:
+          - qwen3.8-max
+          - qwen3.8-plus
+          - qwen3.8-flash
     name: Qwen Desktop
     transport: cdp
     host: laptop
@@ -41,6 +90,12 @@ agents:
     notes: "только через CDP/DOM, API нет"
 
   - id: llm-server
+    default_profile: local
+    profiles:
+      - id: local
+        name: Локальный llama.cpp
+        models:
+          - dolphin-2.9-llama3-8b.Q4_K_M
     name: llama.cpp Dolphin 8B (сервер)
     transport: http
     host: server
@@ -50,6 +105,20 @@ agents:
     notes: "127.0.0.1:11434, OpenAI-совместимый; ctx 8192, max_tokens 1024"
 
   - id: hermes-server
+    default_profile: claudehub
+    profiles:
+      - id: claudehub
+        name: ClaudeHub (сервер)
+        models:
+          - deepseek-v4.1-flash
+          - claude-opus-5
+          - claude-sonnet-4.5
+      - id: router-cheap
+        name: Router.cheap (сервер)
+        models:
+          - deepseek-v4.1-flash
+          - gpt-6.1-sol
+          - qwen3.8-max
     name: Hermes (сервер)
     transport: cli
     host: server
@@ -58,6 +127,20 @@ agents:
     command: "hermes -z <prompt>"
 
   - id: openclaw-server
+    default_profile: claudehub
+    profiles:
+      - id: claudehub
+        name: ClaudeHub (сервер)
+        models:
+          - claude-opus-5
+          - claude-sonnet-4.5
+          - claude-haiku-4
+      - id: router-cheap
+        name: Router.cheap (сервер)
+        models:
+          - deepseek-v4.1-flash
+          - gpt-6.1-sol
+          - qwen3.8-max
     name: OpenClaw (сервер)
     transport: cli
     host: server
@@ -66,6 +149,14 @@ agents:
     command: "openclaw agent --message-file <file> --json"
 
   - id: qwen-server
+    default_profile: qwen-sub
+    profiles:
+      - id: qwen-sub
+        name: Qwen (подписка, сервер)
+        models:
+          - qwen3.8-max
+          - qwen3.8-plus
+          - qwen3.8-flash
     name: Qwen Desktop (сервер)
     transport: cdp
     host: server

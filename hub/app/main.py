@@ -52,6 +52,7 @@ async def _sweeper() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await asyncio.to_thread(db.init)
+    load_profiles()
     task = asyncio.create_task(_sweeper())
     try:
         yield
@@ -99,6 +100,29 @@ def agents() -> dict:
     return {"count": len(items), "agents": items}
 
 
+# Профили провайдеров и модели для выбора в интерфейсе. Источник — реестр агентов,
+# а не внешние платные вызовы: хаб не расходует бюджет на перечисление каталога.
+AGENT_PROFILES: dict[str, dict] = {}
+
+
+def load_profiles() -> None:
+    for item in load_agents().get("agents", []):
+        AGENT_PROFILES[item["id"]] = {
+            "agent_id": item["id"],
+            "profiles": item.get("profiles") or [],
+            "default_profile": item.get("default_profile") or "",
+        }
+
+
+@app.get("/agent-profiles/{agent_id}", dependencies=[Depends(require_token)])
+async def agent_profiles(agent_id: str) -> dict:
+    item = find_agent(agent_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail=f"agent '{agent_id}' not found")
+    prof = AGENT_PROFILES.get(agent_id) or {"profiles": [], "default_profile": ""}
+    return {"agent_id": agent_id, **prof}
+
+
 @app.get("/agents/{agent_id}")
 def agent(agent_id: str) -> dict:
     item = find_agent(agent_id)
@@ -135,9 +159,36 @@ async def run_agent(agent_id: str, request: Request) -> JSONResponse:
     idem = payload.get("idempotency_key") or request.headers.get("idempotency-key")
     prompt_sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
 
+    # Выбор провайдера/модели: реальная конфигурация, а не только поле в интерфейсе.
+    # Несовместимое сочетание отклоняем до постановки в очередь.
+    requested_model = (payload.get("model") or "").strip() or None
+    requested_profile = (payload.get("profile") or "").strip() or None
+    prof = AGENT_PROFILES.get(agent_id) or {}
+    known_profiles = prof.get("profiles") or []
+    default_profile = prof.get("default_profile") or ""
+    if not requested_profile:
+        requested_profile = default_profile
+    profile_spec = None
+    for p in known_profiles:
+        if p.get("id") == requested_profile:
+            profile_spec = p
+            break
+    if requested_profile and profile_spec is None:
+        raise HTTPException(status_code=400,
+                            detail=f"unknown provider profile '{requested_profile}' for agent '{agent_id}'")
+    if profile_spec is not None:
+        known_models = profile_spec.get("models") or []
+        if requested_model and requested_model not in known_models:
+            raise HTTPException(status_code=400,
+                                detail=f"model '{requested_model}' not supported by profile '{requested_profile}' "
+                                       f"of agent '{agent_id}'. Supported: {', '.join(known_models) or 'none'}")
+        if not requested_model and known_models:
+            requested_model = known_models[0]
+
     try:
         job, created = await asyncio.to_thread(
-            db.create_job, bridge_agent, prompt, prompt_sha, timeout_s, idem or None, MAX_QUEUE)
+            db.create_job, bridge_agent, prompt, prompt_sha, timeout_s, idem or None, MAX_QUEUE,
+            requested_model)
     except ValueError:
         raise HTTPException(status_code=409, detail="idempotency_key already used with another payload") from None
     except db.QueueFull as exc:
@@ -207,6 +258,7 @@ async def bridge_jobs(worker: str = "", agents: str = "") -> JSONResponse:
         "prompt": leased["prompt"],
         "timeout": leased["timeout_s"],
         "lease_seconds": LEASE_SECONDS,
+        "requested_model": leased.get("requested_model"),
     })
 
 

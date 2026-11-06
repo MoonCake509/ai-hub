@@ -55,6 +55,8 @@ DDL = [
         result_output text,
         result_error text,
         result_usage jsonb,
+        requested_model text,
+        effective_model text,
         lease_until timestamptz,
         worker text
     )""",
@@ -125,6 +127,13 @@ def init() -> None:
         conn.run(f"create schema if not exists {SCHEMA}")
         for stmt in DDL:
             conn.run(_qualify(stmt))
+        # Миграция на месте: новые колонки для выбора модели (9.1).
+        for col, decl in (("requested_model", "text"), ("effective_model", "text")):
+            try:
+                conn.run(_qualify(
+                    f"alter table aihub.jobs add column if not exists {col} {decl}"))
+            except Exception:
+                pass
 
 
 def _rows(conn, sql: str, **params) -> list[dict]:
@@ -153,7 +162,8 @@ class QueueFull(Exception):
 
 
 def create_job(agent_id: str, prompt: str, prompt_sha: str, timeout_s: int,
-               idempotency_key: str | None, max_queue: int | None = None) -> tuple[dict, bool]:
+               idempotency_key: str | None, max_queue: int | None = None,
+               requested_model: str | None = None) -> tuple[dict, bool]:
     """Возвращает (job, created). При совпадении ключа с другим телом — ValueError."""
     job_id = uuid.uuid4().hex
     with _lock:
@@ -177,9 +187,10 @@ def create_job(agent_id: str, prompt: str, prompt_sha: str, timeout_s: int,
                 if depth >= max_queue:
                     raise QueueFull(depth)
             conn.run(_qualify(
-                "insert into aihub.jobs(id, agent_id, prompt, prompt_sha, timeout_s, idempotency_key)"
-                " values (:i, :a, :p, :s, :t, :k)"),
+                "insert into aihub.jobs(id, agent_id, prompt, prompt_sha, timeout_s, idempotency_key, requested_model)"
+                " values (:i, :a, :p, :s, :t, :k, :rm)"),
                 i=job_id, a=agent_id, p=prompt, s=prompt_sha, t=timeout_s, k=idempotency_key,
+                rm=requested_model,
             )
             conn.run(_qualify("insert into aihub.job_events(job_id, event) values (:j, 'queued')"), j=job_id)
             conn.run("commit")
@@ -201,6 +212,15 @@ def get_job(job_id: str) -> dict | None:
             " from aihub.job_attempts where job_id = :i order by attempt_no desc",
             i=job_id,
         )
+        # Миграция на месте: старые таблицы без новых колонок.
+        for col in ("requested_model", "effective_model"):
+            if col not in job:
+                try:
+                    conn.run(_qualify(
+                        f"alter table aihub.jobs add column if not exists {col} text"))
+                    job[col] = None
+                except Exception:
+                    job[col] = None
         return job
 
 
@@ -209,11 +229,13 @@ def list_jobs(status: str | None, limit: int = 50, offset: int = 0) -> list[dict
         conn = connect()
         if status:
             return _rows(conn, "select id, agent_id, status, created_at, finished_at, attempts,"
+                               " requested_model, effective_model,"
                                " left(prompt, 160) as prompt_preview"
                                " from aihub.jobs where status = :s order by created_at desc"
                                " limit :l offset :o",
                          s=status, l=limit, o=offset)
         return _rows(conn, "select id, agent_id, status, created_at, finished_at, attempts,"
+                          " requested_model, effective_model,"
                           " left(prompt, 160) as prompt_preview"
                           " from aihub.jobs order by created_at desc limit :l offset :o",
                     l=limit, o=offset)
@@ -269,7 +291,7 @@ def lease_job(worker: str, lease_seconds: int = 300, agents: str = "") -> dict |
                           worker = :w,
                           attempts = j.attempts + 1
                      from c where j.id = c.id
-                   returning j.id, j.agent_id, j.prompt, j.timeout_s, j.attempts""",
+                   returning j.id, j.agent_id, j.prompt, j.timeout_s, j.attempts, j.requested_model""",
                 lease=str(int(lease_seconds)), w=worker, agents=agents,
             )
             if not row:
@@ -377,8 +399,9 @@ def finish_attempt(attempt_id: str, ok: bool, output: str | None, error: str | N
             conn.run(_qualify(
                 "update aihub.jobs set status = :s, finished_at = now(), result_output = :o,"
                 " result_error = :e, result_usage = :u::jsonb, lease_until = null,"
-                " needs_reconcile = false where id = :j"),
-                s=status, o=output, e=error, u=json.dumps(usage or {}, ensure_ascii=False), j=job["id"],
+                " needs_reconcile = false, effective_model = :em where id = :j"),
+                s=status, o=output, e=error, u=json.dumps(usage or {}, ensure_ascii=False),
+                em=(usage or {}).get("model"), j=job["id"],
             )
             conn.run(_qualify(
                 "insert into aihub.job_events(job_id, attempt_id, event, payload)"

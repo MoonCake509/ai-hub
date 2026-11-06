@@ -95,8 +95,12 @@ def parse_codex(stdout: str) -> dict:
     }
 
 
-def run_codex(prompt: str, timeout: int) -> dict:
-    cmd = [CODEX_EXE, "exec", "--json", "--skip-git-repo-check", prompt]
+def run_codex(prompt: str, timeout: int, model: str | None = None) -> dict:
+    # Модель применяется флагом конкретного запуска, а не правкой глобального конфига.
+    cmd = [CODEX_EXE, "exec", "--json", "--skip-git-repo-check"]
+    if model:
+        cmd += ["-m", model]
+    cmd.append(prompt)
     started = time.time()
     proc = subprocess.run(
         cmd,
@@ -315,8 +319,13 @@ class Handler(BaseHTTPRequestHandler):
             self._send(429, {"error": f"agent '{agent_id}' busy"})
             return
         try:
-            log(f"run {agent_id} prompt_len={len(prompt)} timeout={timeout}")
-            result = spec["runner"](prompt, timeout)
+            model = (payload.get("model") or "").strip() or None
+            if model and agent_id not in ("codex",):
+                # Пока принимаем выбор модели только там, где адаптер его реально применяет.
+                self._send(400, {"error": f"agent '{agent_id}' does not support model selection yet"})
+                return
+            log(f"run {agent_id} prompt_len={len(prompt)} timeout={timeout} model={model}")
+            result = spec["runner"](prompt, timeout, model) if agent_id == "codex" else spec["runner"](prompt, timeout)
             log(f"done {agent_id} exit={result.get('exit_code')} out_len={len(result.get('output') or '')} elapsed={result.get('elapsed')}")
             self._send(200, {"ok": result.get("exit_code") == 0, "agent": agent_id, **result})
         except subprocess.TimeoutExpired:

@@ -21,10 +21,35 @@ function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
-async function api(path, opts = {}) {
+function fetchOnce(path, opts, timeoutMs) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
   if (token) headers.Authorization = 'Bearer ' + token;
-  const resp = await fetch(API + path, { ...opts, headers });
+  return fetch(API + path, { ...opts, headers, signal: ctrl.signal, cache: 'no-store' })
+    .finally(() => clearTimeout(timer));
+}
+
+async function api(path, opts = {}) {
+  const timeout = opts.timeout || 10000;
+  let resp;
+  let lastErr;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      resp = await fetchOnce(path, opts, timeout);
+      break;
+    } catch (e) {
+      lastErr = e;
+      // обрыв или таймаут — повторяем один раз: прокси на хабе иногда вешает соединение
+      if (attempt === 0) await new Promise(r => setTimeout(r, 600));
+    }
+  }
+  if (!resp) {
+    const reason = lastErr && lastErr.name === 'AbortError'
+      ? `хаб не ответил за ${Math.round(timeout / 1000)} с`
+      : (lastErr ? lastErr.message : 'сеть недоступна');
+    throw new Error('сеть: ' + reason);
+  }
   if (resp.status === 401) { openGate('Токен не подошёл — введи заново.'); throw new Error('unauthorized'); }
   const text = await resp.text();
   let data = null;
@@ -65,6 +90,7 @@ $('#token-save').onclick = async () => {
     status.textContent = 'Ок, загружаю данные…';
     closeGate();
     await boot();
+    status.textContent = '';
   } catch (e) {
     token = '';
     if (e.message === 'unauthorized' || /401/.test(e.message)) {
@@ -317,13 +343,20 @@ async function renderJob(first) {
 
 // ---------- старт ----------
 async function boot() {
-  await health();
-  try {
-    await loadAgents();
-  } catch (e) {
-    if (e.message !== 'unauthorized') $('#agents-count').textContent = 'ошибка: ' + e.message;
+  // Секции грузим параллельно и не блокируем друг друга: зависший запрос не должен
+  // оставлять страницу пустой.
+  const names = ['/health', '/agents', '/jobs'];
+  const results = await Promise.allSettled([health(), loadAgents(), loadJobs()]);
+  const problems = results
+    .map((r, i) => (r.status === 'rejected' && r.reason && r.reason.message !== 'unauthorized')
+      ? names[i] + ': ' + r.reason.message : null)
+    .filter(Boolean);
+  if (problems.length) {
+    const msg = problems.join('; ');
+    $('#health-text').textContent = 'проблема с API — ' + msg;
+    const st = $('#token-status');
+    if (st) { st.className = 'msg error'; st.textContent = msg; }
   }
-  await loadJobs();
 }
 
 (async () => {

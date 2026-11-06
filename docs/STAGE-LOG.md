@@ -227,3 +227,15 @@ Codex на сервере не авторизован, Qwen — десктоп-�
   Проверка восстановления: `jobs 19=19`, `job_attempts 17=17`, `job_events 56=56`, последняя запись совпала.
 - Лимиты: `MAX_PROMPT_CHARS` (413), `MAX_QUEUE` (429 + Retry-After), `MAX_RESULT_CHARS` (усечение с пометкой).
 - Пагинация: `offset`/`total`/`has_more` в API, кнопка «Показать ещё» в интерфейсе (`ui14`).
+
+
+## Этап 7.3 — серверные адаптеры и HTTPS
+
+- `openclaw-server`: `openclaw agent --message-file <file> --json`, проверено — `OC-SRV-HUB-OK` за 92,7 с.
+- `hermes-server`: `hermes -z <prompt>`, проверено — `HERMES-SRV-HUB-OK` за 93,4 с.
+- `llm-server` (бывший `ollama-server`): на 11434 слушает не Ollama, а llama.cpp (`dolphin-2.9-llama3-8b.Q4_K_M`,
+  OpenAI-совместимый `/v1/chat/completions`). Проверено — `succeeded` за 282 с. Модель на CPU медленная
+  и не выполняет инструкцию «ответь ровно так», это её свойство, а не ошибка адаптера.
+- HTTPS: `aihub-hub-tls` на `:8443`, самоподписанный сертификат, portproxy и правило брандмауэра
+  добавлены в `aihub-net.ps1`. Проверено: `/health`, `/jobs`, `/ui/` по TLS, интерфейс грузит 26 заданий.
+- Реестр: все 8 агентов в статусе `verified`, у каждого есть `bridge_agent`.

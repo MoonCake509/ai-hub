@@ -40,24 +40,30 @@ agents:
     bridge_agent: qwen
     notes: "только через CDP/DOM, API нет"
 
-  - id: ollama-server
-    name: Ollama (сервер)
+  - id: llm-server
+    name: llama.cpp Dolphin 8B (сервер)
     transport: http
     host: server
-    status: unverified
-    notes: "не проверялся, сервер только поднят"
+    status: verified
+    bridge_agent: llm-server
+    model: dolphin-2.9-llama3-8b.Q4_K_M
+    notes: "127.0.0.1:11434, OpenAI-совместимый; ctx 8192, max_tokens 1024"
 
   - id: hermes-server
     name: Hermes (сервер)
     transport: cli
     host: server
-    status: unverified
+    status: verified
+    bridge_agent: hermes-server
+    command: "hermes -z <prompt>"
 
   - id: openclaw-server
     name: OpenClaw (сервер)
     transport: cli
     host: server
-    status: unverified
+    status: verified
+    bridge_agent: openclaw-server
+    command: "openclaw agent --message-file <file> --json"
 
   - id: qwen-server
     name: Qwen Desktop (сервер)

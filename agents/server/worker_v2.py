@@ -10,8 +10,10 @@ from __future__ import annotations
 import json
 import msvcrt
 import os
+import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -24,6 +26,12 @@ OUTBOX = os.path.join(HERE, "outbox")
 CREATE_NO_WINDOW = 0x08000000
 NODE = r"C:\Program Files\nodejs\node.exe"
 QWEN_JS = r"C:\Users\user\bin\qwen.js"
+OPENCLAW_CMD = os.environ.get("OPENCLAW_CMD") or r"C:\Users\user\AppData\Roaming\npm\openclaw.cmd"
+HERMES_EXE = os.environ.get("HERMES_EXE") or r"C:\Users\user\AppData\Local\hermes\bin\hermes.exe"
+COMSPEC = os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe")
+# на 11434 слушает llama.cpp (OpenAI-совместимый), не ollama
+LLM_URL = os.environ.get("LLM_URL", "http://127.0.0.1:11434/v1/chat/completions")
+LLM_MODEL = os.environ.get("LLM_MODEL", "dolphin-2.9-llama3-8b.Q4_K_M")
 os.makedirs(OUTBOX, exist_ok=True)
 
 
@@ -67,7 +75,95 @@ def run_qwen(prompt: str, timeout: int) -> dict:
     }
 
 
-AGENTS = {"qwen-server": {"runner": run_qwen, "timeout": 600}}
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _deep_text(obj, keys, depth=0):
+    if depth > 6:
+        return None
+    if isinstance(obj, dict):
+        for k in keys:
+            v = obj.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        for v in obj.values():
+            got = _deep_text(v, keys, depth + 1)
+            if got:
+                return got
+    elif isinstance(obj, list):
+        for v in obj:
+            got = _deep_text(v, keys, depth + 1)
+            if got:
+                return got
+    return None
+
+
+def run_openclaw(prompt: str, timeout: int) -> dict:
+    started = time.time()
+    fd, msg_path = tempfile.mkstemp(prefix="aihub-oc-", suffix=".txt", text=True)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(prompt)
+    try:
+        proc = subprocess.run([COMSPEC, "/c", OPENCLAW_CMD, "agent", "--message-file", msg_path, "--json"],
+                              capture_output=True, stdin=subprocess.DEVNULL, timeout=timeout)
+    finally:
+        try:
+            os.unlink(msg_path)
+        except OSError:
+            pass
+    out = ANSI_RE.sub("", proc.stdout.decode("utf-8", "replace")).strip()
+    err = ANSI_RE.sub("", proc.stderr.decode("utf-8", "replace")).strip()
+    text = ""
+    usage = {}
+    try:
+        start = out.find("{")
+        data = json.loads(out[start:] if start >= 0 else out)
+        text = _deep_text(data, ("finalAssistantMessageRawText", "text")) or ""
+        if isinstance(data.get("usage"), dict):
+            usage = data["usage"]
+    except (ValueError, json.JSONDecodeError):
+        text = out
+    if not text:
+        text = (err or out)[-2000:]
+    return {"output": text, "usage": usage, "exit_code": proc.returncode,
+            "elapsed": round(time.time() - started, 2)}
+
+
+def run_hermes(prompt: str, timeout: int) -> dict:
+    started = time.time()
+    proc = subprocess.run([HERMES_EXE, "-z", prompt], capture_output=True,
+                          stdin=subprocess.DEVNULL, timeout=timeout)
+    out = ANSI_RE.sub("", proc.stdout.decode("utf-8", "replace")).strip()
+    err = ANSI_RE.sub("", proc.stderr.decode("utf-8", "replace")).strip()
+    return {"output": out or err[-2000:], "usage": {}, "exit_code": proc.returncode,
+            "elapsed": round(time.time() - started, 2)}
+
+
+def run_llm(prompt: str, timeout: int) -> dict:
+    """Локальная модель на llama.cpp (OpenAI-совместимый /v1/chat/completions)."""
+    started = time.time()
+    body = json.dumps({"model": LLM_MODEL, "stream": False,
+                       "messages": [{"role": "user", "content": prompt}],
+                       "max_tokens": 1024, "temperature": 0.2}).encode("utf-8")
+    req = urllib.request.Request(LLM_URL, data=body, method="POST")
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read() or b"{}")
+        text = ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+        usage = data.get("usage") or {}
+        return {"output": text.strip(), "usage": usage, "exit_code": 0,
+                "elapsed": round(time.time() - started, 2)}
+    except Exception as exc:  # noqa: BLE001
+        return {"output": "", "usage": {}, "exit_code": 1,
+                "error": f"llm: {exc}", "elapsed": round(time.time() - started, 2)}
+
+AGENTS = {
+    "qwen-server": {"runner": run_qwen, "timeout": 600},
+    "openclaw-server": {"runner": run_openclaw, "timeout": 600},
+    "hermes-server": {"runner": run_hermes, "timeout": 600},
+    "llm-server": {"runner": run_llm, "timeout": 300},
+}
 
 
 def http(method: str, path: str, body: dict | None = None, timeout: float = 45) -> tuple[int, dict]:

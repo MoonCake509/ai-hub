@@ -30,6 +30,10 @@ HUB_TOKEN = os.environ.get("HUB_TOKEN", "")
 AGENTS_FILE = Path(os.environ.get("AGENTS_FILE", "/app/config/agents.yaml"))
 WEB_DIR = Path(os.environ.get("WEB_DIR", "/app/web"))
 LEASE_SECONDS = int(os.environ.get("LEASE_SECONDS", "300"))
+# Пределы, чтобы хаб не превращался в бесконечную очередь и не хранил мегабайты вывода.
+MAX_PROMPT_CHARS = int(os.environ.get("MAX_PROMPT_CHARS", "20000"))
+MAX_QUEUE = int(os.environ.get("MAX_QUEUE", "50"))
+MAX_RESULT_CHARS = int(os.environ.get("MAX_RESULT_CHARS", "100000"))
 
 
 async def _sweeper() -> None:
@@ -114,15 +118,24 @@ async def run_agent(agent_id: str, request: Request) -> JSONResponse:
     prompt = (payload.get("prompt") or "").strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="prompt is required")
+    if len(prompt) > MAX_PROMPT_CHARS:
+        raise HTTPException(
+            status_code=413,
+            detail=f"prompt too long: {len(prompt)} > {MAX_PROMPT_CHARS} chars")
     timeout_s = int(payload.get("timeout") or 600)
     idem = payload.get("idempotency_key") or request.headers.get("idempotency-key")
     prompt_sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
 
     try:
         job, created = await asyncio.to_thread(
-            db.create_job, bridge_agent, prompt, prompt_sha, timeout_s, idem or None)
+            db.create_job, bridge_agent, prompt, prompt_sha, timeout_s, idem or None, MAX_QUEUE)
     except ValueError:
         raise HTTPException(status_code=409, detail="idempotency_key already used with another payload") from None
+    except db.QueueFull as exc:
+        raise HTTPException(
+            status_code=429,
+            detail=f"queue is full ({exc}); повтори позже или дождись исполнения текущих заданий",
+            headers={"Retry-After": "30"}) from None
 
     return JSONResponse(status_code=202, content={
         "job_id": job["id"],
@@ -133,9 +146,13 @@ async def run_agent(agent_id: str, request: Request) -> JSONResponse:
 
 
 @app.get("/jobs", dependencies=[Depends(require_token)])
-async def jobs(status: str | None = None, limit: int = 50) -> dict:
-    items = await asyncio.to_thread(db.list_jobs, status, min(limit, 200))
-    return {"count": len(items), "jobs": items}
+async def jobs(status: str | None = None, limit: int = 50, offset: int = 0) -> dict:
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+    items = await asyncio.to_thread(db.list_jobs, status, limit, offset)
+    total = await asyncio.to_thread(db.count_jobs, status)
+    return {"count": len(items), "total": total, "limit": limit, "offset": offset,
+            "has_more": offset + len(items) < total, "jobs": items}
 
 
 @app.get("/jobs/{job_id}", dependencies=[Depends(require_token)])
@@ -194,11 +211,14 @@ async def bridge_result(request: Request) -> dict:
     attempt_id = payload.get("attempt_id")
     if not attempt_id:
         raise HTTPException(status_code=400, detail="attempt_id is required")
+    output = payload.get("output")
+    if isinstance(output, str) and len(output) > MAX_RESULT_CHARS:
+        output = output[:MAX_RESULT_CHARS] + f"\n… (усечено хабом: {len(output)} символов)"
     outcome = await asyncio.to_thread(
         db.finish_attempt,
         attempt_id,
         bool(payload.get("ok")),
-        payload.get("output"),
+        output,
         payload.get("error"),
         payload.get("usage") or {},
         payload.get("elapsed"),

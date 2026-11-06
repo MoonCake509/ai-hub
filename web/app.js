@@ -3,7 +3,7 @@
 
 const API = window.location.pathname.startsWith('/ui') ? '' : '';
 const TOKEN_KEY = 'aihub_token';
-const BUILD = 'ui13';
+const BUILD = 'ui14';
 function storeGet(k) { try { return localStorage.getItem(k) || ''; } catch (e) { return ''; } }
 function storeSet(k, v) { try { localStorage.setItem(k, v); return true; } catch (e) { return false; } }
 function storeDel(k) { try { localStorage.removeItem(k); } catch (e) { /* заблокировано */ } }
@@ -15,6 +15,8 @@ let agentNames = new Map();
 let pollTimers = [];
 let detailGen = 0;
 let pendingRun = null;
+let jobsLoaded = 0;
+let jobsTotal = 0;
 
 // Русские подписи: значения из API остаются английскими, переводим только показ.
 const STATUS_RU = {
@@ -312,17 +314,26 @@ document.querySelectorAll('.chip').forEach(chip => {
     document.querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
     chip.classList.add('active');
     currentStatus = chip.dataset.status;
+    jobsLoaded = 0;
     loadJobs();
   };
 });
 
-async function loadJobs() {
+const moreBtn = $('#more');
+if (moreBtn) moreBtn.onclick = () => loadJobs(true);
+
+async function loadJobs(more) {
   try {
-    const q = '/jobs?limit=100' + (currentStatus ? '&status=' + encodeURIComponent(currentStatus) : '');
+    // Первая страница — 50; «показать ещё» догружает следующую пачку.
+    // Обычный опрос перезапрашивает столько, сколько уже показано, чтобы список не схлопывался.
+    const limit = more ? 50 : Math.min(200, Math.max(50, jobsLoaded));
+    const offset = more ? jobsLoaded : 0;
+    const q = '/jobs?limit=' + limit + '&offset=' + offset
+      + (currentStatus ? '&status=' + encodeURIComponent(currentStatus) : '');
     const data = await api(q);
     const jobs = data.jobs || [];
     const body = $('#jobs-body');
-    body.innerHTML = '';
+    if (!more) body.innerHTML = '';
     $('#jobs-empty').hidden = jobs.length > 0;
     for (const j of jobs) {
       const tr = el('tr');
@@ -339,6 +350,10 @@ async function loadJobs() {
       tr.onclick = () => openJob(j.id);
       body.append(tr);
     }
+    jobsLoaded = offset + jobs.length;
+    jobsTotal = data.total ?? jobsLoaded;
+    const moreBtnEl = $('#more');
+    if (moreBtnEl) moreBtnEl.hidden = !(data.has_more || jobsLoaded < jobsTotal);
   } catch (e) {
     if (e.message !== 'unauthorized') $('#health-text').textContent = 'ошибка истории: ' + e.message;
   }

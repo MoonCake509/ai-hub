@@ -118,8 +118,12 @@ def event(job_id: str, name: str, attempt_id: str | None = None, payload: dict |
         )
 
 
+class QueueFull(Exception):
+    """Очередь достигла предела: новое задание не принимаем."""
+
+
 def create_job(agent_id: str, prompt: str, prompt_sha: str, timeout_s: int,
-               idempotency_key: str | None) -> tuple[dict, bool]:
+               idempotency_key: str | None, max_queue: int | None = None) -> tuple[dict, bool]:
     """Возвращает (job, created). При совпадении ключа с другим телом — ValueError."""
     job_id = uuid.uuid4().hex
     with _lock:
@@ -130,6 +134,10 @@ def create_job(agent_id: str, prompt: str, prompt_sha: str, timeout_s: int,
                 if existing["prompt_sha"] != prompt_sha:
                     raise ValueError("idempotency_key_conflict")
                 return existing, False
+        if max_queue:
+            depth = _one(conn, "select count(*) as n from aihub.jobs where status = 'queued'")["n"]
+            if depth >= max_queue:
+                raise QueueFull(depth)
         conn.run(
             "insert into aihub.jobs(id, agent_id, prompt, prompt_sha, timeout_s, idempotency_key)"
             " values (:i, :a, :p, :s, :t, :k)",
@@ -154,17 +162,27 @@ def get_job(job_id: str) -> dict | None:
         return job
 
 
-def list_jobs(status: str | None, limit: int = 50) -> list[dict]:
+def list_jobs(status: str | None, limit: int = 50, offset: int = 0) -> list[dict]:
     with _lock:
         conn = connect()
         if status:
             return _rows(conn, "select id, agent_id, status, created_at, finished_at, attempts,"
                                " left(prompt, 160) as prompt_preview"
-                               " from aihub.jobs where status = :s order by created_at desc limit :l",
-                         s=status, l=limit)
+                               " from aihub.jobs where status = :s order by created_at desc"
+                               " limit :l offset :o",
+                         s=status, l=limit, o=offset)
         return _rows(conn, "select id, agent_id, status, created_at, finished_at, attempts,"
                           " left(prompt, 160) as prompt_preview"
-                          " from aihub.jobs order by created_at desc limit :l", l=limit)
+                          " from aihub.jobs order by created_at desc limit :l offset :o",
+                    l=limit, o=offset)
+
+
+def count_jobs(status: str | None = None) -> int:
+    with _lock:
+        conn = connect()
+        if status:
+            return _one(conn, "select count(*) as n from aihub.jobs where status = :s", s=status)["n"]
+        return _one(conn, "select count(*) as n from aihub.jobs")["n"]
 
 
 def events(job_id: str) -> list[dict]:

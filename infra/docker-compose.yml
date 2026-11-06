@@ -62,7 +62,10 @@ services:
       AGENTS_FILE: /app/config/agents.yaml
       HUB_TOKEN: ${HUB_TOKEN}
       DATABASE_URL: postgresql://llmproxy:${POSTGRES_PASSWORD}@postgres:5432/litellm
-      LEASE_SECONDS: "20"
+      LEASE_SECONDS: "${LEASE_SECONDS:-300}"
+      MAX_QUEUE: "${MAX_QUEUE:-50}"
+      MAX_PROMPT_CHARS: "${MAX_PROMPT_CHARS:-20000}"
+      MAX_RESULT_CHARS: "${MAX_RESULT_CHARS:-100000}"
       BRIDGE_URL: ${BRIDGE_URL}
       BRIDGE_TOKEN: ${BRIDGE_TOKEN}
     volumes:

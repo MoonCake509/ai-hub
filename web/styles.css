@@ -166,3 +166,8 @@ code { font-family: var(--mono); background: #0b1016; padding: 1px 4px; border-r
   background: #0b1016; border: 1px solid var(--line); border-radius: 7px;
   font-family: var(--mono); font-size: 11.5px; color: #b9c6d6; white-space: pre-wrap;
 }
+
+.more-wrap { padding: 10px 0 2px; display: flex; justify-content: center; }
+.more-wrap button { background: #1a2430; color: var(--text); border: 1px solid #2b3a4a;
+  border-radius: 8px; padding: 7px 16px; cursor: pointer; font: inherit; }
+.more-wrap button:hover { background: #22303f; }

@@ -142,6 +142,8 @@ td.prompt { max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-s
   position: fixed; inset: 0; background: rgba(5,8,12,.82);
   display: flex; align-items: center; justify-content: center; z-index: 20;
 }
+/* Атрибут hidden перебивается правилом display:flex выше — без этого окно не закрывается. */
+.gate[hidden] { display: none !important; }
 .gate-box {
   background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
   padding: 20px; width: min(420px, 92vw);

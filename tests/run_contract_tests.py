@@ -23,22 +23,23 @@ def wsl(cmd: str, timeout: int = 300) -> tuple[int, str]:
 
 
 def main() -> int:
-    print("== поднимаю стенд (aihub-hub-test, 127.0.0.1:8100, схема aihub_test)")
+    print("== поднимаю стенд (aihub-hub-test, 127.0.0.1:8100, отдельная БД aihub_test)")
     code, out = wsl("cd /mnt/r/AI-Hub/infra && docker compose -f docker-compose.test.yml "
-                    "--env-file .env up -d 2>&1 | tail -5")
+                    "--env-file .env up -d --build 2>&1 | tail -10; echo exit=$?")
     print(out.strip())
-    if code != 0:
+    if "exit=0" not in out:
+        print("стенд не поднялся (compose вернул ошибку)")
         return 1
 
     try:
         for _ in range(40):
-            code, out = wsl("curl -s -m 3 http://127.0.0.1:8100/health", timeout=30)
-            if '"db":true' in out:
-                print("стенд готов:", out.strip())
+            code, out = wsl("curl -s -m 3 http://127.0.0.1:8100/health; echo exit=$?", timeout=30)
+            if code == 0 and '"db":true' in out:
+                print("стенд готов")
                 break
             time.sleep(2)
         else:
-            print("стенд не поднялся:", out[-500:])
+            print("стенд не поднялся, последний ответ:", out[-400:])
             return 1
 
         print("== контрактные тесты")
@@ -53,11 +54,9 @@ def main() -> int:
         sys.stderr.write(r.stderr.decode("utf-8", "replace")[-500:])
         return r.returncode
     finally:
-        print("== убираю стенд и тестовую схему")
+        print("== убираю стенд (контейнеры и данные тестовой БД)")
         _, out = wsl("cd /mnt/r/AI-Hub/infra && docker compose -f docker-compose.test.yml "
-                     "--env-file .env down 2>&1 | tail -3; "
-                     "docker exec aihub-postgres psql -U llmproxy -d litellm "
-                     "-c 'drop schema if exists aihub_test cascade'")
+                     "--env-file .env down -v 2>&1 | tail -5")
         print(out.strip())
 
 

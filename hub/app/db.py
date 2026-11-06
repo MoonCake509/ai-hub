@@ -140,9 +140,10 @@ def _one(conn, sql: str, **params) -> dict | None:
 
 def event(job_id: str, name: str, attempt_id: str | None = None, payload: dict | None = None) -> None:
     with _lock:
-        connect().run(
+        conn = connect()
+        conn.run(_qualify(
             "insert into aihub.job_events(job_id, attempt_id, event, payload)"
-            " values (:j, :a, :e, :p::jsonb)",
+            " values (:j, :a, :e, :p::jsonb)"),
             j=job_id, a=attempt_id, e=name, p=json.dumps(payload or {}, ensure_ascii=False),
         )
 

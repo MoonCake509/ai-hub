@@ -1,17 +1,36 @@
-# Тестовый стенд AI Hub: отдельная БД, отдельный порт, своя схема.
-# Живой хаб, его воркеры и рабочая БД не затрагиваются.
+# Тестовый стенд AI Hub: ОТДЕЛЬНАЯ БД и роль с минимальными правами.
+# Стенд не видит и не может менять рабочие данные даже при баге подстановки схемы.
 services:
+  postgres-test:
+    image: postgres:16-alpine
+    container_name: aihub-postgres-test
+    environment:
+      POSTGRES_USER: aihub_test
+      POSTGRES_PASSWORD: ${AIHUB_TEST_DB_PASSWORD:-aihub_test_password}
+      POSTGRES_DB: aihub_test
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aihub_test -d aihub_test"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   hub-test:
     build:
       context: ../hub
       dockerfile: Dockerfile
     image: aihub-hub:test
     container_name: aihub-hub-test
+    depends_on:
+      postgres-test:
+        condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://llmproxy:${POSTGRES_PASSWORD}@postgres:5432/litellm
+      DATABASE_URL: postgresql://aihub_test:${AIHUB_TEST_DB_PASSWORD:-aihub_test_password}@postgres-test:5432/aihub_test
       AGENTS_YAML: /app/config/agents.yaml
       HUB_TOKEN: ${HUB_TOKEN}
-      SCHEMA: aihub_test
       LEASE_SECONDS: "3"
       MAX_QUEUE: "50"
       MAX_PROMPT_CHARS: "20000"
@@ -19,9 +38,10 @@ services:
     volumes:
       - ../hub/app:/app/app:ro
       - ../config/agents.yaml:/app/config/agents.yaml:ro
-    networks:
-      - default
     ports:
-      - "127.0.0.1:8100:8000"
+      - "0.0.0.0:8100:8000"
     command: ["python", "-m", "app.serve"]
-    # TLS на стенде не нужен: serve.py сам отключит его без сертификатов
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"

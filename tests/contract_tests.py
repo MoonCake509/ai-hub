@@ -51,10 +51,9 @@ def api(method, path, body=None, timeout=60):
 
 
 def sql(query):
-    # Все обращения — только к тестовой схеме. Рабочая aihub не читается и не меняется.
-    query = query.replace("aihub.", SCHEMA + ".")
+    # Всегда указываем схему явно: стенд на отдельной БД aihub_test, схема там называется aihub.
     r = subprocess.run([WSL, "-d", "AIHub", "-e", "bash", "-lc",
-                        "docker exec aihub-postgres psql -U llmproxy -d litellm -t -A -c " + repr(query)],
+                        "docker exec aihub-postgres-test psql -U aihub_test -d aihub_test -t -A -c " + repr(query)],
                        capture_output=True)
     return r.stdout.decode("utf-8", "replace").strip()
 
@@ -125,14 +124,17 @@ def test_late_result():
         check("late: аренда тестового задания", False, "воркер перехватил")
         return
     attempt = att["attempt_id"]
-    # Ждём настоящего истечения аренды (на стенде LEASE_SECONDS=3), без прямого SQL.
-    deadline = time.time() + 30
+    # Ждём настоящего истечения аренды: LEASE_SECONDS берём из аренды, а не из env.
+    # Дожидаемся unknown И закрытой попытки — только потом результат считается поздним.
+    lease_s = float(att.get("lease_seconds", 3))
+    deadline = time.time() + lease_s + 40
     status = ""
     job = {}
     while time.time() < deadline:
         _, job = api("GET", "/jobs/" + job_id)
         status = job["status"]
-        if status == "unknown":
+        att_status = sql(f"select status from job_attempts where id='{attempt}'")
+        if status == "unknown" and att_status == "unknown":
             break
         time.sleep(1)
     check("late: sweeper сам перевёл в unknown", status == "unknown", status)
@@ -148,6 +150,7 @@ def test_late_result():
     row = next((x for x in late["items"] if x["attempt_id"] == attempt), None)
     check("late: payload сохранён в late_results", bool(row) and row["payload"].get("output") == "CT-LATE-OK")
     code, r2 = api("POST", "/bridge/result", payload)
+    # late_results отсутствует в списке схем для подмены — уберём префикс вручную
     n = sql(f"select count(*) from aihub.late_results where attempt_id='{attempt}'")
     check("late: повтор идемпотентен (1 строка)", code == 200 and n == "1", f"{code} rows={n}")
 
@@ -196,21 +199,38 @@ with cf.ThreadPoolExecutor(4) as ex:
     res = list(ex.map(mk, range(4)))
 print("created:", res.count("created"), "full:", res.count("full"))
 '''
+    # Очередь полностью пуста: отдельная БД стенда, детерминированный счётчик.
     sql("update aihub.jobs set status='cancelled', finished_at=now() where status='queued' and agent_id='openclaw'")
+    # Тест конкурентности в двух отдельных процессах. Строгая проверка:
+    # 8 корректных запросов при лимите 5 → ровно 5 созданий, 3 отказа QueueFull,
+    # ни одного иного сбоя. Стенд на отдельной БД — требуем, что и в БД ровно 5.
     cmd = [WSL, "-d", "AIHub", "-e", "bash", "-lc",
-           "docker exec -i -e SCHEMA=aihub_test aihub-hub-test python - <<'PY'\n" + script + "\nPY"]
-    # два процесса одновременно — проверка межпроцессного инварианта advisory-блокировки
+           "docker exec -i aihub-hub-test python - <<'PY'\n" + script + "\nPY"]
     procs = [subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE) for _ in range(2)]
-    outs = [p.communicate(timeout=120) for p in procs]
-    total_created = 0
-    for out, err in outs:
+    results = [p.communicate(timeout=120) for p in procs]
+    total_created = total_full = 0
+    all_ok = True
+    for (out, err), p in zip(results, procs):
         text = out.decode("utf-8", "replace")
-        print("  process:", text.strip(), err.decode("utf-8", "replace")[-200:])
+        stderr_text = err.decode("utf-8", "replace")
+        print("  process:", text.strip(), stderr_text[-200:] if stderr_text.strip() else "")
+        if p.returncode != 0:
+            all_ok = False
+            print("   процесс завершился с кодом", p.returncode)
+            continue
         if "created:" in text:
             total_created += int(text.split("created:")[1].split()[0])
-    n = sql("select count(*) from aihub.jobs where status='queued' and agent_id='openclaw'")
-    check("конкурентная очередь (2 процесса): не более 5",
-          total_created <= 5 and int(n or 0) <= 5, f"created={total_created} db={n}")
+            total_full += int(text.split("full:")[1].split()[0])
+        else:
+            all_ok = False
+            print("   процесс не вернул ожидаемый результат")
+        if "Traceback" in text or "Traceback" in stderr_text:
+            all_ok = False
+    # В БД стенда очередь должна быть ровно из пяти (лимит 5, 8 запросов)
+    db_n = int(sql("select count(*) from aihub.jobs where status='queued' and agent_id='openclaw'") or 0)
+    check("конкурентная очередь (2 процесса): ровно 5 созданий и 3 отказа",
+          all_ok and total_created == 5 and total_full == 3 and db_n == 5,
+          f"created={total_created} full={total_full} db={db_n} all_ok={all_ok}")
 
 
 if __name__ == "__main__":

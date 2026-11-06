@@ -3,7 +3,7 @@
 
 const API = window.location.pathname.startsWith('/ui') ? '' : '';
 const TOKEN_KEY = 'aihub_token';
-const BUILD = 'ui12';
+const BUILD = 'ui13';
 function storeGet(k) { try { return localStorage.getItem(k) || ''; } catch (e) { return ''; } }
 function storeSet(k, v) { try { localStorage.setItem(k, v); return true; } catch (e) { return false; } }
 function storeDel(k) { try { localStorage.removeItem(k); } catch (e) { /* заблокировано */ } }
@@ -11,6 +11,10 @@ let token = storeGet(TOKEN_KEY);
 let currentJob = null;
 let currentStatus = '';
 let agents = [];
+let agentNames = new Map();
+let pollTimers = [];
+let detailGen = 0;
+let pendingRun = null;
 
 // Русские подписи: значения из API остаются английскими, переводим только показ.
 const STATUS_RU = {
@@ -242,6 +246,11 @@ async function loadAgents() {
     if (!a.bridge_agent) opt.disabled = true;
     select.append(opt);
   }
+  agentNames = new Map();
+  for (const a of agents) {
+    agentNames.set(a.id, a.name || a.id);
+    if (a.bridge_agent) agentNames.set(a.bridge_agent, a.name || a.bridge_agent);
+  }
   if (agents.length) select.value = agents[0].id;
 }
 
@@ -253,14 +262,20 @@ $('#run-form').onsubmit = async e => {
   msg.textContent = 'Отправка…';
   $('#run-submit').disabled = true;
   try {
-    const body = {
-      prompt: $('#run-prompt').value.trim(),
-      timeout: Number($('#run-timeout').value) || 300,
-      idempotency_key: newKey(),
-    };
+    const agent = $('#run-agent').value;
+    const prompt = $('#run-prompt').value.trim();
+    const timeout = Number($('#run-timeout').value) || 300;
+    // Если предыдущая отправка могла дойти до сервера, повтор идёт с тем же ключом:
+    // иначе потерянный ответ превращается в дубль задания.
+    const reuse = pendingRun && pendingRun.agent === agent
+      && pendingRun.prompt === prompt && pendingRun.timeout === timeout;
+    const key = reuse ? pendingRun.key : newKey();
+    pendingRun = { agent, prompt, timeout, key };
+    const body = { prompt, timeout, idempotency_key: key };
     const r = await api('/agents/' + encodeURIComponent($('#run-agent').value) + '/run', {
       method: 'POST', body: JSON.stringify(body),
     });
+    pendingRun = null;   // подтверждено сервером
     msg.className = 'msg ok';
     msg.textContent = 'Задание ' + r.job_id.slice(0, 8) + ' принято (' + ruStatus(r.status) + ')';
     $('#run-prompt').value = '';
@@ -314,7 +329,7 @@ async function loadJobs() {
       tr.dataset.id = j.id;
       if (currentJob && currentJob.id === j.id) tr.classList.add('selected');
       tr.append(el('td', '', fmtTime(j.created_at)));
-      tr.append(el('td', 'mono', j.agent_id || '—'));
+      tr.append(el('td', 'mono', agentName(j.agent_id)));
       const st = el('td');
       st.append(el('span', 'badge ' + j.status, ruStatus(j.status)));
       tr.append(st);
@@ -330,15 +345,20 @@ async function loadJobs() {
 }
 
 // ---------- детали ----------
+function agentName(id) {
+  return id ? (agentNames.get(id) || id) : '—';
+}
+
 function openJob(id) {
   currentJob = { id };
+  detailGen += 1;
   $('#d-note').textContent = '';
   $('#detail').hidden = false;
   document.querySelectorAll('#jobs-body tr').forEach(tr => tr.classList.toggle('selected', tr.dataset.id === id));
   renderJob(true);
 }
 
-$('#d-close').onclick = () => { currentJob = null; $('#detail').hidden = true; document.querySelectorAll('#jobs-body tr').forEach(tr => tr.classList.remove('selected')); };
+$('#d-close').onclick = () => { detailGen += 1; currentJob = null; $('#detail').hidden = true; document.querySelectorAll('#jobs-body tr').forEach(tr => tr.classList.remove('selected')); };
 
 $('#d-cancel').onclick = async () => {
   if (!currentJob) return;
@@ -364,11 +384,14 @@ $('#d-cancel').onclick = async () => {
 async function renderJob(first) {
   if (!currentJob) return;
   const id = currentJob.id;
+  const gen = detailGen;
   try {
     const [job, ev] = await Promise.all([
       api('/jobs/' + id),
       api('/jobs/' + id + '/events').catch(() => ({ events: [] })),
     ]);
+    // Пока грузили, могли открыть другую карточку или закрыть панель — поздний ответ игнорируем.
+    if (gen !== detailGen || !currentJob || currentJob.id !== id) return;
     currentJob = job;
 
     $('#d-id').textContent = job.id;
@@ -380,7 +403,7 @@ async function renderJob(first) {
       d.append(document.createTextNode(v));
       meta.append(d);
     };
-    add('Агент', job.agent_id || '—');
+    add('Агент', agentName(job.agent_id));
     add('Статус', ruStatus(job.status));
     add('Создано', fmtTime(job.created_at));
     add('Завершено', job.finished_at ? fmtTime(job.finished_at) : '—');
@@ -433,6 +456,18 @@ async function renderJob(first) {
 }
 
 // ---------- старт ----------
+function stopPolling() {
+  pollTimers.forEach(t => clearInterval(t));
+  pollTimers = [];
+}
+
+// Вызывается и при старте, и после входа по токену. Повторный вызов не плодит таймеры.
+function startPolling() {
+  stopPolling();
+  pollTimers.push(setInterval(health, 15000));
+  pollTimers.push(setInterval(() => { if (!document.hidden) loadJobs(); }, 5000));
+}
+
 async function boot() {
   // Секции грузим параллельно и не блокируем друг друга: зависший запрос не должен
   // оставлять страницу пустой.
@@ -448,6 +483,7 @@ async function boot() {
     const st = $('#token-status');
     if (st) { st.className = 'msg error'; st.textContent = msg; }
   }
+  startPolling();
 }
 
 (async () => {
@@ -456,6 +492,4 @@ async function boot() {
   if (b) b.textContent = BUILD;
   if (!token) { openGate(''); return; }
   await boot();
-  setInterval(health, 15000);
-  setInterval(() => { if (!document.hidden) loadJobs(); }, 5000);
 })();

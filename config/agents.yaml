@@ -19,15 +19,18 @@ agents:
     transport: cli
     host: laptop
     status: verified
-    command: "openclaw agent -m <prompt> --json"
+    bridge_agent: openclaw
+    command: "openclaw agent --message-file <file> --json"
     notes: "gateway только на loopback, ходим через CLI"
 
   - id: hermes-laptop
     name: Hermes (ноутбук)
-    transport: http
+    transport: cli
     host: laptop
     status: verified
-    notes: "CLI + локальный HTTP-эндпоинт"
+    bridge_agent: hermes
+    command: "hermes -z <prompt>"
+    notes: "режим одного запроса; через хаб — pull-воркер ноутбука"
 
   - id: qwen-code
     name: Qwen Desktop

@@ -3,7 +3,7 @@
 
 const API = window.location.pathname.startsWith('/ui') ? '' : '';
 const TOKEN_KEY = 'aihub_token';
-const BUILD = 'ui11';
+const BUILD = 'ui12';
 function storeGet(k) { try { return localStorage.getItem(k) || ''; } catch (e) { return ''; } }
 function storeSet(k, v) { try { localStorage.setItem(k, v); return true; } catch (e) { return false; } }
 function storeDel(k) { try { localStorage.removeItem(k); } catch (e) { /* заблокировано */ } }
@@ -11,6 +11,22 @@ let token = storeGet(TOKEN_KEY);
 let currentJob = null;
 let currentStatus = '';
 let agents = [];
+
+// Русские подписи: значения из API остаются английскими, переводим только показ.
+const STATUS_RU = {
+  queued: 'в очереди', running: 'в работе', succeeded: 'успешно', failed: 'ошибка',
+  timeout: 'таймаут', unknown: 'неизвестно', cancelled: 'отменено',
+  cancel_requested: 'отмена запрошена', already_finished: 'уже завершено',
+};
+const EVENT_RU = {
+  queued: 'создано', created: 'создано', leased: 'взято воркером',
+  succeeded: 'успешно', failed: 'ошибка', timeout: 'таймаут',
+  cancelled: 'отменено', cancel_requested: 'запрошена отмена',
+  lease_expired: 'аренда истекла', finished: 'завершено',
+};
+const AGENT_STATUS_RU = { verified: 'проверен', unverified: 'не проверен', error: 'ошибка' };
+const ruStatus = s => STATUS_RU[s] || s || '—';
+const ruEvent = e => EVENT_RU[e] || e;
 
 const newKey = () => (window.crypto && crypto.randomUUID ? crypto.randomUUID() : 'ui-' + Date.now() + '-' + Math.random().toString(16).slice(2));
 const $ = sel => document.querySelector(sel);
@@ -211,7 +227,7 @@ async function loadAgents() {
     const row = el('div', 'agent');
     row.dataset.id = a.id;
     row.append(el('span', 'id', a.id));
-    row.append(el('span', 'status ' + (a.status || ''), a.status || '—'));
+    row.append(el('span', 'status ' + (a.status || ''), AGENT_STATUS_RU[a.status] || a.status || '—'));
     row.append(el('span', 'transport', a.transport || ''));
     row.onclick = () => {
       document.querySelectorAll('.agent').forEach(n => n.classList.remove('active'));
@@ -246,7 +262,7 @@ $('#run-form').onsubmit = async e => {
       method: 'POST', body: JSON.stringify(body),
     });
     msg.className = 'msg ok';
-    msg.textContent = 'Задание ' + r.job_id.slice(0, 8) + ' принято (' + r.status + ')';
+    msg.textContent = 'Задание ' + r.job_id.slice(0, 8) + ' принято (' + ruStatus(r.status) + ')';
     $('#run-prompt').value = '';
     await loadJobs();
     openJob(r.job_id);
@@ -300,7 +316,7 @@ async function loadJobs() {
       tr.append(el('td', '', fmtTime(j.created_at)));
       tr.append(el('td', 'mono', j.agent_id || '—'));
       const st = el('td');
-      st.append(el('span', 'badge ' + j.status, j.status));
+      st.append(el('span', 'badge ' + j.status, ruStatus(j.status)));
       tr.append(st);
       tr.append(el('td', '', fmtDur(j.created_at, j.finished_at, j.status === 'running')));
       tr.append(el('td', '', String(j.attempts ?? 0)));
@@ -365,12 +381,12 @@ async function renderJob(first) {
       meta.append(d);
     };
     add('Агент', job.agent_id || '—');
-    add('Статус', job.status);
+    add('Статус', ruStatus(job.status));
     add('Создано', fmtTime(job.created_at));
     add('Завершено', job.finished_at ? fmtTime(job.finished_at) : '—');
     add('Длительность', fmtDur(job.created_at, job.finished_at, job.status === 'running'));
     add('Попыток', String(job.attempts ?? 0));
-    add('Таймаут', (job.timeout_s ?? '—') + ' с');
+    add('Лимит времени', (job.timeout_s ?? '—') + ' с');
     add('Сверка', job.needs_reconcile ? 'нужна (результат неизвестен)' : 'не требуется');
 
     $('#d-output').textContent = job.result_output || (job.result_error ? 'Ошибка: ' + job.result_error : '—');
@@ -382,12 +398,12 @@ async function renderJob(first) {
     for (const a of list) {
       const box = el('div', 'attempt');
       const row = el('div', 'row');
-      row.append(el('span', 'badge ' + a.status, a.status));
-      row.append(el('span', 'mono', '#' + a.attempt_no));
+      row.append(el('span', 'badge ' + a.status, ruStatus(a.status)));
+      row.append(el('span', 'mono', 'попытка №' + a.attempt_no));
       row.append(el('span', 'muted', a.worker || '—'));
       row.append(el('span', 'muted', fmtDur(a.started_at, a.finished_at, a.status === 'running')));
       if (a.usage && Object.keys(a.usage).length) {
-        row.append(el('span', 'muted', 'tok ' + (a.usage.input_tokens ?? '?') + '/' + (a.usage.output_tokens ?? '?')));
+        row.append(el('span', 'muted', 'токены ' + (a.usage.input_tokens ?? '?') + ' / ' + (a.usage.output_tokens ?? '?')));
       }
       box.append(row);
       if (a.error) box.append(el('div', 'err', a.error));
@@ -400,7 +416,7 @@ async function renderJob(first) {
     if (!items.length) evs.append(el('li', 'muted', 'событий нет'));
     for (const e of items) {
       const li = el('li');
-      li.innerHTML = '<b>' + esc(e.event) + '</b> — ' + esc(fmtTime(e.at)) +
+      li.innerHTML = '<b>' + esc(ruEvent(e.event)) + '</b> — ' + esc(fmtTime(e.at)) +
         (e.attempt_id ? ' <span class="muted">(' + esc(e.attempt_id.slice(0, 8)) + ')</span>' : '');
       evs.append(li);
     }

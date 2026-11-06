@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AI-Hub — задания и агенты</title>
-<link rel="stylesheet" href="styles.css?v=11">
+<link rel="stylesheet" href="styles.css?v=12">
 </head>
 <body>
 <header class="top">
@@ -45,7 +45,7 @@
       <label>Промпт
         <textarea id="run-prompt" rows="5" placeholder="Что должен сделать агент" required></textarea>
       </label>
-      <label>Таймаут, с
+      <label>Лимит времени, с
         <input id="run-timeout" type="number" min="10" max="3600" value="300">
       </label>
       <button class="primary" id="run-submit" type="submit">Запустить</button>
@@ -58,18 +58,18 @@
       <h2>История</h2>
       <div class="filters">
         <button class="chip active" data-status="">все</button>
-        <button class="chip" data-status="running">running</button>
-        <button class="chip" data-status="queued">queued</button>
-        <button class="chip" data-status="succeeded">succeeded</button>
-        <button class="chip" data-status="failed">failed</button>
-        <button class="chip" data-status="unknown">unknown</button>
-        <button class="chip" data-status="cancelled">cancelled</button>
+        <button class="chip" data-status="running">в работе</button>
+        <button class="chip" data-status="queued">в очереди</button>
+        <button class="chip" data-status="succeeded">успешно</button>
+        <button class="chip" data-status="failed">ошибка</button>
+        <button class="chip" data-status="unknown">неизвестно</button>
+        <button class="chip" data-status="cancelled">отменено</button>
       </div>
     </div>
     <div class="table-wrap">
       <table id="jobs-table">
         <thead>
-          <tr><th>Создано</th><th>Агент</th><th>Статус</th><th>Длит.</th><th>Попытки</th><th>Промпт</th></tr>
+          <tr><th>Создано</th><th>Агент</th><th>Статус</th><th>Время</th><th>Попытки</th><th>Задание</th></tr>
         </thead>
         <tbody id="jobs-body"></tbody>
       </table>
@@ -103,6 +103,6 @@
   <ol id="d-events" class="events"></ol>
 </aside>
 
-<script src="app.js?v=11"></script>
+<script src="app.js?v=12"></script>
 </body>
 </html>

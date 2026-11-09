@@ -1,38 +1,34 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="ru">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AI-Hub — задания и агенты</title>
-<link rel="stylesheet" href="styles.css?v=20">
-</head>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#10141c"><title>AI Hub — проекты, команда и качество</title><link rel="stylesheet" href="styles.css?v=24"><link rel="stylesheet" href="quality.css?v=2"></head>
 <body>
 <header class="top">
-  <div class="brand">AI-Hub<span class="ver" id="version"></span><span class="ver" id="build"></span></div>
-  <div class="state">
-    <span class="dot" id="health-dot"></span>
-    <span id="health-text">проверка…</span>
-  </div>
-  <button class="ghost" id="token-btn">Токен</button>
+  <a class="brand" href="/ui/" aria-label="AI Hub — рабочее пространство"><span class="brand-mark">AI</span><span>Hub<span class="ver" id="version"></span><span class="ver" id="build"></span></span></a>
+  <nav class="tabs" aria-label="Разделы"><button type="button" class="tab active" data-view="workspace" aria-pressed="true">Рабочее пространство</button><button type="button" class="tab" data-view="ops" aria-pressed="false">Запуски и диагностика</button><button type="button" class="tab" data-view="quality" aria-pressed="false">Качество каналов</button></nav>
+  <div class="state"><span class="dot" id="health-dot"></span><span id="health-text">Подключение…</span></div><button type="button" class="ghost token-button" id="token-btn">Доступ</button>
 </header>
-
-<div class="gate" id="gate" hidden>
-  <div class="gate-box">
-    <h2>Нужен токен хаба</h2>
-    <p>Токен хранится в браузере и уходит только в заголовке <code>Authorization</code>.</p>
-    <input id="token-input" type="password" placeholder="HUB_TOKEN" autocomplete="off">
-    <div class="row">
-      <button class="primary" id="token-save">Сохранить и войти</button>
-      <button class="ghost" id="token-cancel">Отмена</button>
-      <button class="ghost" id="token-diag" type="button">Диагностика</button>
-    </div>
-    <pre id="diag" class="diag" hidden></pre>
-    <p class="msg" id="token-status"></p>
-    <p class="err" id="token-err"></p>
-  </div>
-</div>
-
-<main class="layout">
+<main id="view-workspace" class="workspace-shell">
+  <aside class="workspace-sidebar" aria-label="Проекты, чаты и файлы">
+    <section><div class="section-heading"><h2>Проекты</h2><button type="button" id="project-new" class="icon-button" aria-label="Создать проект">+</button></div><div id="projects-list" class="projects-list"><p class="muted">Загрузка проектов…</p></div></section>
+    <section class="sidebar-chats"><div class="section-heading"><h2>Чаты</h2><button type="button" id="conv-new" class="ghost small">+ Новый чат</button></div><div id="convs-list" class="convs-list"></div></section>
+    <section class="sidebar-files"><div class="section-heading"><h2>Контекст</h2><label class="ghost small file-label" for="att-file">+ Файл или изображение</label><input id="att-file" type="file" accept="image/png,image/jpeg,.png,.jpg,.jpeg,.txt,.md,.csv,.json,.log,.yaml,.yml,.html,.py,.js,.ts,.tsx,.jsx,.css,.sql,.toml,.ini,.xml,.sh,.ps1" multiple hidden></div><div id="atts-list" class="atts-list"></div><p class="hint">До 5 файлов на задачу, до 2 МБ каждый. PNG/JPEG показываются как предпросмотр; текстовые файлы передаются как UTF-8 контекст.</p></section>
+    <div class="sidebar-bottom"><span class="dot ok"></span><span>Контекст хранится в проекте</span></div>
+  </aside>
+  <section class="workspace-main" aria-label="Чат проекта">
+    <header class="workspace-header"><div><div class="eyebrow">ПРОЕКТ</div><h1 id="project-title">AI Hub</h1><p class="project-location" id="project-location">Выберите проект</p></div><button type="button" class="ghost small" id="project-settings">Настройки проекта</button></header>
+    <div class="workspace-error" id="workspace-error" role="alert" hidden><span id="workspace-error-text"></span><button type="button" class="ghost small" id="workspace-retry">Повторить</button></div>
+    <div class="chat-toolbar"><div class="chat-heading"><span class="chat-indicator"></span><h2 id="chat-title">Новый чат</h2></div><label class="recipient-label">Получатель<select id="chat-target" aria-label="Роль, которой отправляется задача"></select></label><p class="chat-route-hint" id="chat-route-hint" role="status"></p></div>
+    <div id="chat-log" class="chat-log" aria-live="polite"></div>
+    <div class="composer-area"><div id="selected-context" class="selected-context"></div><form id="chat-form" class="chat-form"><label class="sr-only" for="chat-input">Сообщение агенту</label><textarea id="chat-input" rows="3" placeholder="Что нужно сделать в этом проекте?" required></textarea><div class="composer-footer"><span id="chat-role" class="composer-role">Выберите роль справа</span><div class="row"><span id="chat-ctx" class="hint"></span><button class="primary send-button" id="chat-send" type="submit">Отправить <span aria-hidden="true">↑</span></button></div></div></form><p class="msg" id="chat-msg" role="status"></p><p class="composer-help">Enter — новая строка · Ctrl/⌘ + Enter — отправить</p></div>
+  </section>
+  <aside class="workspace-team" aria-label="Команда проекта"><div class="section-heading"><div><div class="eyebrow">НАЗНАЧЕНИЯ</div><h2>Команда проекта</h2></div><span class="count-label">5 ролей</span></div><div id="roles-list" class="roles-list"></div>
+    <section class="role-editor" id="role-editor"><div class="editor-heading"><span class="role-avatar" id="role-avatar">A</span><div><h3 id="role-editor-title">Архитектор</h3><p class="hint" id="role-description"></p></div></div>
+      <label>Агент / устройство<select id="role-agent"></select></label><label>Провайдер<select id="role-profile"></select></label><label>Модель<select id="role-model"></select></label><p class="hint" id="role-capability"></p>
+      <details class="role-instructions"><summary>Инструкции роли</summary><textarea id="role-instructions" rows="4" placeholder="За что отвечает эта роль"></textarea></details><button type="button" id="role-save" class="ghost save-role">Сохранить назначение</button><p id="role-save-status" class="hint" role="status"></p>
+    </section><section class="quota-summary"><div class="section-heading"><h3>Расходы и лимиты</h3></div><p class="hint" id="role-quota">Данные аккаунта не предоставлены каналом.</p></section>
+  </aside>
+</main>
+<main class="layout" id="view-ops" hidden>
   <section class="panel agents">
     <div class="panel-head"><h2>Агенты</h2><span class="muted" id="agents-count"></span></div>
     <div id="agents-list" class="agents-list"></div>
@@ -86,6 +82,44 @@
   </section>
 </main>
 
+<main id="view-quality" class="quality-view" hidden>
+  <header class="quality-header">
+    <div><div class="eyebrow">КАЧЕСТВО КАНАЛОВ</div><h1>Проверка выбранного маршрута</h1><p id="q-suite-description" class="hint">Загружаю версионированный набор проверок…</p></div>
+    <button type="button" class="ghost small" id="q-refresh">Обновить данные</button>
+  </header>
+  <div id="q-error" class="quality-error" role="alert" hidden></div>
+  <section class="quality-start panel">
+    <div><div class="eyebrow">ОДИН РУЧНОЙ ЗАПУСК</div><h2>Маршрут и объём проверки</h2><p class="hint">Каждая проверка создаёт отдельную задачу в обычной очереди. Автоматических повторов нет.</p></div>
+    <div class="quality-version-note"><strong>OCR вручную</strong><br>Текущий набор проверок текстовый: он не отправляет изображения и не запускает OCR. Для ручной проверки прикрепите изображение в рабочем пространстве и выберите маршрут, который поддерживает изображения. Такие каналы остаются доступны для управления ниже.</div>
+    <form id="q-start-form" class="quality-controls">
+      <label>Агент<select id="q-agent" required><option value="">Выберите агента</option></select></label>
+      <label>Провайдер<select id="q-provider" required disabled><option value="">Выберите провайдера</option></select></label>
+      <label>Модель<select id="q-model" required disabled><option value="">Выберите модель</option></select></label>
+      <label>Количество задач<select id="q-case-count"><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4" selected>4</option></select></label>
+      <label>Лимит времени на задачу, с<input id="q-timeout" type="number" min="10" max="180" value="60" required></label>
+      <button type="submit" class="primary" id="q-start">Запустить проверку</button>
+      <input id="q-channel" type="hidden" value="">
+    </form>
+    <p id="q-selection-status" class="quality-selection-status" role="status">Последовательно выберите агента, провайдера и модель.</p>
+    <p id="q-start-status" class="msg" role="status"></p>
+    <p id="q-scope-note" class="quality-scope-note">100% означает, что пройдены все запущенные проверки. Это результат базового набора, не общая оценка модели.</p>
+    <div id="q-suite-cases" class="quality-cases"></div>
+  </section>
+  <section class="quality-columns">
+    <section class="panel quality-channels">
+      <div class="panel-head"><div><div class="eyebrow">РУЧНОЕ УПРАВЛЕНИЕ</div><h2>Каналы</h2></div><span id="q-channel-count" class="count-label"></span></div>
+      <label class="quality-search">Фильтр каналов<input id="q-channel-filter" type="search" placeholder="Агент, профиль или модель"></label>
+      <div id="q-channel-list" class="quality-channel-list"></div>
+    </section>
+    <section class="panel quality-runs">
+      <div class="panel-head"><div><div class="eyebrow">СОХРАНЁННЫЕ РЕЗУЛЬТАТЫ</div><h2>Запуски</h2></div><span id="q-run-count" class="count-label"></span></div>
+      <div class="quality-version-note">Сравнивайте результаты одной версии проверки. Ошибка проверки — наблюдение о качестве, не доказательство подмены модели.</div>
+      <div id="q-run-list" class="quality-run-list"></div>
+      <section id="q-run-detail" class="quality-run-detail" hidden></section>
+    </section>
+  </section>
+</main>
+
 <aside class="detail" id="detail" hidden>
   <div class="detail-head">
     <div>
@@ -111,6 +145,9 @@
   <ol id="d-events" class="events"></ol>
 </aside>
 
-<script src="app.js?v=20"></script>
-</body>
-</html>
+
+<dialog id="project-dialog" class="settings-dialog"><form id="project-settings-form"><div class="dialog-heading"><h2 id="project-dialog-title">Настройки проекта</h2><button type="button" id="project-dialog-close" class="icon-button" aria-label="Закрыть настройки">×</button></div><label>Название<input id="project-name" required maxlength="120" placeholder="Название проекта"></label><label>Устройство<select id="project-host"><option value="laptop">Ноутбук</option><option value="server">Сервер</option></select></label><label>Рабочая папка на этом устройстве<input id="project-workdir" placeholder="C:\Projects\my-project" autocomplete="off"></label><p class="hint">Агент работает в этой папке. Серверный путь не подставляется на ноутбуке.</p><p id="project-dialog-error" class="err" role="alert"></p><button type="submit" class="primary">Сохранить проект</button></form></dialog>
+<div id="toast" class="toast" role="status" hidden></div>
+<div class="gate" id="gate" hidden><form class="gate-box" id="token-form"><div class="brand-mark">AI</div><h2>Подключиться к AI Hub</h2><p>Введите токен доступа к вашему хабу.</p><label class="sr-only" for="token-input">Токен доступа</label><input id="token-input" type="password" placeholder="HUB_TOKEN" autocomplete="off"><div class="row"><button class="primary" id="token-save" type="button">Подключиться</button><button class="ghost" id="token-cancel" type="button">Отмена</button><button class="ghost" id="token-diag" type="button">Диагностика</button></div><pre id="diag" class="diag" hidden></pre><p class="msg" id="token-status"></p><p class="err" id="token-err" role="alert"></p></form></div>
+<script src="app.js?v=24"></script><script src="quality.js?v=2"></script>
+</body></html>

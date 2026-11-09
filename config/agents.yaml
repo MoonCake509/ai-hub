@@ -7,6 +7,7 @@
 agents:
   - id: codex
     default_profile: openai
+    supports_workdir: true
     profiles:
       - id: openai
         name: OpenAI (подписка Codex)
@@ -32,20 +33,97 @@ agents:
 
   - id: openclaw-laptop
     model_selection: false
-    default_profile: claudehub
+    model_selection_reason: "Выбор модели проходит проверку: отдельный запуск превысил 300с; доступен штатный канал без выбора"
+    default_profile: router-cheap
     profiles:
-      - id: claudehub
-        name: ClaudeHub (claudehub)
+      - id: pishnye-ai
+        name: "pishnye-ai"
+        native_provider: pishnye-ai
         models:
-          - claude-opus-5
-          - claude-sonnet-4.5
-          - claude-haiku-4
+          - "claude-fable-5"
+          - "claude-fable-5-1"
+          - "claude-haiku-5-5"
+          - "claude-opus-5"
+          - "claude-opus-5-5"
+          - "claude-sonnet-5"
+          - "claude-sonnet-5-5"
+          - "deepseek-v4-pro-0813"
+          - "deepseek-v4.1-flash"
+          - "gemini-3.8-flash"
+          - "glm-5.3"
+          - "glm-5.3-flash"
+          - "gpt-5.6-sol"
+          - "gpt-5.6-terra"
+          - "gpt-6-astra"
+          - "gpt-6-luna"
+          - "gpt-6-sol"
+          - "gpt-6.1-sol"
+          - "grok-4.7"
+          - "kimi-k2.7-code"
+          - "kimi-k3"
+          - "mimo-v2.5-pro"
+          - "glm-5.3-flashx"
+          - "gpt-5.6-luna"
+          - "qwen3.8-flash"
+          - "qwen3.8-max"
+      - id: claudexia
+        name: "claudexia"
+        native_provider: claudexia
+        models:
+          - "deepseek-v4.1-flash"
+          - "gpt-6-luna"
+          - "qwen3.8-flash"
+          - "qwen3.8-omni-flash"
+      - id: gigachat
+        name: "gigachat"
+        native_provider: gigachat
+        models:
+          - "gigachat-3.5-ultra"
+      - id: apinex-bond
+        name: "apinex-bond"
+        native_provider: apinex-bond
+        models:
+          - "free/glm-5.3-flashx"
       - id: router-cheap
-        name: Router.cheap
+        name: "router-cheap"
+        native_provider: router-cheap
         models:
-          - deepseek-v4.1-flash
-          - gpt-6.1-sol
-          - qwen3.8-max
+          - "deepseek-v4.1-flash-1017"
+          - "claude-fable-5"
+          - "claude-fable-5-1"
+          - "claude-haiku-5-5"
+          - "claude-opus-5"
+          - "claude-opus-5-5"
+          - "claude-sonnet-5"
+          - "claude-sonnet-5-5"
+          - "deepseek-v4-pro-0813"
+          - "deepseek-v4.1-flash"
+          - "gemini-3.8-flash"
+          - "glm-5.3"
+          - "glm-5.3-flash"
+          - "gpt-5.6-sol"
+          - "gpt-5.6-terra"
+          - "gpt-6-astra"
+          - "gpt-6-luna"
+          - "gpt-6-sol"
+          - "gpt-6.1-sol"
+          - "gpt-6.1-terra"
+          - "grok-4.7"
+          - "kimi-k3"
+          - "gpt-5.6-luna"
+          - "qwen3.8-flash"
+          - "qwen3.8-max"
+          - "kimi-k3.1-pro"
+      - id: vast-qwen
+        name: "vast-qwen"
+        native_provider: vast-qwen
+        models:
+          - "qwen25-32b-abliterated"
+      - id: dolphin-local
+        name: "dolphin-local"
+        native_provider: dolphin-local
+        models:
+          - "dolphin"
     name: OpenClaw (ноутбук)
     transport: cli
     host: laptop
@@ -55,21 +133,92 @@ agents:
     notes: "gateway только на loopback, ходим через CLI"
 
   - id: hermes-laptop
-    model_selection: false
-    default_profile: claudehub
+    model_selection: true
+    supports_workdir: true
+    default_profile: router-cheap
     profiles:
+      - id: pishnye
+        name: "pishnye"
+        native_provider: pishnye
+        models:
+          - "deepseek-v4.1-flash-1017"
+          - "deepseek-v4-pro-0813"
+          - "deepseek-v4.1-flash"
+          - "gemini-3.8-flash"
+          - "glm-5.3"
+          - "glm-5.3-flash"
+          - "glm-5.3-flashx"
+          - "gpt-5.6-luna"
+          - "gpt-5.6-sol"
+          - "gpt-5.6-terra"
+          - "gpt-6-astra"
+          - "gpt-6-luna"
+          - "gpt-6-sol"
+          - "gpt-6.1-sol"
+          - "grok-4.7"
+          - "kimi-k2.7-code"
+          - "kimi-k3"
+          - "qwen3.8-flash"
+          - "qwen3.8-max"
       - id: claudehub
-        name: ClaudeHub (claudehub)
+        name: "claudehub"
+        native_provider: claudehub
         models:
-          - deepseek-v4.1-flash
-          - claude-opus-5
-          - claude-sonnet-4.5
+          - "claude-sonnet-5"
+          - "Qwen-3.8-Max"
+          - "claude-fable-5"
+          - "claude-fable-5-1"
+          - "claude-haiku-4.5"
+          - "claude-opus-4.6"
+          - "claude-opus-4.7"
+          - "claude-opus-4.8"
+          - "claude-opus-5"
+          - "claude-opus-5-5"
+          - "claude-sonnet-4.6"
+          - "claude-sonnet-5"
+          - "claude-sonnet-5-5"
+          - "deepseek-v4-flash"
+          - "deepseek-v4-pro"
+          - "deepseek-v4.1-flash"
+          - "gemini-flash-3.8"
+          - "glm-5.3"
+          - "glm-5.3-flash"
+          - "gpt-5.5"
+          - "gpt-5.6-luna"
+          - "gpt-5.6-sol"
+          - "gpt-5.6-terra"
+          - "gpt-6-astra"
+          - "gpt-6-luna"
+          - "gpt-6-sol"
+          - "gpt-6.1-sol"
+          - "grok-4.6"
+          - "grok-4.7"
+          - "kimi-2.7"
+          - "kimi-k3"
       - id: router-cheap
-        name: Router.cheap
+        name: "router.cheap"
+        native_provider: router_cheap
         models:
-          - deepseek-v4.1-flash
-          - gpt-6.1-sol
-          - qwen3.8-max
+          - "deepseek-v4.1-flash-1017"
+          - "deepseek-v4-pro-0813"
+          - "deepseek-v4.1-flash"
+          - "gemini-3.8-flash"
+          - "glm-5.3"
+          - "glm-5.3-flash"
+          - "gpt-5.6-luna"
+          - "gpt-5.6-sol"
+          - "gpt-5.6-terra"
+          - "gpt-6-astra"
+          - "gpt-6-luna"
+          - "gpt-6-sol"
+          - "gpt-6.1-sol"
+          - "grok-4.7"
+          - "kimi-k2.7-code"
+          - "kimi-k3"
+          - "kimi-k3.1-pro"
+          - "gpt-6.1-terra"
+          - "qwen3.8-flash"
+          - "qwen3.8-max"
     name: Hermes (ноутбук)
     transport: cli
     host: laptop
@@ -96,13 +245,27 @@ agents:
     notes: "только через CDP/DOM, API нет"
 
   - id: llm-server
-    model_selection: false
+    model_selection: true
     default_profile: local
+    input_modalities: [text]
+    output_modalities: [text]
+    context_mode: "Текстовый HTTP-контекст; без доступа к файлам проекта и file tools"
+    filesystem_access: false
     profiles:
       - id: local
         name: Локальный llama.cpp
+        input_modalities: [text]
+        output_modalities: [text]
+        context_mode: "Только текст prompt; файлы проекта недоступны"
+        filesystem_access: false
         models:
           - dolphin-2.9-llama3-8b.Q4_K_M
+        model_capabilities:
+          dolphin-2.9-llama3-8b.Q4_K_M:
+            input_modalities: [text]
+            output_modalities: [text]
+            context_mode: "Только текст prompt; файлы проекта недоступны"
+            filesystem_access: false
     name: llama.cpp Dolphin 8B (сервер)
     transport: http
     host: server
@@ -110,6 +273,40 @@ agents:
     bridge_agent: llm-server
     model: dolphin-2.9-llama3-8b.Q4_K_M
     notes: "127.0.0.1:11434, OpenAI-совместимый; ctx 8192, max_tokens 1024"
+
+  - id: xiaomi-ocr-server
+    model_selection: true
+    default_profile: local
+    input_modalities: [text, image]
+    output_modalities: [text]
+    required_modalities: [image]
+    context_mode: "Локальный OCR изображения; файлы проекта и file tools недоступны"
+    filesystem_access: false
+    profiles:
+      - id: local
+        name: Xiaomi OCR (локальный сервер)
+        input_modalities: [text, image]
+        output_modalities: [text]
+        required_modalities: [image]
+        context_mode: "Один загруженный PNG/JPEG + текстовый вопрос; файлы проекта недоступны"
+        filesystem_access: false
+        requires_image: true
+        models:
+          - xiaomi-ocr-q8
+        model_capabilities:
+          xiaomi-ocr-q8:
+            input_modalities: [text, image]
+            output_modalities: [text]
+            required_modalities: [image]
+            context_mode: "Один загруженный PNG/JPEG + текстовый вопрос; файлы проекта недоступны"
+            filesystem_access: false
+            requires_image: true
+    name: Xiaomi OCR Q8 (сервер)
+    transport: http
+    host: server
+    status: verified
+    bridge_agent: xiaomi-ocr-server
+    notes: "Локальный OCR API 127.0.0.1:8787; модель xiaomi-ocr-q8"
 
   - id: hermes-server
     model_selection: false

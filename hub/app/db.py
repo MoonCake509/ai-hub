@@ -21,6 +21,18 @@ import pg8000.native
 _lock = threading.RLock()
 _conn: pg8000.native.Connection | None = None
 
+
+def _json_object(value):
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+            return decoded if isinstance(decoded, dict) else {}
+        except (TypeError, ValueError):
+            return {}
+    return {}
+
 # Тестовый стенд работает в отдельной схеме той же БД: рабочие таблицы не затрагиваются.
 # Схема подставляется через search_path при подключении, а не правкой SQL-текстов.
 SCHEMA = os.environ.get("SCHEMA", "aihub")
@@ -97,6 +109,69 @@ DDL = [
         at timestamptz not null default now(),
         payload jsonb
     )""",
+    # --- 9.2: рабочее пространство проекта ---
+    """create table if not exists aihub.projects (
+        id text primary key,
+        name text not null,
+        host_id text not null default 'laptop',
+        workdir text not null default '',
+        settings jsonb not null default '{}',
+        created_at timestamptz not null default now()
+    )""",
+    """create table if not exists aihub.roles (
+        project_id text not null references aihub.projects(id) on delete cascade,
+        role_id text not null,
+        agent_id text not null default '',
+        profile text,
+        model text,
+        instructions text not null default '',
+        timeout_s int,
+        primary key (project_id, role_id)
+    )""",
+    """create table if not exists aihub.conversations (
+        id text primary key,
+        project_id text not null references aihub.projects(id) on delete cascade,
+        role_id text not null default '',
+        title text not null default '',
+        created_at timestamptz not null default now()
+    )""",
+    """create table if not exists aihub.messages (
+        id bigserial primary key,
+        conversation_id text not null references aihub.conversations(id) on delete cascade,
+        author text not null,
+        body text not null,
+        job_id text references aihub.jobs(id) on delete set null,
+        state text not null default 'done',
+        idempotency_key text,
+        created_at timestamptz not null default now()
+    )""",
+    "create index if not exists messages_conv on aihub.messages(conversation_id, id)",
+    "alter table aihub.messages add column if not exists idempotency_key text",
+    "create unique index if not exists messages_idem on aihub.messages(idempotency_key) where idempotency_key is not null",
+    # Вложения: загрузка с устройства пользователя или выбор файла на устройстве агента.
+    """create table if not exists aihub.attachments (
+        id text primary key,
+        project_id text not null references aihub.projects(id) on delete cascade,
+        origin text not null,
+        filename text not null,
+        mime text not null default '',
+        size_bytes int not null default 0,
+        storage text not null,
+        host_id text,
+        host_path text,
+        created_at timestamptz not null default now()
+    )""",
+    "alter table aihub.attachments add column if not exists metadata jsonb",
+    """create table if not exists aihub.message_attachments (
+        message_id bigint not null references aihub.messages(id) on delete cascade,
+        attachment_id text not null references aihub.attachments(id) on delete cascade,
+        primary key (message_id, attachment_id)
+    )""",
+    # Запуск помнит своё назначение снимком — правки карточки роли его не меняют.
+    "alter table aihub.jobs add column if not exists project_id text",
+    "alter table aihub.jobs add column if not exists conversation_id text",
+    "alter table aihub.jobs add column if not exists role_id text",
+    "alter table aihub.jobs add column if not exists run_snapshot jsonb",
 ]
 
 
@@ -166,7 +241,8 @@ class QueueFull(Exception):
 def create_job(agent_id: str, prompt: str, prompt_sha: str, timeout_s: int,
                idempotency_key: str | None, max_queue: int | None = None,
                requested_model: str | None = None,
-               requested_profile: str | None = None) -> tuple[dict, bool]:
+               requested_profile: str | None = None,
+               workspace: dict | None = None) -> tuple[dict, bool]:
     """Возвращает (job, created). При совпадении ключа с другим телом — ValueError."""
     job_id = uuid.uuid4().hex
     with _lock:
@@ -193,12 +269,15 @@ def create_job(agent_id: str, prompt: str, prompt_sha: str, timeout_s: int,
                 depth = _one(conn, "select count(*) as n from aihub.jobs where status = 'queued'")["n"]
                 if depth >= max_queue:
                     raise QueueFull(depth)
+            workspace = workspace or {}
             conn.run(_qualify(
                 "insert into aihub.jobs(id, agent_id, prompt, prompt_sha, timeout_s, idempotency_key,"
-                " requested_model, requested_profile)"
-                " values (:i, :a, :p, :s, :t, :k, :rm, :rp)"),
+                " requested_model, requested_profile, project_id, conversation_id, role_id, run_snapshot)"
+                " values (:i, :a, :p, :s, :t, :k, :rm, :rp, :pr, :cv, :ri, :sn::jsonb)"),
                 i=job_id, a=agent_id, p=prompt, s=prompt_sha, t=timeout_s, k=idempotency_key,
-                rm=requested_model, rp=requested_profile,
+                rm=requested_model, rp=requested_profile, pr=workspace.get("project_id"),
+                cv=workspace.get("conversation_id"), ri=workspace.get("role_id"),
+                sn=json.dumps(workspace, ensure_ascii=False),
             )
             conn.run(_qualify("insert into aihub.job_events(job_id, event) values (:j, 'queued')"), j=job_id)
             conn.run("commit")
@@ -214,6 +293,11 @@ def get_job(job_id: str) -> dict | None:
         job = _one(conn, "select * from aihub.jobs where id = :i", i=job_id)
         if not job:
             return None
+        if isinstance(job.get("run_snapshot"), str):
+            try:
+                job["run_snapshot"] = json.loads(job["run_snapshot"])
+            except (TypeError, ValueError):
+                job["run_snapshot"] = {}
         job["attempts_detail"] = _rows(
             conn,
             "select id, attempt_no, worker, status, started_at, finished_at, error, usage"
@@ -229,6 +313,18 @@ def get_job(job_id: str) -> dict | None:
                     job[col] = None
                 except Exception:
                     job[col] = None
+        return job
+
+
+def get_job_by_idempotency_key(key: str) -> dict | None:
+    with _lock:
+        conn = connect()
+        job = _one(conn, "select * from aihub.jobs where idempotency_key = :k", k=key)
+        if job and isinstance(job.get("run_snapshot"), str):
+            try:
+                job["run_snapshot"] = json.loads(job["run_snapshot"])
+            except (TypeError, ValueError):
+                job["run_snapshot"] = {}
         return job
 
 
@@ -300,7 +396,7 @@ def lease_job(worker: str, lease_seconds: int = 300, agents: str = "") -> dict |
                           attempts = j.attempts + 1
                      from c where j.id = c.id
                    returning j.id, j.agent_id, j.prompt, j.timeout_s, j.attempts, j.requested_model,
-                        j.requested_profile""",
+                        j.requested_profile, j.run_snapshot, j.project_id""",
                 lease=str(int(lease_seconds)), w=worker, agents=agents,
             )
             if not row:
@@ -320,7 +416,47 @@ def lease_job(worker: str, lease_seconds: int = 300, agents: str = "") -> dict |
         except Exception:
             conn.run("rollback")
             raise
-        return {**row, "attempt_id": attempt_id, "lease_seconds": lease_seconds}
+        snap = row.get("run_snapshot") or {}
+        if isinstance(snap, str):
+            try:
+                snap = json.loads(snap)
+            except Exception:
+                snap = {}
+        # Рабочая папка — из проекта, а не из промпта. Воркер запускает агента с этим cwd.
+        workdir = snap.get("workdir") if "workdir" in snap else None
+        host_id = snap.get("host_id")
+        project_id = row.get("project_id") or snap.get("project_id")
+        if project_id:
+            proj = _one(conn, _qualify("select workdir, host_id from aihub.projects where id = :p"),
+                        p=project_id)
+            if proj:
+                if "workdir" not in snap:
+                    workdir = proj.get("workdir") or None
+                host_id = host_id or proj.get("host_id")
+        # Вложения задания: содержимое передаётся воркеру, а не ссылка.
+        attachments = []
+        refs = snap.get("attachment_refs") or []
+        if not refs:
+            versions = snap.get("attachment_versions") or {}
+            refs = [{"id": aid, "version": versions.get(aid) or aid}
+                    for aid in (snap.get("attachment_ids") or [])]
+        for ref in refs[:5]:
+            aid = ref.get("id") if isinstance(ref, dict) else ref
+            if not aid:
+                continue
+            att = _one(conn, _qualify(
+                "select id, project_id, filename, mime, storage, origin from aihub.attachments"
+                " where id = :a and project_id = :p"),
+                a=aid, p=project_id)
+            if att and (not isinstance(ref, dict) or
+                        str(ref.get("version") or aid) == str(aid)):
+                attachments.append({"id": att["id"], "filename": att["filename"],
+                                    "mime": att["mime"], "content_b64": att["storage"] or "",
+                                    "origin": att["origin"], "version": str(aid),
+                                    "source": ref.get("source") if isinstance(ref, dict) else None,
+                                    "message_id": ref.get("message_id") if isinstance(ref, dict) else None})
+        return {**row, "attempt_id": attempt_id, "lease_seconds": lease_seconds,
+                "workdir": workdir or None, "host_id": host_id, "attachments": attachments}
 
 
 def heartbeat(attempt_id: str, lease_seconds: int = 300) -> bool:
@@ -410,7 +546,9 @@ def finish_attempt(attempt_id: str, ok: bool, output: str | None, error: str | N
                 " result_error = :e, result_usage = :u::jsonb, lease_until = null,"
                 " needs_reconcile = false, effective_model = :em where id = :j"),
                 s=status, o=output, e=error, u=json.dumps(usage or {}, ensure_ascii=False),
-                em=(usage or {}).get("model"), j=job["id"],
+                em=next((value.strip() for value in ((usage or {}).get("reported_model"),
+                                                     (usage or {}).get("model"))
+                         if isinstance(value, str) and value.strip()), None), j=job["id"],
             )
             conn.run(_qualify(
                 "insert into aihub.job_events(job_id, attempt_id, event, payload)"
@@ -485,3 +623,394 @@ def expire_leases() -> int:
                select (select count(*) from expired) as n""",
         )
         return int(row["n"])
+
+
+# ============================================================
+# 9.2: проекты, роли, чаты, вложения
+# ============================================================
+
+ROLE_IDS = ("architect", "coder", "tester", "reviewer", "archivist")
+
+ROLE_RU = {
+    "architect": "Архитектор",
+    "coder": "Кодер",
+    "tester": "Тестер",
+    "reviewer": "Ревьюер",
+    "archivist": "Архивариус",
+}
+
+
+def seed_workspace() -> dict:
+    """Проект «AI Hub» и пять карточек ролей. Идемпотентно: повтор — без изменений."""
+    with _lock:
+        conn = connect()
+        conn.run("begin")
+        try:
+            proj = _one(conn, _qualify("select * from aihub.projects where id = 'ai-hub'"))
+            if not proj:
+                conn.run(_qualify(
+                    "insert into aihub.projects(id, name, host_id, workdir, settings)"
+                    " values ('ai-hub', 'AI Hub', 'laptop', '', '{}'::jsonb)"))
+            for rid in ROLE_IDS:
+                ex = _one(conn, _qualify(
+                    "select 1 as one from aihub.roles where project_id = 'ai-hub' and role_id = :r"), r=rid)
+                if not ex:
+                    conn.run(_qualify(
+                        "insert into aihub.roles(project_id, role_id, agent_id, profile, model, instructions)"
+                        " values ('ai-hub', :r, 'codex', null, null, '')"), r=rid)
+            conn.run("commit")
+        except Exception:
+            conn.run("rollback")
+            raise
+        return get_project("ai-hub")
+
+
+def list_projects() -> list[dict]:
+    with _lock:
+        conn = connect()
+        return _rows(conn, _qualify("select * from aihub.projects order by created_at"))
+
+
+def get_project(project_id: str) -> dict | None:
+    with _lock:
+        conn = connect()
+        proj = _one(conn, _qualify("select * from aihub.projects where id = :p"), p=project_id)
+        if not proj:
+            return None
+        proj["roles"] = _rows(conn, _qualify(
+            "select * from aihub.roles where project_id = :p order by role_id"), p=project_id)
+        return proj
+
+
+def create_project(name: str, host_id: str = "laptop", workdir: str = "",
+                   settings: dict | None = None) -> dict:
+    project_id = uuid.uuid4().hex
+    with _lock:
+        conn = connect()
+        conn.run("begin")
+        try:
+            conn.run(_qualify(
+                "insert into aihub.projects(id, name, host_id, workdir, settings)"
+                " values (:i, :n, :h, :w, :s::jsonb)"),
+                i=project_id, n=name, h=host_id, w=workdir,
+                s=json.dumps(settings or {}, ensure_ascii=False))
+            for rid in ROLE_IDS:
+                conn.run(_qualify(
+                    "insert into aihub.roles(project_id, role_id, agent_id, profile, model, instructions)"
+                    " values (:p, :r, 'codex', null, null, '')"), p=project_id, r=rid)
+            conn.run("commit")
+        except Exception:
+            conn.run("rollback")
+            raise
+    return get_project(project_id)
+
+
+def update_project(project_id: str, name=None, host_id=None, workdir=None,
+                   settings=None) -> dict | None:
+    with _lock:
+        conn = connect()
+        conn.run("begin")
+        try:
+            if name is not None:
+                conn.run(_qualify("update aihub.projects set name = :v where id = :p"), v=name, p=project_id)
+            if host_id is not None:
+                conn.run(_qualify("update aihub.projects set host_id = :v where id = :p"), v=host_id, p=project_id)
+            if workdir is not None:
+                conn.run(_qualify("update aihub.projects set workdir = :v where id = :p"), v=workdir, p=project_id)
+            if settings is not None:
+                conn.run(_qualify("update aihub.projects set settings = :v::jsonb where id = :p"),
+                         v=json.dumps(settings, ensure_ascii=False), p=project_id)
+            conn.run("commit")
+        except Exception:
+            conn.run("rollback")
+            raise
+        return get_project(project_id)
+
+
+def update_role(project_id: str, role_id: str, agent_id=None, profile=None,
+                model=None, instructions=None, timeout_s=None) -> dict | None:
+    """Назначение роли. model=None означает «сброс к значению по умолчанию профиля»."""
+    if role_id not in ROLE_IDS:
+        raise ValueError("unknown_role")
+    with _lock:
+        conn = connect()
+        conn.run("begin")
+        try:
+            if agent_id is not None:
+                conn.run(_qualify(
+                    "update aihub.roles set agent_id = :v where project_id = :p and role_id = :r"),
+                    v=agent_id, p=project_id, r=role_id)
+            if profile is not None:
+                conn.run(_qualify(
+                    "update aihub.roles set profile = :v where project_id = :p and role_id = :r"),
+                    v=profile, p=project_id, r=role_id)
+            if model is not None:
+                conn.run(_qualify(
+                    "update aihub.roles set model = :v where project_id = :p and role_id = :r"),
+                    v=model, p=project_id, r=role_id)
+            if instructions is not None:
+                conn.run(_qualify(
+                    "update aihub.roles set instructions = :v where project_id = :p and role_id = :r"),
+                    v=instructions, p=project_id, r=role_id)
+            if timeout_s is not None:
+                conn.run(_qualify(
+                    "update aihub.roles set timeout_s = :v where project_id = :p and role_id = :r"),
+                    v=timeout_s, p=project_id, r=role_id)
+            conn.run("commit")
+        except Exception:
+            conn.run("rollback")
+            raise
+        return get_project(project_id)
+
+
+def clear_role_model(project_id: str, role_id: str) -> dict | None:
+    if role_id not in ROLE_IDS:
+        raise ValueError("unknown_role")
+    with _lock:
+        conn = connect()
+        conn.run(_qualify(
+            "update aihub.roles set model = null where project_id = :p and role_id = :r"),
+            p=project_id, r=role_id)
+        return get_project(project_id)
+
+
+def clear_role_selection(project_id: str, role_id: str) -> None:
+    if role_id not in ROLE_IDS:
+        raise ValueError("unknown_role")
+    with _lock:
+        conn = connect()
+        conn.run(_qualify(
+            "update aihub.roles set profile = null, model = null"
+            " where project_id = :p and role_id = :r"), p=project_id, r=role_id)
+
+
+def get_role(project_id: str, role_id: str) -> dict | None:
+    with _lock:
+        conn = connect()
+        return _one(conn, _qualify(
+            "select * from aihub.roles where project_id = :p and role_id = :r"), p=project_id, r=role_id)
+
+
+def list_conversations(project_id: str) -> list[dict]:
+    with _lock:
+        conn = connect()
+        return _rows(conn, _qualify(
+            "select * from aihub.conversations where project_id = :p order by created_at desc"),
+            p=project_id)
+
+
+def get_conversation(conversation_id: str) -> dict | None:
+    with _lock:
+        conn = connect()
+        conv = _one(conn, _qualify(
+            "select * from aihub.conversations where id = :c"), c=conversation_id)
+        if conv:
+            conv["project"] = get_project(conv["project_id"])
+        return conv
+
+
+def create_conversation(project_id: str, role_id: str = "", title: str = "") -> dict:
+    cid = uuid.uuid4().hex
+    with _lock:
+        conn = connect()
+        conn.run(_qualify(
+            "insert into aihub.conversations(id, project_id, role_id, title)"
+            " values (:c, :p, :r, :t)"), c=cid, p=project_id, r=role_id, t=title)
+        return {"id": cid, "project_id": project_id, "role_id": role_id, "title": title}
+
+
+def get_messages(conversation_id: str, limit: int = 200) -> list[dict]:
+    with _lock:
+        conn = connect()
+        rows = _rows(conn, _qualify(
+            "select m.id, m.conversation_id, m.author, m.body, m.job_id, m.state, m.created_at,"
+            " j.status as job_status, coalesce(j.run_snapshot->>'agent_id', j.agent_id) as job_agent_id,"
+            " coalesce(j.role_id, j.run_snapshot->>'role_id') as job_role_id,"
+            " j.requested_profile, j.requested_model, j.effective_model"
+            " from aihub.messages m left join aihub.jobs j on j.id = m.job_id"
+            " where m.conversation_id = :c order by m.id desc limit :l"),
+            c=conversation_id, l=limit)
+        rows.reverse()
+        for m in rows:
+            m["attachments"] = _rows(conn, _qualify(
+                "select a.id, a.filename, a.mime, a.size_bytes, a.origin, a.metadata"
+                " from aihub.attachments a"
+                " join aihub.message_attachments ma on ma.attachment_id = a.id"
+                " where ma.message_id = :m"), m=m["id"])
+            for attachment in m["attachments"]:
+                attachment["metadata"] = _json_object(attachment.get("metadata"))
+        return rows
+
+
+def add_message(conversation_id: str, author: str, body: str, job_id: str | None = None,
+                state: str = "done", idempotency_key: str | None = None) -> dict:
+    """Повтор с тем же ключом возвращает прежнее сообщение (без дубля)."""
+    with _lock:
+        conn = connect()
+        if idempotency_key:
+            ex = _one(conn, _qualify(
+                "select * from aihub.messages where idempotency_key = :k"), k=idempotency_key)
+            if ex:
+                if ex["conversation_id"] != conversation_id or ex["author"] != author or ex["body"] != body:
+                    raise ValueError("message_idempotency_conflict")
+                return ex
+        conn.run("begin")
+        try:
+            row = _one(conn, _qualify(
+                "insert into aihub.messages(conversation_id, author, body, job_id, state, idempotency_key)"
+                " values (:c, :a, :b, :j, :s, :k)"
+                " on conflict (idempotency_key) where idempotency_key is not null do nothing returning *"),
+                c=conversation_id, a=author, b=body, j=job_id, s=state, k=idempotency_key)
+            if not row and idempotency_key:
+                row = _one(conn, _qualify(
+                    "select * from aihub.messages where idempotency_key = :k"), k=idempotency_key)
+                if not row or row["conversation_id"] != conversation_id or row["author"] != author or row["body"] != body:
+                    raise ValueError("message_idempotency_conflict")
+            conn.run("commit")
+            return row
+        except Exception:
+            conn.run("rollback")
+            raise
+
+
+def get_message_by_idempotency_key(key: str) -> dict | None:
+    with _lock:
+        conn = connect()
+        return _one(conn, _qualify(
+            "select * from aihub.messages where idempotency_key = :k"), k=key)
+
+
+def set_message_job(message_id: int, job_id: str, state: str = "running") -> None:
+    with _lock:
+        conn = connect()
+        conn.run(_qualify("update aihub.messages set job_id = :j, state = :s where id = :m"),
+                 j=job_id, s=state, m=message_id)
+
+
+def finish_message_by_job(job_id: str, body: str, state: str) -> dict | None:
+    """Ответ агента дописывается в чат тем же сообщением-«ожиданием». Идемпотентно."""
+    with _lock:
+        conn = connect()
+        conn.run("begin")
+        try:
+            msg = _one(conn, _qualify(
+                "select * from aihub.messages where job_id = :j order by id desc limit 1"), j=job_id)
+            if not msg:
+                conn.run("rollback")
+                return None
+            if msg["state"] not in ("running", "queued"):
+                conn.run("rollback")
+                return msg
+            conn.run(_qualify("update aihub.messages set body = :b, state = :s where id = :m"),
+                     b=body, s=state, m=msg["id"])
+            conn.run("commit")
+            msg["body"] = body
+            msg["state"] = state
+            return msg
+        except Exception:
+            conn.run("rollback")
+            raise
+
+
+def create_attachment(project_id: str, origin: str, filename: str, mime: str,
+                      data: bytes, host_id: str | None = None,
+                      host_path: str | None = None, metadata: dict | None = None) -> dict:
+    import base64 as _b64
+    aid = uuid.uuid4().hex
+    with _lock:
+        conn = connect()
+        conn.run(_qualify(
+            "insert into aihub.attachments(id, project_id, origin, filename, mime, size_bytes,"
+            " storage, host_id, host_path, metadata)"
+            " values (:i, :p, :o, :f, :m, :s, :st, :h, :hp, :md::jsonb)"),
+            i=aid, p=project_id, o=origin, f=filename, m=mime, s=len(data),
+            st=_b64.b64encode(data).decode(), h=host_id, hp=host_path,
+            md=json.dumps(metadata or {}))
+        return {"id": aid, "filename": filename, "mime": mime, "size_bytes": len(data),
+                "origin": origin, "host_path": host_path, "metadata": metadata or {}}
+
+
+def list_attachments(project_id: str) -> list[dict]:
+    """Файлы проекта для выбора в контексте. Хранилище не отдаём — только метаданные."""
+    with _lock:
+        conn = connect()
+        rows = _rows(conn, _qualify(
+            "select id, filename, mime, size_bytes, origin, metadata, created_at from aihub.attachments"
+            " where project_id = :p order by created_at desc limit 200"), p=project_id)
+        for attachment in rows:
+            attachment["metadata"] = _json_object(attachment.get("metadata"))
+        return rows
+
+
+def get_attachment(attachment_id: str) -> dict | None:
+    with _lock:
+        conn = connect()
+        row = _one(conn, _qualify("select * from aihub.attachments where id = :a"), a=attachment_id)
+        if row:
+            row["metadata"] = _json_object(row.get("metadata"))
+        return row
+
+
+def link_attachment(message_id: int, attachment_id: str) -> None:
+    with _lock:
+        conn = connect()
+        conn.run(_qualify(
+            "insert into aihub.message_attachments(message_id, attachment_id)"
+            " values (:m, :a) on conflict do nothing"), m=message_id, a=attachment_id)
+
+
+def get_conversation_context(conversation_id: str, tail: int = 20) -> list[dict]:
+    """Recent messages and only their project-owned attachment links."""
+    with _lock:
+        conn = connect()
+        rows = _rows(conn, _qualify(
+            "select m.id, m.author, m.body, c.project_id from aihub.messages m"
+            " join aihub.conversations c on c.id = m.conversation_id"
+            " where m.conversation_id = :c order by m.id desc limit :t"),
+            c=conversation_id, t=tail)
+        rows.reverse()
+        for message in rows:
+            message["attachments"] = _rows(conn, _qualify(
+                "select a.id, a.project_id, a.filename, a.mime, a.size_bytes, a.origin"
+                " from aihub.message_attachments ma"
+                " join aihub.attachments a on a.id = ma.attachment_id"
+                " where ma.message_id = :m and a.project_id = :p"
+                " order by a.created_at desc, a.id desc"),
+                m=message["id"], p=message["project_id"])
+        return rows
+
+
+def refresh_default_conversation_title(conversation_id: str) -> str | None:
+    """Name a default conversation from its first user message; preserve custom titles."""
+    with _lock:
+        conn = connect()
+        updated = _one(conn, _qualify(
+            "with first_user as ("
+            " select regexp_replace(btrim(body), '\\s+', ' ', 'g') as body"
+            " from aihub.messages where conversation_id = :c and author = 'user'"
+            " order by id asc limit 1"
+            "), renamed as ("
+            " update aihub.conversations c set title = case"
+            " when char_length(first_user.body) > 64 then left(first_user.body, 61) || '…'"
+            " else first_user.body end"
+            " from first_user where c.id = :c"
+            " and lower(btrim(coalesce(c.title, ''))) in ('', 'новый чат', 'new chat')"
+            " returning c.title"
+            ") select title from renamed"), c=conversation_id)
+        if updated:
+            return updated["title"]
+        current = _one(conn, _qualify(
+            "select title from aihub.conversations where id = :c"), c=conversation_id)
+        return current.get("title") if current else None
+
+
+def create_chat_job(agent_id: str, prompt: str, prompt_sha: str, timeout_s: int,
+                    idempotency_key: str | None, max_queue: int | None,
+                    requested_model: str | None, requested_profile: str | None,
+                    project_id: str, conversation_id: str, role_id: str,
+                    run_snapshot: dict) -> tuple[dict, bool]:
+    """Запуск из чата: job + связь с проектом/ролью/снимок назначения."""
+    workspace = dict(run_snapshot)
+    workspace.update(project_id=project_id, conversation_id=conversation_id, role_id=role_id)
+    return create_job(agent_id, prompt, prompt_sha, timeout_s, idempotency_key,
+                      max_queue, requested_model, requested_profile, workspace)

@@ -66,36 +66,51 @@ def outbox_path(job_id: str, attempt_id: str) -> str:
 
 
 def deliver(path: str) -> bool:
-    """Досылает результат из файла, пока хаб не подтвердит или не отвергнет попытку."""
+    """Keep the outbox item until the Hub confirms durable result storage."""
     try:
         with open(path, encoding="utf-8") as fh:
             payload = json.load(fh)
-    except (OSError, ValueError):
-        return True
+    except (OSError, ValueError) as exc:
+        log(f"deliver retained unreadable outbox file: {type(exc).__name__}")
+        return False
     base = hub_url()
-    for _ in range(120):
+    for attempt in range(3):
         try:
             code, resp = http("POST", f"{base}/bridge/result", payload, timeout=60)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            log(f"deliver retained {payload.get('attempt_id')}: invalid JSON acknowledgement ({type(exc).__name__})")
+            return False
         except Exception as exc:  # noqa: BLE001
-            log(f"deliver retry {payload.get('attempt_id')}: {exc}")
-            time.sleep(5)
-            continue
-        if code == 200:
-            # late/stale тоже означают «хаб сохранил»: результат лежит в late_results.
-            if resp.get("outcome") in ("applied", "duplicate", "late", "stale"):
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
-            return True
-        if code in (404, 409):
-            log(f"deliver drop {payload.get('attempt_id')}: {code} {resp}")
+            log(f"deliver transport error {payload.get('attempt_id')}: {type(exc).__name__}")
+            if attempt < 2:
+                time.sleep(5)
+                continue
+            return False
+        outcome = resp.get("outcome") if isinstance(resp, dict) else None
+        confirmed = (
+            code == 200
+            and isinstance(resp, dict)
+            and resp.get("ok") is True
+            and resp.get("recorded") is True
+            and outcome in ("applied", "duplicate", "late", "stale")
+        )
+        if confirmed:
             try:
                 os.remove(path)
-            except OSError:
-                pass
+            except OSError as exc:
+                log(f"deliver stored but could not remove outbox {payload.get('attempt_id')}: {type(exc).__name__}")
+                return False
             return True
-        time.sleep(5)
+        if code in (404, 409):
+            log(f"deliver retained {payload.get('attempt_id')}: HTTP {code}, server did not confirm durable storage")
+            return False
+        if code == 200:
+            ack_ok = resp.get("ok") if isinstance(resp, dict) else None
+            ack_recorded = resp.get("recorded") if isinstance(resp, dict) else None
+            log(f"deliver retained {payload.get('attempt_id')}: invalid acknowledgement ok={ack_ok} recorded={ack_recorded} outcome={outcome}")
+            return False
+        log(f"deliver retained {payload.get('attempt_id')}: HTTP {code}, server did not confirm durable storage")
+        return False
     return False
 
 
@@ -188,23 +203,49 @@ def main() -> int:
         lease = int(job.get("lease_seconds") or 300)
         timeout = int(job.get("timeout") or spec["timeout"])
         requested_model = job.get("requested_model")
+        requested_profile = job.get("requested_profile")
+        workdir = job.get("workdir") or None
+        # Вложения задания: содержимое приходит с хабом; раскладываем во временный каталог,
+        # чтобы Codex мог открыть файлы, и перечисляем пути в промпте.
+        attachments = job.get("attachments") or []
+        if attachments:
+            import base64, tempfile
+            att_dir = tempfile.mkdtemp(prefix="aihub-att-")
+            paths = []
+            for att in attachments:
+                try:
+                    raw = base64.b64decode(att.get("content_b64") or "")
+                except Exception:
+                    continue
+                safe = os.path.basename(att.get("filename") or "file")
+                p = os.path.join(att_dir, safe)
+                with open(p, "wb") as fh:
+                    fh.write(raw)
+                paths.append(p)
+            if paths:
+                prompt += "\n\nФайлы приложены и доступны по путям:\n" + "\n".join(paths)
         stop = threading.Event()
         threading.Thread(target=heartbeat_loop, args=(base, attempt_id, lease, stop), daemon=True).start()
 
-        log(f"job {job_id} attempt={attempt_id} agent={agent_id} timeout={timeout} model={requested_model}")
+        log(f"job {job_id} attempt={attempt_id} agent={agent_id} timeout={timeout} "
+            f"profile={requested_profile} model={requested_model}")
         started = time.time()
         try:
-            # Выбор модели передаётся только адаптерам, которые его применяют.
-            if requested_model and agent_id in ("codex",):
-                # Локальный Codex на ноутбуке: выбор модели через адаптер.
-                result = spec["runner"](prompt, timeout, requested_model)
+            if agent_id == "codex":
+                # Preserve Codex model/cwd behavior; the updated bridge accepts
+                # requested_profile and keyword-only cwd while legacy positional
+                # model/workdir calls remain supported.
+                result = spec["runner"](
+                    prompt, timeout, requested_model, requested_profile, cwd=workdir)
+            elif agent_id in ("openclaw", "hermes"):
+                result = spec["runner"](
+                    prompt, timeout, requested_model, requested_profile, cwd=workdir)
             else:
                 result = spec["runner"](prompt, timeout)
             ok = result.get("exit_code") == 0
             payload = {"job_id": job_id, "attempt_id": attempt_id, "ok": ok, **result}
-            # Фактическая модель: если инструмент её раскрывает — сохраняем, иначе null.
-            if result.get("model") is None:
-                payload["model"] = requested_model
+            # The selected model is already stored separately on the job;
+            # only a provider-reported model may be sent as the effective value.
             if not ok and not payload.get("error"):
                 code = result.get("exit_code")
                 tail = (result.get("output") or "").strip()[-500:]

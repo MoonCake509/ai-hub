@@ -31,10 +31,8 @@ TOKEN_FILE = os.path.join(HERE, "token.txt")
 LOG_FILE = os.path.join(HERE, "bridge.log")
 PORT = int(os.environ.get("BRIDGE_PORT", "8010"))
 
-CODEX_EXE = os.environ.get(
-    "CODEX_EXE",
-    r"C:\Users\lavy\AppData\Local\OpenAI\Codex\bin\a159911ff70742e9\codex.exe",
-)
+CODEX_EXE_DEFAULT = r"C:\Users\lavy\AppData\Local\OpenAI\Codex\bin\a159911ff70742e9\codex.exe"
+CODEX_EXE = os.environ.get("CODEX_EXE", CODEX_EXE_DEFAULT)
 QWEN_JS = os.environ.get("QWEN_JS", r"C:\Users\lavy\tools\qwen.js")
 OPENCLAW_CMD = os.environ.get("OPENCLAW_CMD") or shutil.which("openclaw") or r"C:\Users\lavy\AppData\Roaming\npm\openclaw.cmd"
 HERMES_EXE = os.environ.get("HERMES_EXE") or shutil.which("hermes") or r"C:\Users\lavy\AppData\Local\hermes\bin\hermes.exe"
@@ -43,6 +41,37 @@ NODE_EXE = shutil.which("node") or r"C:\Program Files\nodejs\node.exe"
 
 CREATE_NO_WINDOW = 0x08000000
 LOCKS = {name: threading.Lock() for name in ("codex", "qwen", "openclaw", "hermes")}
+
+
+def resolve_codex_exe() -> str:
+    """Resolve the current trusted Codex CLI, honoring an explicit override."""
+    override = os.environ.get("CODEX_EXE")
+    if override and override.strip():
+        return override.strip()
+
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        install_root = os.path.join(local_app_data, "OpenAI", "Codex", "bin")
+        try:
+            candidates = [
+                os.path.join(install_root, entry, "codex.exe")
+                for entry in os.listdir(install_root)
+                if os.path.isfile(os.path.join(install_root, entry, "codex.exe"))
+            ]
+        except OSError:
+            candidates = []
+        if candidates:
+            return max(candidates, key=os.path.getmtime)
+
+    # Preserve a clear missing-binary error when the trusted install root is
+    # unavailable. Do not fall back to an arbitrary executable from PATH.
+    return CODEX_EXE_DEFAULT
+
+
+def _agent_path(agent_id: str, spec: dict) -> str:
+    path = resolve_codex_exe() if agent_id == "codex" else spec["path"]
+    spec["path"] = path
+    return path
 
 # These are actual per-run provider IDs from the installed Hermes config. The
 # model catalog itself is generated from the installed clients' local metadata
@@ -226,7 +255,7 @@ def run_codex(prompt: str, timeout: int, requested_model: str | None = None,
             requested_profile = None
         else:
             raise ValueError(f"Codex profile '{requested_profile}' is not selectable by this adapter")
-    cmd = [CODEX_EXE, "exec", "--json", "--skip-git-repo-check"]
+    cmd = [resolve_codex_exe(), "exec", "--json", "--skip-git-repo-check"]
     # model/workdir remain accepted for older callers.
     requested_model = requested_model if requested_model is not None else model
     cwd = cwd if cwd is not None else workdir
@@ -482,10 +511,11 @@ class Handler(BaseHTTPRequestHandler):
                 return
             items = []
             for name, spec in AGENTS.items():
+                path = _agent_path(name, spec)
                 items.append({
                     "id": name,
                     "name": spec["name"],
-                    "available": bool(spec["path"]) and os.path.exists(spec["path"]),
+                    "available": bool(path) and os.path.exists(path),
                     "timeout": spec["timeout"],
                 })
             self._send(200, {"count": len(items), "agents": items})
@@ -515,8 +545,9 @@ class Handler(BaseHTTPRequestHandler):
         if not prompt:
             self._send(400, {"error": "prompt is required"})
             return
-        if not os.path.exists(spec["path"]):
-            self._send(503, {"error": f"agent binary not found: {spec['path']}"})
+        agent_exe = _agent_path(agent_id, spec)
+        if not os.path.exists(agent_exe):
+            self._send(503, {"error": f"agent binary not found: {agent_exe}"})
             return
 
         timeout = int(payload.get("timeout") or spec["timeout"])

@@ -232,11 +232,46 @@ print("created:", res.count("created"), "full:", res.count("full"))
           all_ok and total_created == 5 and total_full == 3 and db_n == 5,
           f"created={total_created} full={total_full} db={db_n} all_ok={all_ok}")
 
+def test_diag01_observations():
+    """DIAG-01: четыре вида наблюдений, TTL на чтение, отсутствие ложного ok."""
+    kinds = {"configured", "compatibility", "availability", "quality"}
+    code, d = api("GET", "/agents")
+    agents = d.get("agents") or []
+    check("DIAG-01: /agents 200 и 9 карточек", code == 200 and len(agents) == 9, str(code) + " " + str(len(agents)))
+    check("DIAG-01: у каждой карточки четыре вида",
+          all(kinds <= set(a.get("observations") or {}) for a in agents))
+    check("DIAG-01: без heartbeat availability unknown",
+          {((a.get("observations") or {}).get("availability") or {}).get("state") for a in agents} == {"unknown"})
+    check("DIAG-01: effective_state не ok без наблюдений",
+          "ok" not in {a.get("effective_state") for a in agents})
+    cleanup = "delete from aihub.agent_observations where source = 'contract-test'"
+    sql(cleanup)
+    sql("insert into aihub.agent_observations(id, agent_id, kind, state, source, checked_at, ttl_s, reason, detail)"
+        " values ('ct-diag-fresh','codex','availability','ok','contract-test', now(), 180, null, '{}'::jsonb)")
+    code, d = api("GET", "/agents/codex")
+    fresh = ((d.get("observations") or {}).get("availability") or {}).get("state")
+    check("DIAG-01: свежее наблюдение доступности даёт ok и effective ok",
+          fresh == "ok" and d.get("effective_state") == "ok", str(fresh) + " " + str(d.get("effective_state")))
+    sql(cleanup)
+    sql("insert into aihub.agent_observations(id, agent_id, kind, state, source, checked_at, ttl_s, reason, detail)"
+        " values ('ct-diag-stale','codex','availability','ok','contract-test', now() - interval '9 minutes', 180, 'heartbeat 9 минут назад', '{}'::jsonb)")
+    code, d = api("GET", "/agents/codex")
+    old = (d.get("observations") or {}).get("availability") or {}
+    check("DIAG-01: истёкший TTL → stale и degraded",
+          old.get("state") == "stale" and d.get("effective_state") == "degraded",
+          str(old.get("state")) + " " + str(d.get("effective_state")))
+    check("DIAG-01: stale объяснён возрастом и TTL",
+          "назад" in (old.get("reason") or "") and "TTL" in (old.get("reason") or ""), str(old.get("reason")))
+    stored = sql("select count(*) from aihub.agent_observations where id = 'ct-diag-stale' and state = 'ok'")
+    check("DIAG-01: stale вычисляется на чтение, в БД остаётся ok", stored == "1", stored)
+    sql(cleanup)
+
 
 if __name__ == "__main__":
     TOKEN = open(TOKEN_FILE, encoding="utf-8").read().strip()
     for fn in (test_idem_conflict, test_timeout_bounds, test_prompt_limit,
-               test_duplicate_result, test_late_result, test_concurrent_queue):
+               test_duplicate_result, test_late_result, test_concurrent_queue,
+               test_diag01_observations):
         print("==", fn.__name__)
         try:
             fn()

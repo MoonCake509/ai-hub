@@ -37,6 +37,11 @@ const EVENT_RU = {
   lease_expired: 'аренда истекла', finished: 'завершено',
 };
 const AGENT_STATUS_RU = { verified: 'проверен', unverified: 'не проверен', error: 'ошибка' };
+// DIAG-01: статус агента — набор наблюдений, а не слово в реестре.
+const OBS_KINDS = ['configured', 'compatibility', 'availability', 'quality'];
+const OBS_KIND_RU = { configured: 'конфигурация', compatibility: 'совместимость', availability: 'доступность', quality: 'качество' };
+const OBS_STATE_RU = { ok: 'ok', degraded: 'ухудшено', failed: 'сбой', stale: 'устарело', unknown: 'нет данных' };
+const OBS_EFFECTIVE_RU = { ok: 'ok', degraded: 'деградация', failed: 'сбой', unknown: 'нет свежих данных' };
 const ruStatus = s => STATUS_RU[s] || s || '—';
 const ruEvent = e => EVENT_RU[e] || e;
 
@@ -226,6 +231,80 @@ async function health() {
 }
 
 // ---------- агенты ----------
+function obsAge(iso) {
+  if (!iso) return '';
+  const t = new Date(iso).getTime();
+  if (!Number.isFinite(t)) return '';
+  const s = Math.max(0, Math.round((Date.now() - t) / 1000));
+  if (s < 60) return s + ' с назад';
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + ' мин назад';
+  const h = Math.floor(m / 60);
+  if (h < 48) return h + ' ч назад';
+  return Math.floor(h / 24) + ' дн назад';
+}
+
+function obsTtl(o) {
+  if (!o || o.ttl_s === null || o.ttl_s === undefined) return 'не истекает';
+  const s = o.ttl_s;
+  if (s < 3600) return 'TTL ' + Math.round(s / 60) + ' мин';
+  if (s < 86400) return 'TTL ' + Math.round(s / 3600) + ' ч';
+  return 'TTL ' + Math.round(s / 86400) + ' дн';
+}
+
+function obsDetailLine(detail) {
+  const parts = [];
+  for (const [k, v] of Object.entries(detail || {})) {
+    if (Array.isArray(v)) { if (v.length) parts.push(k + ': ' + v.join('/')); continue; }
+    if (v === null || v === undefined || v === '') continue;
+    parts.push(k + ': ' + v);
+  }
+  return parts.join(' · ');
+}
+
+function obsPanel(a) {
+  const panel = el('div', 'obs-panel');
+  const head = el('div', 'obs-panel-head');
+  head.append(el('b', '', OBS_EFFECTIVE_RU[a.effective_state] || a.effective_state || 'unknown'));
+  if (a.effective_reason) head.append(el('span', 'obs-reason', a.effective_reason));
+  panel.append(head);
+  for (const kind of OBS_KINDS) {
+    const o = (a.observations || {})[kind];
+    const state = o ? o.state : 'unknown';
+    const line = el('div', 'obs-row');
+    line.append(el('span', 'obs-kind', OBS_KIND_RU[kind]));
+    line.append(el('span', 'obs-state ' + state, OBS_STATE_RU[state] || state));
+    const meta = [];
+    meta.push(o && o.checked_at ? obsAge(o.checked_at) : 'наблюдений нет');
+    if (o && o.checked_at) meta.push(obsTtl(o));
+    if (o && o.source) meta.push('источник: ' + o.source);
+    line.append(el('span', 'obs-meta', meta.join(' · ')));
+    panel.append(line);
+    if (o && (o.reason || (o.detail && Object.keys(o.detail).length))) {
+      const extra = el('div', 'obs-extra');
+      if (o.reason) extra.append(el('span', 'obs-reason', o.reason));
+      const text = obsDetailLine(o.detail);
+      if (text) extra.append(el('span', 'obs-detail', text));
+      panel.append(extra);
+    }
+  }
+  return panel;
+}
+
+function obsBadge(a, row) {
+  const state = a.effective_state || 'unknown';
+  const badge = el('button', 'status obs-' + state, OBS_EFFECTIVE_RU[state] || state);
+  badge.type = 'button';
+  badge.title = 'Наблюдения: ' + (a.effective_reason || 'свежих данных нет');
+  badge.onclick = ev => {
+    ev.stopPropagation();
+    const wasOpen = !!row.querySelector('.obs-panel');
+    row.querySelectorAll('.obs-panel').forEach(n => n.remove());
+    if (!wasOpen) row.append(obsPanel(a));
+  };
+  return badge;
+}
+
 async function loadAgents() {
   const data = await api('/agents');
   agents = data.agents || [];
@@ -239,7 +318,7 @@ async function loadAgents() {
     const row = el('div', 'agent');
     row.dataset.id = a.id;
     row.append(el('span', 'id', a.id));
-    row.append(el('span', 'status ' + (a.status || ''), AGENT_STATUS_RU[a.status] || a.status || '—'));
+    row.append(obsBadge(a, row));
     row.append(el('span', 'transport', a.transport || ''));
     row.onclick = () => {
       document.querySelectorAll('.agent').forEach(n => n.classList.remove('active'));
@@ -249,7 +328,7 @@ async function loadAgents() {
     };
     list.append(row);
 
-    const opt = el('option', '', a.id + (a.status === 'verified' ? '' : ' (не проверен)'));
+    const opt = el('option', '', a.id + (a.effective_state === 'ok' ? '' : ' · ' + (OBS_EFFECTIVE_RU[a.effective_state] || a.effective_state || 'нет данных')));
     opt.value = a.id;
     if (!a.bridge_agent) opt.disabled = true;
     select.append(opt);

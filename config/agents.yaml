@@ -2,7 +2,7 @@
 # id       — стабильный идентификатор для API
 # transport— способ обращения: cli | http | cdp | acp
 # host     — где живёт агент: server | laptop
-# status   — verified | unverified | planned
+# configured — карточка заполнена в реестре; доступность и качество — в observations API
 
 agents:
   - id: codex
@@ -26,7 +26,7 @@ agents:
     model_selection: true
     transport: cli
     host: laptop
-    status: verified
+    configured: true
     bridge_agent: codex
     command: "codex exec --json --skip-git-repo-check"
     notes: "бинаря нет в PATH: AppData/Local/OpenAI/Codex/bin/*/codex.exe; список моделей из ~/.codex/models_cache.json"
@@ -127,7 +127,7 @@ agents:
     name: OpenClaw (ноутбук)
     transport: cli
     host: laptop
-    status: verified
+    configured: true
     bridge_agent: openclaw
     command: "openclaw agent --message-file <file> --json"
     notes: "gateway только на loopback, ходим через CLI"
@@ -222,7 +222,7 @@ agents:
     name: Hermes (ноутбук)
     transport: cli
     host: laptop
-    status: verified
+    configured: true
     bridge_agent: hermes
     command: "hermes -z <prompt>"
     notes: "режим одного запроса; через хаб — pull-воркер ноутбука"
@@ -240,7 +240,7 @@ agents:
     name: Qwen Desktop
     transport: cdp
     host: laptop
-    status: verified
+    configured: true
     bridge_agent: qwen
     notes: "только через CDP/DOM, API нет"
 
@@ -269,7 +269,7 @@ agents:
     name: llama.cpp Dolphin 8B (сервер)
     transport: http
     host: server
-    status: verified
+    configured: true
     bridge_agent: llm-server
     model: dolphin-2.9-llama3-8b.Q4_K_M
     notes: "127.0.0.1:11434, OpenAI-совместимый; ctx 8192, max_tokens 1024"
@@ -304,7 +304,7 @@ agents:
     name: Xiaomi OCR Q8 (сервер)
     transport: http
     host: server
-    status: verified
+    configured: true
     bridge_agent: xiaomi-ocr-server
     notes: "Локальный OCR API 127.0.0.1:8787; модель xiaomi-ocr-q8"
 
@@ -327,7 +327,7 @@ agents:
     name: Hermes (сервер)
     transport: cli
     host: server
-    status: verified
+    configured: true
     bridge_agent: hermes-server
     command: "hermes -z <prompt>"
 
@@ -350,7 +350,7 @@ agents:
     name: OpenClaw (сервер)
     transport: cli
     host: server
-    status: verified
+    configured: true
     bridge_agent: openclaw-server
     command: "openclaw agent --message-file <file> --json"
 
@@ -367,6 +367,6 @@ agents:
     name: Qwen Desktop (сервер)
     transport: cdp
     host: server
-    status: verified
+    configured: true
     bridge_agent: qwen-server
     notes: "CDP 9333, node qwen.js; требует авторизации в приложении"

@@ -23,7 +23,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import chat_context, db, quality, quality_db
+from . import chat_context, db, observations, quality, quality_db
 from .image_validation import validate_image
 
 VERSION = "0.3.0"
@@ -56,6 +56,13 @@ async def _sweeper() -> None:
 async def lifespan(app: FastAPI):
     await asyncio.to_thread(db.init)
     await asyncio.to_thread(quality_db.init)
+    await asyncio.to_thread(observations.init)
+    try:
+        written = await asyncio.to_thread(
+            observations.record_registry, load_agents().get("agents", []), None, VERSION)
+        print(f"registry observations: {written}", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        print("registry observations failed:", exc, flush=True)
     load_profiles()
     try:
         db.seed_workspace()
@@ -102,14 +109,31 @@ async def health() -> dict:
     return {"status": "ok", "service": "hub-agent", "version": VERSION, "db": db_ok}
 
 
+def with_observations(item: dict, summary: dict | None = None) -> dict:
+    """Карточка агента вместе с наблюдениями (DIAG-01).
+
+    Поле status остаётся для совместимости, но считается из configured и
+    compatibility, а не берётся из YAML как есть.
+    """
+    data = dict(item)
+    data.setdefault("model_selection_reason", None)
+    data.setdefault("supports_workdir", False)
+    observed = summary if summary is not None else observations.evaluate_one(
+        data, None, VERSION)
+    data["status"] = observed.get("status") or data.get("status")
+    data["observations"] = observed.get("observations") or {}
+    data["effective_state"] = observed.get("effective_state", "unknown")
+    data["effective_reason"] = observed.get("effective_reason")
+    data["observations_checked_at"] = observed.get("checked_at")
+    return data
+
+
 @app.get("/agents")
 def agents() -> dict:
-    items = []
-    for raw in load_agents().get("agents", []):
-        item = dict(raw)
-        item.setdefault("model_selection_reason", None)
-        item.setdefault("supports_workdir", False)
-        items.append(item)
+    raw_agents = load_agents().get("agents", [])
+    summary = observations.evaluate(raw_agents, None, VERSION)
+    items = [with_observations(raw, summary.get(str(raw.get("id") or "")))
+             for raw in raw_agents]
     return {"count": len(items), "agents": items}
 
 
@@ -135,8 +159,13 @@ async def agent_profiles(agent_id: str) -> dict:
     if item is None:
         raise HTTPException(status_code=404, detail=f"agent '{agent_id}' not found")
     prof = AGENT_PROFILES.get(agent_id) or {"profiles": [], "default_profile": ""}
+    observed = await asyncio.to_thread(observations.evaluate_one, item, None, VERSION)
     return {
         "agent_id": agent_id,
+        "observations": observed.get("observations") or {},
+        "effective_state": observed.get("effective_state", "unknown"),
+        "effective_reason": observed.get("effective_reason"),
+        "observations_checked_at": observed.get("checked_at"),
         "model_selection": bool(item.get("model_selection")),
         "model_selection_reason": item.get("model_selection_reason"),
         "input_modalities": item.get("input_modalities", ["text"]),
@@ -364,7 +393,7 @@ def agent(agent_id: str) -> dict:
     item = find_agent(agent_id)
     if item is None:
         raise HTTPException(status_code=404, detail=f"agent '{agent_id}' not found")
-    return item
+    return with_observations(item)
 
 
 @app.post("/agents/{agent_id}/run", dependencies=[Depends(require_token)])

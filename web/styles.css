@@ -36,3 +36,20 @@
 .context-link:hover{background:#1d2b33}
 @media(max-width:900px){.workspace-sidebar,.workspace-team{position:static;height:auto;max-height:none}.chat-context{margin:14px 12px 20px;padding:14px}}
 @media(max-width:600px){.chat-context{margin:12px 8px 18px}.context-filter{max-width:100%}}
+
+/* UX-02: чаты — постоянные заголовок/кнопка/поиск, прокручивается только список */
+.workspace-sidebar{overflow:hidden}
+.sidebar-projects{flex:0 1 auto;min-height:0;max-height:34%;display:flex;flex-direction:column;gap:6px}
+.sidebar-projects .projects-list{min-height:0;overflow-y:auto}
+.sidebar-chats{flex:1 1 auto;min-height:0;display:flex;flex-direction:column;gap:6px}
+.conv-search{display:block;margin:0}
+.conv-search input{width:100%;font-size:11px;padding:6px 8px;box-sizing:border-box}
+.conv-summary{font-size:10px;color:var(--faint);margin:0;min-height:12px}
+.convs-list{flex:1 1 auto;min-height:0;max-height:none;overflow-y:auto;overscroll-behavior:contain;display:flex;flex-direction:column;flex-wrap:nowrap;gap:2px;padding-right:2px;scrollbar-gutter:stable}
+.convs-list .conv{width:100%;max-width:none;flex:0 0 auto;min-height:34px}
+.conv-text{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.conv-more{flex:0 0 auto;margin-top:2px}
+.sidebar-bottom{flex:0 0 auto}
+@media(max-width:900px){.workspace-sidebar{overflow:visible}.sidebar-projects{max-height:none}.convs-list{max-height:240px}}
+@media(max-width:600px){.convs-list{max-height:200px;flex-wrap:nowrap}}
+@media(max-width:600px){.workspace-shell{align-items:stretch}.workspace-sidebar,.workspace-main,.workspace-team{width:100%;max-width:100%}}

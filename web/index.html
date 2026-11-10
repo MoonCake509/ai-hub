@@ -1,6 +1,6 @@
 <!doctype html>
 <html lang="ru">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#10141c"><title>AI Hub — проекты, команда и качество</title><link rel="stylesheet" href="styles.css?v=25"><link rel="stylesheet" href="quality.css?v=2"></head>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#10141c"><title>AI Hub — проекты, команда и качество</title><link rel="stylesheet" href="styles.css?v=26"><link rel="stylesheet" href="quality.css?v=2"></head>
 <body>
 <header class="top">
   <a class="brand" href="/ui/" aria-label="AI Hub — рабочее пространство"><span class="brand-mark">AI</span><span>Hub<span class="ver" id="version"></span><span class="ver" id="build"></span></span></a>
@@ -9,8 +9,8 @@
 </header>
 <main id="view-workspace" class="workspace-shell">
   <aside class="workspace-sidebar" aria-label="Проекты, чаты и файлы">
-    <section><div class="section-heading"><h2>Проекты</h2><button type="button" id="project-new" class="icon-button" aria-label="Создать проект">+</button></div><div id="projects-list" class="projects-list"><p class="muted">Загрузка проектов…</p></div></section>
-    <section class="sidebar-chats"><div class="section-heading"><h2>Чаты</h2><button type="button" id="conv-new" class="ghost small">+ Новый чат</button></div><div id="convs-list" class="convs-list"></div></section>
+    <section class="sidebar-projects"><div class="section-heading"><h2>Проекты</h2><button type="button" id="project-new" class="icon-button" aria-label="Создать проект">+</button></div><div id="projects-list" class="projects-list"><p class="muted">Загрузка проектов…</p></div></section>
+    <section class="sidebar-chats" aria-label="Чаты проекта"><div class="section-heading"><h2>Чаты</h2><button type="button" id="conv-new" class="ghost small">+ Новый чат</button></div><label class="conv-search"><span class="sr-only">Поиск по чатам</span><input id="conv-filter" type="search" placeholder="Поиск по чатам" autocomplete="off"></label><p class="conv-summary" id="conv-summary" role="status"></p><div id="convs-list" class="convs-list"></div><button type="button" class="ghost small conv-more" id="conv-more" hidden>Показать ещё</button></section>
     <div class="sidebar-bottom"><span class="dot ok"></span><span>Контекст хранится в проекте</span></div>
   </aside>
   <section class="workspace-main" aria-label="Чат проекта">
@@ -155,5 +155,5 @@
 <dialog id="project-dialog" class="settings-dialog"><form id="project-settings-form"><div class="dialog-heading"><h2 id="project-dialog-title">Настройки проекта</h2><button type="button" id="project-dialog-close" class="icon-button" aria-label="Закрыть настройки">×</button></div><label>Название<input id="project-name" required maxlength="120" placeholder="Название проекта"></label><label>Устройство<select id="project-host"><option value="laptop">Ноутбук</option><option value="server">Сервер</option></select></label><label>Рабочая папка на этом устройстве<input id="project-workdir" placeholder="C:\Projects\my-project" autocomplete="off"></label><p class="hint">Агент работает в этой папке. Серверный путь не подставляется на ноутбуке.</p><p id="project-dialog-error" class="err" role="alert"></p><button type="submit" class="primary">Сохранить проект</button></form></dialog>
 <div id="toast" class="toast" role="status" hidden></div>
 <div class="gate" id="gate" hidden><form class="gate-box" id="token-form"><div class="brand-mark">AI</div><h2>Подключиться к AI Hub</h2><p>Введите токен доступа к вашему хабу.</p><label class="sr-only" for="token-input">Токен доступа</label><input id="token-input" type="password" placeholder="HUB_TOKEN" autocomplete="off"><div class="row"><button class="primary" id="token-save" type="button">Подключиться</button><button class="ghost" id="token-cancel" type="button">Отмена</button><button class="ghost" id="token-diag" type="button">Диагностика</button></div><pre id="diag" class="diag" hidden></pre><p class="msg" id="token-status"></p><p class="err" id="token-err" role="alert"></p></form></div>
-<script src="app.js?v=25"></script><script src="quality.js?v=2"></script>
+<script src="app.js?v=26"></script><script src="quality.js?v=2"></script>
 </body></html>

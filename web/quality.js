@@ -2,7 +2,7 @@
 (() => {
   'use strict';
   const q = id => document.getElementById(id);
-  const state = { suite: null, channels: [], runs: [], selectedRunId: null, loading: false, polling: false };
+  const state = { suite: null, channels: [], runs: [], selectedRunId: null, loading: false, polling: false, starting: false, detailRequest: 0 };
   const token = () => { try { return localStorage.getItem('aihub_token') || ''; } catch { return ''; } };
   const node = (tag, cls = '', text = undefined) => {
     const item = document.createElement(tag);
@@ -15,7 +15,7 @@
   const number = value => value === null || value === undefined ? 'недоступно' : String(value);
   const tokens = (usage, key) => usage && usage[key] !== null && usage[key] !== undefined ? String(usage[key]) : 'недоступно';
   const when = value => value ? new Date(value).toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) : '—';
-  const statusLabel = status => ({ queued: 'в очереди', running: 'в работе', succeeded: 'успешно', completed: 'завершён', failed: 'ошибка', timeout: 'таймаут', cancelled: 'отменён', unknown: 'неизвестно' }[status] || status || '—');
+  const statusLabel = status => ({ queued: 'в очереди', running: 'в работе', succeeded: 'успешно', completed: 'завершён', failed: 'ошибка', timeout: 'таймаут', cancelled: 'отменён', unknown: 'неизвестно', budget_exhausted: 'пропущено: бюджет', not_applicable: 'не входит в этот маршрут', pending: 'ожидает запуска' }[status] || status || '—');
 
   async function api(path, options = {}) {
     const headers = { ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...(options.headers || {}) };
@@ -53,7 +53,8 @@
 
   function updateStartEnabled() {
     const selected = chosenChannel();
-    q('q-start').disabled = state.loading || !selected || !selected.enabled || requiresImage(selected);
+    q('q-start').disabled = state.loading || state.starting || !selected || !selected.enabled || requiresImage(selected);
+    q('q-quick').disabled = state.loading || state.starting || !selected || !selected.enabled;
   }
 
   function categoryLabel(value) {
@@ -76,7 +77,7 @@
     const profile = q('q-provider').value === '__default__' ? null : q('q-provider').value || null;
     const rawModel = q('q-model').value;
     const model = rawModel === '__default__' ? null : rawModel || null;
-    const selected = textChannels().find(channel => channel.agent_id === agentId
+    const selected = state.channels.find(channel => channel.agent_id === agentId
       && (channel.profile || null) === profile && (channel.model || null) === model) || null;
     q('q-channel').value = selected ? selected.channel_id : '';
     const note = q('q-selection-status');
@@ -87,12 +88,13 @@
       note.textContent = 'Выберите модель для этого провайдера.';
     } else if (!selected) note.textContent = 'Для этой комбинации нет доступного маршрута.';
     else if (!selected.enabled) note.textContent = `Этот маршрут отключён для новых задач. Причина: ${selected.reason || 'не указана оператором'}`;
+    else if (requiresImage(selected)) note.textContent = `Выбран маршрут для изображения: ${selected.agent_name} · ${selected.profile_name} · ${selected.model_name || selected.model || 'по настройкам агента'}. Доступна одна быстрая OCR-проба; расширенный текстовый набор отключён.`;
     else note.textContent = `Выбран маршрут: ${selected.agent_name} · ${selected.profile_name} · ${selected.model_name || selected.model || 'по настройкам агента'}.`;
     updateStartEnabled();
   }
 
   function renderRouteSelects() {
-    const channels = textChannels();
+    const channels = state.channels;
     const oldAgent = q('q-agent').value;
     const oldProvider = q('q-provider').value;
     const oldModel = q('q-model').value;
@@ -199,7 +201,8 @@
       const count = Number(run.case_count) || 0;
       const fraction = `${number(run.passed_count)} из ${count} ${count === 4 ? 'базовых' : 'выбранных'} проверок`;
       const scoreLabel = run.score === null || run.score === undefined ? 'доля проверок: недоступна' : `доля проверок: ${run.score}%`;
-      const meta = node('div', 'quality-run-meta', `${fraction} · ${scoreLabel} · ${when(run.created_at)}`);
+      const modeLabel = run.mode === 'quick' ? `Быстрая · бюджет ${number(run.budget_s)} с · максимум ${number(run.max_calls)} проб` : 'Расширенная';
+      const meta = node('div', 'quality-run-meta', `${modeLabel} · ${fraction} · ${scoreLabel} · ${when(run.created_at)}`);
       const timing = node('div', 'quality-run-meta', `Среднее ожидание: ${sec(run.queue_wait_seconds)} · Суммарное выполнение: ${sec(run.execution_seconds)} · Время прогона: ${sec(run.wall_seconds)}`);
       button.append(title, meta, timing);
       button.onclick = () => loadRunDetail(run.id).catch(e => showError(errText(e)));
@@ -208,12 +211,23 @@
     }
   }
 
+  function quickVerdictText(run) {
+    const verdict = run.verdict || {};
+    const label = verdict.label || ({ running: 'проверка идёт', insufficient: 'данных недостаточно', deviations: 'есть отклонения', ok: 'без замечаний' }[verdict.state] || 'вердикт не предоставлен');
+    return `Быстрая проверка · общий бюджет ${number(run.budget_s)} с · максимум ${number(run.max_calls)} проб. Вердикт: ${label}. Завершено проверок: ${number(verdict.graded_count)}; пропущено: ${number(verdict.skipped_count)}. Статус задания: ${statusLabel(run.status)}. Пропущенные или ожидающие пробы не считаются успешными.`;
+  }
+
   function renderRunDetail(run) {
     const box = q('q-run-detail');
     box.replaceChildren();
     box.hidden = !run;
     if (!run) return;
     box.append(node('h3', '', `${routeName(routeFor(run), run)} · ${statusLabel(run.status)}`));
+    if (run.mode === 'quick') {
+      const verdict = run.verdict || {};
+      box.append(node('p', 'quality-quick-verdict', quickVerdictText(run)));
+      if (Array.isArray(verdict.reasons)) for (const reason of verdict.reasons) box.append(node('p', 'quality-quick-reason', reason));
+    }
     const count = Number(run.case_count) || (run.items || []).length;
     const passed = Number(run.passed_count) || 0;
     box.append(node('p', 'quality-muted', `${passed} из ${count} ${count === 4 ? 'базовых' : 'выбранных'} проверок пройдены. Процент относится только к этому запуску и не является общей оценкой модели.`));
@@ -227,7 +241,7 @@
     for (const item of run.items || []) {
       const card = node('article', 'quality-item');
       const head = node('div', 'quality-item-head');
-      head.append(node('strong', '', `${item.ordinal + 1}. ${item.case && item.case.title || 'Базовая проверка'}`), node('span', 'badge ' + (item.passed ? 'succeeded' : item.passed === false ? 'failed' : item.job_status || 'queued'), item.passed === true ? 'проверка пройдена' : item.passed === false ? 'проверка не пройдена' : statusLabel(item.job_status || item.status)));
+      head.append(node('strong', '', `${item.ordinal + 1}. ${item.case && item.case.title || 'Базовая проверка'}`), node('span', 'badge ' + (item.passed ? 'succeeded' : item.passed === false ? 'failed' : item.status || item.job_status || 'pending'), item.passed === true ? 'проверка пройдена' : item.passed === false ? 'проверка не пройдена' : statusLabel(item.status || item.job_status || 'pending')));
       card.append(head);
       card.append(node('p', 'quality-item-reason', item.grader_reason || item.error || 'Ожидает завершения задания.'));
       const caseMetrics = node('div', 'quality-metrics');
@@ -280,7 +294,9 @@
   }
   async function loadRunDetail(id) {
     state.selectedRunId = id;
+    const request = ++state.detailRequest;
     const run = await api('/quality/runs/' + encodeURIComponent(id));
+    if (request !== state.detailRequest || state.selectedRunId !== id) return;
     renderRunList();
     renderRunDetail(run);
   }
@@ -317,40 +333,41 @@
   q('q-channel-filter').oninput = renderChannels;
   q('q-start-form').onsubmit = async event => {
     event.preventDefault();
+    if (state.starting) return;
+    const mode = event.submitter && event.submitter.dataset.mode === 'quick' ? 'quick' : 'extended';
     const channel = chosenChannel();
+    if (!channel || !channel.enabled) { showError('Выберите включённый канал.'); return; }
     const caseCount = Number(q('q-case-count').value);
     const timeout = Number(q('q-timeout').value);
-    if (!channel || !channel.enabled) { showError('Выберите включённый канал.'); return; }
-    if (requiresImage(channel)) { showError('Маршруты с обязательным изображением не поддерживаются текущим текстовым набором проверок.'); return; }
-    if (!Number.isInteger(caseCount) || caseCount < 1 || caseCount > 4) { showError('Количество задач должно быть от 1 до 4.'); return; }
-    if (!Number.isInteger(timeout) || timeout < 10 || timeout > 180) { showError('Лимит времени на одну задачу — от 10 до 180 секунд.'); return; }
-    const button = q('q-start');
-    button.disabled = true;
+    const budget = 45;
+    if (mode === 'extended' && requiresImage(channel)) { showError('Для маршрута с изображением выберите быструю OCR-пробу.'); return; }
+    if (mode === 'extended' && (!Number.isInteger(caseCount) || caseCount < 1 || caseCount > 4)) { showError('Количество задач должно быть от 1 до 4.'); return; }
+    if (mode === 'extended' && (!Number.isInteger(timeout) || timeout < 10 || timeout > 180)) { showError('Лимит времени на одну задачу — от 10 до 180 секунд.'); return; }
+    state.starting = true;
+    updateStartEnabled();
     q('q-start-status').className = 'msg';
-    q('q-start-status').textContent = 'Добавляю отдельные jobs в общую очередь…';
+    q('q-start-status').textContent = mode === 'quick'
+      ? `Запускаю до трёх коротких проб в общей очереди. Общий предел: ${budget} с; платные повторы не запускаются.`
+      : 'Добавляю отдельные jobs в общую очередь…';
     showError('');
     const idempotencyKey = window.crypto && crypto.randomUUID ? crypto.randomUUID() : `quality-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const payload = mode === 'quick'
+      ? { mode: 'quick', agent_id: channel.agent_id, profile: channel.profile, model: channel.model, budget_s: budget, idempotency_key: idempotencyKey }
+      : { mode: 'extended', suite_id: state.suite && state.suite.id, suite_version: state.suite && state.suite.version, agent_id: channel.agent_id, profile: channel.profile, model: channel.model, case_count: caseCount, timeout_s: timeout, idempotency_key: idempotencyKey };
     try {
-      const run = await api('/quality/runs', { method: 'POST', body: JSON.stringify({
-        suite_id: state.suite && state.suite.id,
-        suite_version: state.suite && state.suite.version,
-        agent_id: channel.agent_id,
-        profile: channel.profile,
-        model: channel.model,
-        case_count: caseCount,
-        timeout_s: timeout,
-        idempotency_key: idempotencyKey,
-      }) });
+      const run = await api('/quality/runs', { method: 'POST', body: JSON.stringify(payload) });
       state.selectedRunId = run.id;
       q('q-start-status').className = 'msg ok';
-      q('q-start-status').textContent = 'Проверка сохранена. Исполнение идёт через обычную очередь.';
+      q('q-start-status').textContent = mode === 'quick'
+        ? 'Быстрый прогон сохранён. Проверяется только то, что успело завершиться в пределах общего бюджета.'
+        : 'Проверка сохранена. Исполнение идёт через обычную очередь.';
       await loadRuns();
       await loadRunDetail(run.id);
     } catch (e) {
       q('q-start-status').className = 'msg error';
       q('q-start-status').textContent = errText(e);
       showError(errText(e));
-    } finally { updateStartEnabled(); }
+    } finally { state.starting = false; updateStartEnabled(); }
   };
 
   document.querySelectorAll('.tab').forEach(tab => tab.addEventListener('click', () => {

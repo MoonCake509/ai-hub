@@ -230,6 +230,47 @@ DDL = [
         materialized_at timestamptz
     )""",
     "create index if not exists context_packets_project on aihub.context_packets(project_id, created_at desc)",
+    # FLOW-01: durable запуски, задачи и журнал.
+    """create table if not exists aihub.runs (
+        id text primary key,
+        project_id text not null,
+        template_id text not null default 'default',
+        template_version int not null default 1,
+        policy jsonb not null default '{}',
+        state text not null default 'active',
+        created_at timestamptz not null default now(),
+        updated_at timestamptz not null default now(),
+        finished_at timestamptz
+    )""",
+    "create index if not exists runs_state on aihub.runs(state, updated_at)",
+    """create table if not exists aihub.run_tasks (
+        id text primary key,
+        run_id text not null references aihub.runs(id) on delete cascade,
+        key text not null,
+        role text,
+        agent text,
+        prompt text,
+        depends_on jsonb not null default '[]',
+        position int not null default 0,
+        state text not null default 'pending',
+        attempt int not null default 0,
+        job_id text,
+        error text,
+        created_at timestamptz not null default now(),
+        updated_at timestamptz not null default now(),
+        finished_at timestamptz
+    )""",
+    "create unique index if not exists run_tasks_key on aihub.run_tasks(run_id, key)",
+    "create index if not exists run_tasks_job on aihub.run_tasks(job_id)",
+    """create table if not exists aihub.run_events (
+        id bigserial primary key,
+        run_id text not null references aihub.runs(id) on delete cascade,
+        task_id text,
+        event text not null,
+        payload jsonb not null default '{}',
+        created_at timestamptz not null default now()
+    )""",
+    "create index if not exists run_events_run on aihub.run_events(run_id, id)",
     """create table if not exists aihub.context_packet_items (
         packet_id text not null references aihub.context_packets(id) on delete cascade,
         path text not null,

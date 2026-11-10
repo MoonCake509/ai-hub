@@ -28,6 +28,7 @@ from . import chat_context, db, observations, probes, quality, quality_db, quali
 from . import reconciliation
 from . import capabilities
 from . import packets
+from . import runs as runs_ctrl
 from . import protocol as bridge_protocol
 from . import resources
 from . import workspace
@@ -68,6 +69,7 @@ async def _sweeper() -> None:
             # Quick-run deadlines are enforced even with no browser open.
             await asyncio.to_thread(quality.refresh_active_runs)
             await asyncio.to_thread(packets.poll_active)
+            await asyncio.to_thread(runs_ctrl.poll_active, _resolve_run_agent)
         except Exception as exc:  # noqa: BLE001
             print(f"lease sweeper error: {exc}", flush=True)
 
@@ -1470,6 +1472,61 @@ async def context_packet_materialize(packet_id: str) -> dict:
         raise HTTPException(status_code=status, detail=exc.as_dict()) from None
     except workspace.OpError as exc:
         raise HTTPException(status_code=400, detail=exc.as_dict()) from None
+
+
+def _resolve_run_agent(agent_id: str) -> tuple[str | None, str | None]:
+    """Для задачи запуска: id агента -> bridge_agent, либо причина отказа."""
+    item = find_agent(agent_id)
+    if not item:
+        return None, f"агент '{agent_id}' не найден в реестре"
+    bridge = item.get("bridge_agent")
+    if not bridge:
+        return None, f"у агента '{agent_id}' нет адаптера"
+    return bridge, None
+
+
+@app.post("/runs", dependencies=[Depends(require_token)])
+async def run_create(request: Request) -> JSONResponse:
+    payload = await request.json()
+    project_id = payload.get("project_id")
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id is required")
+    project = await asyncio.to_thread(db.get_project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="project not found")
+    try:
+        result = await asyncio.to_thread(runs_ctrl.create_run, project_id,
+                                         payload.get("template") or {}, payload.get("policy") or {})
+    except runs_ctrl.RunError as exc:
+        raise HTTPException(status_code=400, detail=exc.as_dict()) from None
+    return JSONResponse(status_code=202, content=result)
+
+
+@app.get("/runs/{run_id}", dependencies=[Depends(require_token)])
+async def run_get(run_id: str) -> dict:
+    item = await asyncio.to_thread(runs_ctrl.get_run, run_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="run not found")
+    return item
+
+
+@app.post("/runs/{run_id}/dispatch", dependencies=[Depends(require_token)])
+async def run_dispatch(run_id: str) -> dict:
+    try:
+        return await asyncio.to_thread(runs_ctrl.dispatch, run_id, _resolve_run_agent)
+    except runs_ctrl.RunError as exc:
+        raise HTTPException(status_code=404, detail=exc.as_dict()) from None
+
+
+@app.post("/runs/{run_id}/{action}", dependencies=[Depends(require_token)])
+async def run_action(run_id: str, action: str) -> dict:
+    if action not in ("pause", "resume", "cancel"):
+        raise HTTPException(status_code=400, detail="action must be pause, resume or cancel")
+    try:
+        return await asyncio.to_thread(runs_ctrl.set_state, run_id, action)
+    except runs_ctrl.RunError as exc:
+        code = 404 if exc.code == "not_found" else 409
+        raise HTTPException(status_code=code, detail=exc.as_dict()) from None
 
 
 @app.post("/projects/{project_id}/context/requests", dependencies=[Depends(require_token)])

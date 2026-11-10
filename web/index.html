@@ -1,6 +1,6 @@
 <!doctype html>
 <html lang="ru">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#10141c"><title>AI Hub — проекты, команда и качество</title><link rel="stylesheet" href="styles.css?v=26"><link rel="stylesheet" href="quality.css?v=2"></head>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#10141c"><title>AI Hub — проекты, команда и качество</title><link rel="stylesheet" href="styles.css?v=27"><link rel="stylesheet" href="quality.css?v=2"></head>
 <body>
 <header class="top">
   <a class="brand" href="/ui/" aria-label="AI Hub — рабочее пространство"><span class="brand-mark">AI</span><span>Hub<span class="ver" id="version"></span><span class="ver" id="build"></span></span></a>
@@ -155,5 +155,5 @@
 <dialog id="project-dialog" class="settings-dialog"><form id="project-settings-form"><div class="dialog-heading"><h2 id="project-dialog-title">Настройки проекта</h2><button type="button" id="project-dialog-close" class="icon-button" aria-label="Закрыть настройки">×</button></div><label>Название<input id="project-name" required maxlength="120" placeholder="Название проекта"></label><label>Устройство<select id="project-host"><option value="laptop">Ноутбук</option><option value="server">Сервер</option></select></label><label>Рабочая папка на этом устройстве<input id="project-workdir" placeholder="C:\Projects\my-project" autocomplete="off"></label><p class="hint">Агент работает в этой папке. Серверный путь не подставляется на ноутбуке.</p><p id="project-dialog-error" class="err" role="alert"></p><button type="submit" class="primary">Сохранить проект</button></form></dialog>
 <div id="toast" class="toast" role="status" hidden></div>
 <div class="gate" id="gate" hidden><form class="gate-box" id="token-form"><div class="brand-mark">AI</div><h2>Подключиться к AI Hub</h2><p>Введите токен доступа к вашему хабу.</p><label class="sr-only" for="token-input">Токен доступа</label><input id="token-input" type="password" placeholder="HUB_TOKEN" autocomplete="off"><div class="row"><button class="primary" id="token-save" type="button">Подключиться</button><button class="ghost" id="token-cancel" type="button">Отмена</button><button class="ghost" id="token-diag" type="button">Диагностика</button></div><pre id="diag" class="diag" hidden></pre><p class="msg" id="token-status"></p><p class="err" id="token-err" role="alert"></p></form></div>
-<script src="app.js?v=26"></script><script src="quality.js?v=2"></script>
+<script src="app.js?v=27"></script><script src="quality.js?v=2"></script>
 </body></html>

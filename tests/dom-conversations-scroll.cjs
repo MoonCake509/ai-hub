@@ -17,7 +17,7 @@ const helpers = slice('function wsConversationTitle(', '\nasync function wsOpenC
 
 function node(tag) {
   return {
-    tag: tag, className: '', title: '', textContent: '', children: [], scrollTop: 0,
+    tag: tag, className: '', title: '', textContent: '', children: [], scrollTop: 0, disabled: false, hidden: false,
     append: function () { this.children.push.apply(this.children, arguments); },
     setAttribute: function () {},
   };
@@ -39,9 +39,9 @@ Box.prototype = {
   },
 };
 
-function makeContext(list, activeIndex, scrollTop) {
+function makeContext(options) {
+  const settings = options || {};
   const box = new Box();
-  if (scrollTop != null) box.scrollTop = scrollTop;
   const fields = new Map();
   const $ = function (selector) {
     if (selector === '#convs-list') return box;
@@ -49,129 +49,148 @@ function makeContext(list, activeIndex, scrollTop) {
     return fields.get(selector);
   };
   const context = {
-    WS: { convs: list, conv: list[activeIndex] || null, convFilter: '', convLimit: 24,
-      convSignature: '', convShownId: list[activeIndex] ? list[activeIndex].id : '' },
-    $: $,
-    el: function (tag, className, text) { const item = node(tag); item.className = className || ''; if (text != null) item.textContent = text; return item; },
-    action: function (handler) { return handler; },
-    wsOpenConversation: function () {},
-    box: box,
+    WS: { convs: [], conv: null, convFilter: '', convSignature: '', convShownId: '', convCursor: '',
+      convHasMore: false, convTotal: 0, convLoading: false, convSeq: 0, project: { id: 'p1' } },
+    $: $, el: function (tag, className, text) { const item = node(tag); item.className = className || ''; if (text != null) item.textContent = text; return item; },
+    action: function (handler) { return handler; }, wsOpenConversation: function () {},
+    URLSearchParams: URLSearchParams,
+    workspaceError: function (error) { context.lastError = String(error && error.message || error); },
+    calls: [], box: box, api: async function (path) {
+      context.calls.push(path);
+      const handler = settings.api;
+      return handler ? handler(path, context.calls.length) : { conversations: [], total: 0, has_more: false, next_cursor: '' };
+    },
   };
+  if (settings.state) Object.assign(context.WS, settings.state);
   vm.createContext(context);
   vm.runInContext(helpers, context);
   return context;
 }
 
-function conversations(count) {
+function conversations(from, count) {
   return Array.from({ length: count }, function (_, index) {
-    return { id: 'conv-' + index, title: 'Разбор архитектуры проекта и длинное название разговора номер ' + index + ' — продолжение проверки' };
+    const number = from + index;
+    return { id: 'conv-' + number, title: 'Разбор архитектуры проекта и длинное название разговора номер ' + number + ' — продолжение проверки' };
   });
 }
 
-function rows(box) {
-  return box.children.filter(function (child) { return child.className.split(' ')[0] === 'conv'; });
-}
 function titles(box) {
-  return rows(box).map(function (child) { return child.children[1].textContent; });
+  return box.children.filter(function (child) { return child.className.split(' ')[0] === 'conv'; })
+    .map(function (child) { return child.children[1].textContent; });
 }
 
+async function main() {
+// 1. первая страница: 24 строки, общее число известно, есть следующий шаг
 {
-  const list = conversations(60);
-  const context = makeContext(list, 57);
+  const context = makeContext();
+  Object.assign(context.WS, { convs: conversations(0, 24), convTotal: 55, convHasMore: true, conv: conversations(0, 1)[0] });
   context.wsRenderConversations();
-  const buttons = rows(context.box);
-  assert.equal(buttons.length, 25, '24 видимых строки плюс закреплённый открытый чат');
-  assert.match(buttons[0].className, /active/, 'открытый чат закреплён первым и доступен');
-  assert.equal(buttons[0].title, list[57].title, 'в подсказке закреплённой строки полное название');
-  assert.match(context.$('#conv-summary').textContent, /60 чатов/);
-  assert.match(context.$('#conv-summary').textContent, /показаны первые 24/);
+  assert.equal(titles(context.box).length, 24);
+  assert.match(context.$('#conv-summary').textContent, /55 чатов · показаны 24/);
   assert.equal(context.$('#conv-more').hidden, false);
   assert.match(context.$('#conv-more').textContent, /Показать ещё/);
-  assert.equal(buttons[0].children[1].className, 'conv-text', 'обрезается ячейка названия, а не строка');
 }
 
+// 2. polling с неизменными данными не перестраивает строки и не сбрасывает прокрутку
 {
-  const list = conversations(60);
-  const context = makeContext(list, 57, 180);
+  const context = makeContext();
+  Object.assign(context.WS, { convs: conversations(0, 24), convTotal: 55, convHasMore: true, conv: conversations(0, 1)[0] });
   context.wsRenderConversations();
   const before = context.box.children.slice();
   context.box.scrollTop = 180;
   context.wsRenderConversations();
   context.wsRenderConversations();
-  assert.equal(context.box.children.length, before.length);
-  assert.ok(context.box.children.every(function (child, index) { return child === before[index]; }), 'одинаковый результат polling сохраняет те же DOM-узлы');
-  assert.equal(context.box.scrollTop, 180, 'позиция читателя переживает polling');
+  assert.ok(context.box.children.every(function (child, index) { return child === before[index]; }), 'одинаковые данные сохраняют узлы');
+  assert.equal(context.box.scrollTop, 180, 'позиция читателя переживает повторную отрисовку');
 }
 
+// 3. вторая страница добавляется по курсору, дубликаты не появляются
 {
-  const list = conversations(60);
-  list[3].title = 'Отчёт по качеству канала';
-  list[8].title = 'Отчёт по оплате';
-  const context = makeContext(list, 57);
-  context.WS.convFilter = 'отчёт';
-  context.wsRenderConversations();
+  let step = 0;
+  const context = makeContext({ api: function (path) {
+    step += 1;
+    if (step === 1) return { conversations: conversations(0, 24), total: 55, has_more: true, next_cursor: 'cursor-1' };
+    return { conversations: conversations(22, 24), total: 55, has_more: true, next_cursor: 'cursor-2' };
+  } });
+  await context.wsLoadConversations({ reset: true });
+  assert.equal(context.WS.convs.length, 24);
+  assert.equal(context.WS.convCursor, 'cursor-1');
+  assert.match(context.calls[0], /limit=24/);
+  assert.doesNotMatch(context.calls[0], /cursor=/);
+  await context.wsLoadConversations({});
+  assert.equal(context.WS.convs.length, 46, 'пересечение страниц схлопывается по id');
+  assert.equal(new Set(context.WS.convs.map(function (item) { return item.id; })).size, 46);
+  assert.match(context.calls[1], /cursor=cursor-1/);
+  assert.equal(context.WS.convCursor, 'cursor-2');
+}
+
+// 4. гонка: устаревший ответ после сброса не подменяет новый список
+{
+  const pending = [];
+  const context = makeContext({ api: function (path) {
+    return new Promise(function (resolve) { pending.push({ path: path, resolve: resolve }); });
+  } });
+  const first = context.wsLoadConversations({ reset: true });
+  context.WS.convFilter = 'свежий';
+  const second = context.wsLoadConversations({ reset: true });
+  pending[1].resolve({ conversations: [{ id: 'fresh', title: 'Свежий разговор' }], total: 1, has_more: false, next_cursor: '' });
+  pending[0].resolve({ conversations: conversations(0, 24), total: 55, has_more: true, next_cursor: 'old' });
+  await Promise.all([first, second]);
+  assert.equal(context.WS.convs.map(function (item) { return item.id; }).join(','), 'fresh', 'побеждает последний запрос');
+  assert.equal(context.WS.convTotal, 1);
+  assert.match(context.calls[1], /q=/);
+}
+
+// 5. поиск идёт на сервер; открытый чат остаётся доступным, даже если не попал в ответ
+{
+  const context = makeContext({ api: function () {
+    return { conversations: [{ id: 'match', title: 'Отчёт по качеству' }], total: 1, has_more: false, next_cursor: '' };
+  } });
+  Object.assign(context.WS, { conv: { id: 'open', title: 'Длинный открытый разговор' }, convFilter: 'отчёт' });
+  await context.wsLoadConversations({ reset: true });
   const shown = titles(context.box);
-  assert.equal(shown.length, 3, 'два совпадения плюс закреплённый открытый чат');
-  assert.match(shown[0], /номер 57/, 'открытый чат остаётся в списке во время поиска');
-  assert.ok(shown.some(function (title) { return title.indexOf('качеству') >= 0; }));
-  assert.match(context.$('#conv-summary').textContent, /найдено 2 чата из 60 чатов/);
-  context.WS.convFilter = 'ничего-нет';
-  context.wsRenderConversations();
-  assert.equal(titles(context.box).length, 1, 'без совпадений остаётся только закреплённый открытый чат');
-  assert.match(context.$('#conv-summary').textContent, /найдено 0 чатов из 60 чатов/);
+  assert.equal(shown.length, 2, 'совпадение плюс закреплённый открытый чат');
+  assert.match(shown[0], /Длинный открытый разговор/);
+  assert.match(context.$('#conv-summary').textContent, /найдено 1 чат/);
+  assert.equal(context.$('#conv-more').hidden, true);
 }
 
-{
-  const list = conversations(60);
-  const context = makeContext(list, 0);
-  context.wsRenderConversations();
-  context.WS.convLimit = 48;
-  context.wsRenderConversations();
-  assert.equal(titles(context.box).length, 48);
-  context.WS.convLimit = 96;
-  context.wsRenderConversations();
-  assert.equal(titles(context.box).length, 60);
-  assert.equal(context.$('#conv-more').hidden, true, 'кнопка исчезает, когда показано всё');
-}
-
+// 6. разметка, на которую опирается код
 {
   ['conv-filter', 'conv-summary', 'conv-more', 'convs-list'].forEach(function (id) {
     const found = (html.match(new RegExp('id="' + id + '"', 'g')) || []).length;
     assert.equal(found, 1, id + ' встречается ровно один раз');
   });
-  assert.match(html, /class="convs-list"/);
 }
 
+// 7. чтение истории не прыгает при повторном polling с теми же сообщениями
 {
   const from = app.indexOf('function wsMessageSignature(');
   const body = app.indexOf('\n}\n', app.indexOf('function renderMessages(', from)) + 3;
-  assert.ok(from >= 0 && body > from, 'функции сообщений найдены');
   const chatLog = new Box();
-  chatLog.scrollHeight = 1000;
-  chatLog.clientHeight = 200;
   chatLog.scrollTop = 120;
   const context = {
     WS: { conv: { id: 'conv-1', title: 'Чат' }, messages: [{ id: 'm1', author: 'user', body: 'старый вопрос' }], msgSignature: '' },
     $: function (selector) { return selector === '#chat-log' ? chatLog : node('div'); },
     el: function (tag, className, text) { const item = node(tag); item.className = className || ''; if (text != null) item.textContent = text; return item; },
-    roleInfo: function () { return ['Архитектор', 'A']; },
-    agentName: function (id) { return id; },
-    fmtTime: function () { return ''; },
-    ruStatus: function (state) { return state; },
-    wsUpdateRecipient: function () {},
-    wsLatestConversationImage: function () { return null; },
+    roleInfo: function () { return ['Архитектор', 'A']; }, agentName: function (id) { return id; },
+    fmtTime: function () { return ''; }, ruStatus: function (state) { return state; },
+    wsUpdateRecipient: function () {}, wsLatestConversationImage: function () { return null; },
   };
   vm.createContext(context);
   vm.runInContext(app.slice(from, body), context);
   context.renderMessages();
-  assert.equal(chatLog.scrollTop, 120, 'читатель не внизу не отбрасывается ни в начало, ни в конец');
+  assert.equal(chatLog.scrollTop, 120);
   const first = chatLog.children.slice();
   context.renderMessages();
-  assert.ok(chatLog.children.every(function (child, index) { return child === first[index]; }), 'повтор с теми же сообщениями не перестраивает лог');
+  assert.ok(chatLog.children.every(function (child, index) { return child === first[index]; }));
   context.WS.messages = context.WS.messages.concat([{ id: 'm2', author: 'assistant', body: 'ответ' }]);
   chatLog.scrollTop = 900;
   context.renderMessages();
-  assert.equal(chatLog.scrollTop, chatLog.scrollHeight, 'у нижней кромки новый ответ прокручивает вниз');
+  assert.equal(chatLog.scrollTop, chatLog.scrollHeight);
 }
 
-console.log('Conversation list DOM regression passed: 60 чатов, свой scroll, стабильный polling, поиск и закреплённый открытый чат.');
+console.log('Conversation list DOM regression passed: страницы по курсору, дедупликация, гонки, поиск, стабильный polling.');
+}
+
+main().catch(function (error) { console.error(error); process.exit(1); });

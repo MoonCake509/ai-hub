@@ -619,7 +619,7 @@ const ROLE_META = {
   reviewer: ['Ревьюер','R','Проверка результата и замечания'],
   archivist: ['Архивариус','D','Документация и сохранение решений'],
 };
-const WS={projects:[],project:null,convs:[],conv:null,roles:{},atts:[],messages:[],selectedAtts:new Set(),attFilter:'',roleId:'architect',profiles:new Map(),generation:0,editorGen:0,editorProfilesLoading:false,pollTimer:null,pending:null,dirty:false,sending:false,view:'workspace',newProject:false,previewUrls:new Map(),previewLoads:new Map(),previewGeneration:0,activeImageByConversation:new Map(),convFilter:'',convLimit:24,convSignature:'',convShownId:'',msgSignature:''};
+const WS={projects:[],project:null,convs:[],conv:null,roles:{},atts:[],messages:[],selectedAtts:new Set(),attFilter:'',roleId:'architect',profiles:new Map(),generation:0,editorGen:0,editorProfilesLoading:false,pollTimer:null,pending:null,dirty:false,sending:false,view:'workspace',newProject:false,previewUrls:new Map(),previewLoads:new Map(),previewGeneration:0,activeImageByConversation:new Map(),convFilter:'',convLimit:24,convSignature:'',convShownId:'',msgSignature:'',convCursor:'',convHasMore:false,convTotal:0,convLoading:false,convSeq:0,convFilterTimer:null};
 
 function toast(message,error=false){const box=$('#toast');box.textContent=message;box.classList.toggle('error',error);box.hidden=false;clearTimeout(toast.timer);toast.timer=setTimeout(()=>box.hidden=true,5500)}
 function workspaceError(error){const text=String(error?.message||error);if(text==='unauthorized')return;$('#workspace-error-text').textContent=text.includes('404')||text==='Not Found'?'Сервер ещё не обновлён: API проектов недоступен. Обновите backend вместе с интерфейсом.':text;$('#workspace-error').hidden=false}
@@ -640,10 +640,14 @@ async function wsRefreshAll(){
  if(!WS.project){wsClearPreviewUrls();WS.roles={};WS.convs=[];WS.conv=null;WS.messages=[];renderMessages();renderRoles();$('#project-title').textContent='Создайте первый проект';$('#project-location').textContent='Рабочая папка, чаты и назначения в одном месте';$('#conv-new').disabled=true;return}
  $('#conv-new').disabled=false;storeSet('aihub.project',WS.project.id);
  const projectId=WS.project.id;
- const [project,convs,attachments]=await Promise.all([api('/projects/'+projectId),api('/projects/'+projectId+'/conversations'),api('/projects/'+projectId+'/attachments')]);
+ const [project,attachments]=await Promise.all([api('/projects/'+projectId),api('/projects/'+projectId+'/attachments')]);
  if(gen!==WS.generation||WS.project?.id!==projectId)return;
- WS.project=project;WS.roles=Object.fromEntries((project.roles||[]).map(r=>[r.role_id,r]));WS.convs=convs.conversations||[];if(previous!==projectId){wsClearPreviewUrls();WS.selectedAtts.clear()}WS.atts=attachments.attachments||[];
- const savedConv=storeGet(conversationStorageKey());WS.conv=WS.convs.find(c=>c.id===savedConv)||WS.convs[0]||null;
+ WS.project=project;WS.roles=Object.fromEntries((project.roles||[]).map(r=>[r.role_id,r]));if(previous!==projectId){wsClearPreviewUrls();WS.selectedAtts.clear()}WS.atts=attachments.attachments||[];
+ await wsLoadConversations({reset:true,quiet:true});
+ const savedConv=storeGet(conversationStorageKey());
+ let openConv=WS.convs.find(c=>c.id===savedConv)||null;
+ if(!openConv&&savedConv){try{openConv=await api('/conversations/'+savedConv)}catch(error){openConv=null}}
+ WS.conv=openConv||WS.convs[0]||null;
  if(WS.conv?.role_id&&ROLE_META[WS.conv.role_id])WS.roleId=WS.conv.role_id;
  $('#project-title').textContent=project.name;$('#project-location').textContent=(project.host_id==='server'?'Сервер':'Ноутбук')+' · '+(project.workdir||'Рабочая папка не указана');
  wsRenderProjects();wsRenderConversations();wsRenderAttachments();renderRoles();await wsEditRole(WS.roleId);await wsLoadMessages();wsStartPolling();
@@ -652,26 +656,44 @@ async function wsRefreshAll(){
 function wsRenderProjects(){const box=$('#projects-list');box.replaceChildren();for(const project of WS.projects){const button=el('button','proj'+(project.id===WS.project?.id?' active':''));button.type='button';button.setAttribute('aria-pressed',String(project.id===WS.project?.id));button.append(el('span','project-icon',project.name.slice(0,1).toUpperCase()),el('span','project-text',project.name));button.onclick=action(async()=>{if(WS.project?.id===project.id)return;storeSet('aihub.project',project.id);WS.conv=null;WS.messages=[];WS.selectedAtts.clear();WS.pending=null;await wsRefreshAll()});box.append(button)}if(!WS.projects.length)box.append(el('p','sidebar-empty','Добавьте проект, чтобы начать.'))}
 function wsConversationTitle(conversation){return (conversation&&conversation.title)||'Новый чат'}
 function wsChatCount(n){const lastTwo=n%100,last=n%10;const word=lastTwo>=11&&lastTwo<=14?'чатов':last===1?'чат':last>=2&&last<=4?'чата':'чатов';return n+' '+word}
-function wsVisibleConversations(){
- const all=WS.convs||[],filter=(WS.convFilter||'').trim().toLowerCase(),limit=Math.max(1,WS.convLimit||24);
- const matched=filter?all.filter(conversation=>wsConversationTitle(conversation).toLowerCase().includes(filter)):all;
- const visible=matched.slice(0,limit);
- const pinned=WS.conv&&!visible.some(conversation=>conversation.id===WS.conv.id)?WS.conv:null;
- return {all,matched,visible,pinned}
+function wsConversationParams(reset){
+ const params=new URLSearchParams({limit:String(reset?24:24)});
+ const filter=(WS.convFilter||'').trim();if(filter)params.set('q',filter);
+ if(!reset&&WS.convCursor)params.set('cursor',WS.convCursor);
+ return params
 }
-function wsConversationSummary(matched,total,shown){
- if(total&&matched<total)return 'найдено '+wsChatCount(matched)+' из '+wsChatCount(total);
+async function wsLoadConversations(options){
+ const settings=options||{},reset=!!settings.reset,projectId=WS.project?.id;
+ if(!projectId)return;
+ const seq=++WS.convSeq;WS.convLoading=true;
+ try{
+  const data=await api('/projects/'+projectId+'/conversations?'+wsConversationParams(reset).toString());
+  if(seq!==WS.convSeq||WS.project?.id!==projectId)return;
+  const page=data.conversations||[];
+  if(reset)WS.convs=[];
+  const known=new Set(WS.convs.map(conversation=>conversation.id));
+  for(const conversation of page)if(!known.has(conversation.id)){WS.convs.push(conversation);known.add(conversation.id)}
+  WS.convCursor=data.next_cursor||'';WS.convHasMore=!!data.has_more;
+  WS.convTotal=Number.isFinite(Number(data.total))?Number(data.total):WS.convs.length;
+  wsRenderConversations()
+ }catch(error){if(seq===WS.convSeq&&!settings.quiet)workspaceError(error)}
+ finally{if(seq===WS.convSeq)WS.convLoading=false}
+}
+function wsConversationSummary(loaded,total,filtered){
  if(!total)return 'чатов пока нет';
- return wsChatCount(total)+(shown<total?' · показаны первые '+shown:'');
+ if(filtered)return 'найдено '+wsChatCount(loaded)+(total>loaded?' из '+wsChatCount(total):'');
+ return wsChatCount(total)+(loaded<total?' · показаны '+loaded:'');
 }
 function wsRenderConversations(){
  const box=$('#convs-list');if(!box)return;
- const {all,matched,visible,pinned}=wsVisibleConversations(),activeId=WS.conv?.id||'';
- const summary=$('#conv-summary');if(summary)summary.textContent=wsConversationSummary(matched.length,all.length,visible.length);
+ const all=WS.convs||[],filter=(WS.convFilter||'').trim(),activeId=WS.conv?.id||'';
+ const shown=all;
+ const pinned=WS.conv&&!all.some(conversation=>conversation.id===WS.conv.id)?WS.conv:null;
+ const summary=$('#conv-summary');if(summary)summary.textContent=wsConversationSummary(all.length,WS.convTotal||all.length,!!filter);
  const more=$('#conv-more');
- if(more){const rest=matched.length-visible.length;more.hidden=rest<=0;more.textContent=rest>0?'Показать ещё ':''}
- const signature=[WS.convFilter||'',WS.convLimit||0,all.length,activeId,pinned?pinned.id:'',
-  visible.map(conversation=>conversation.id+''+wsConversationTitle(conversation)).join('')].join('');
+ if(more){more.hidden=!WS.convHasMore;more.textContent=WS.convHasMore?(WS.convLoading?'Загружаю…':'Показать ещё'):'Показать ещё ';more.disabled=!!WS.convLoading}
+ const signature=[filter,all.length,activeId,pinned?pinned.id:'',WS.convHasMore?'1':'0',
+  all.map(conversation=>conversation.id+''+wsConversationTitle(conversation)).join('')].join('');
  if(signature===WS.convSignature&&box.childElementCount>0)return;
  WS.convSignature=signature;
  const previousScroll=box.scrollTop||0,activeChanged=WS.convShownId!==activeId;WS.convShownId=activeId;
@@ -684,14 +706,14 @@ function wsRenderConversations(){
   button.onclick=action(()=>wsOpenConversation(conversation));box.append(button)
  };
  if(pinned)add(pinned);
- for(const conversation of visible)add(conversation);
- if(!matched.length&&!pinned)box.append(el('p','sidebar-empty',all.length?'Ничего не найдено. Измените запрос.':'Здесь появятся разговоры проекта.'));
+ for(const conversation of shown)add(conversation);
+ if(!all.length)box.append(el('p','sidebar-empty',filter?'Ничего не найдено. Измените запрос.':'Здесь появятся разговоры проекта.'));
  box.scrollTop=activeChanged?0:previousScroll;
  const current=typeof box.querySelector==='function'?box.querySelector('.conv.active'):null;
  if(current&&typeof current.scrollIntoView==='function')current.scrollIntoView({block:'nearest'});
 }
 async function wsOpenConversation(conversation){WS.conv=conversation;storeSet(conversationStorageKey(),conversation.id);WS.messages=[];WS.pending=null;if(conversation.role_id&&ROLE_META[conversation.role_id])WS.roleId=conversation.role_id;wsRenderConversations();renderRoles();await wsEditRole(WS.roleId);await wsLoadMessages();$('#chat-input').focus()}
-async function wsNewConversation(){if(!WS.project)throw Error('Сначала создайте или выберите проект.');const button=$('#conv-new');button.disabled=true;try{const conversation=await api('/projects/'+WS.project.id+'/conversations',{method:'POST',body:JSON.stringify({role_id:WS.roleId,title:'Новый чат'})});WS.convs.unshift(conversation);WS.convFilter='';WS.convLimit=24;const filterBox=$('#conv-filter');if(filterBox)filterBox.value='';await wsOpenConversation(conversation);toast('Новый чат создан')}finally{button.disabled=false}}
+async function wsNewConversation(){if(!WS.project)throw Error('Сначала создайте или выберите проект.');const button=$('#conv-new');button.disabled=true;try{const conversation=await api('/projects/'+WS.project.id+'/conversations',{method:'POST',body:JSON.stringify({role_id:WS.roleId,title:'Новый чат'})});WS.convs.unshift(conversation);WS.convFilter='';delete WS.convSignature;const filterBox=$('#conv-filter');if(filterBox)filterBox.value='';await wsOpenConversation(conversation);wsRenderConversations();toast('Новый чат создан')}finally{button.disabled=false}}
 
 function wsIsImageAttachment(attachment){return attachment?.kind==='image'||/^image\/(png|jpeg)$/i.test(attachment?.mime||'')}
 function wsRevokePreview(id){const url=WS.previewUrls.get(id);if(url){URL.revokeObjectURL(url);WS.previewUrls.delete(id)}}
@@ -886,7 +908,7 @@ function wsWire(){
  $('#att-file').onchange=action(async event=>{const files=Array.from(event.target.files||[]);try{await wsUpload(files)}finally{event.target.value=''}});
  const filterBox=$('#att-filter');if(filterBox)filterBox.oninput=event=>{WS.attFilter=event.target.value||'';wsRenderAttachments()};
  const clearButton=$('#att-clear');if(clearButton)clearButton.onclick=()=>{WS.selectedAtts.clear();wsRenderAttachments()};
- const convFilter=$('#conv-filter');if(convFilter)convFilter.oninput=event=>{WS.convFilter=event.target.value||'';wsRenderConversations()};const convMore=$('#conv-more');if(convMore)convMore.onclick=()=>{WS.convLimit=(WS.convLimit||24)+24;wsRenderConversations()};
+ const convFilter=$('#conv-filter');if(convFilter)convFilter.oninput=event=>{WS.convFilter=event.target.value||'';clearTimeout(WS.convFilterTimer);WS.convFilterTimer=setTimeout(()=>{wsLoadConversations({reset:true}).catch(workspaceError)},260)};const convMore=$('#conv-more');if(convMore)convMore.onclick=()=>{if(WS.convLoading)return;wsLoadConversations({}).catch(workspaceError)};
  $('#chat-form').onsubmit=async event=>{event.preventDefault();const input=$('#chat-input'),draft=input.value,text=draft.trim(),submittedProjectId=WS.project?.id,submittedConversationId=WS.conv?.id;if(!text||WS.sending)return;WS.sending=true;wsUpdateRecipient();$('#chat-msg').className='msg';$('#chat-msg').textContent='Передаю задачу…';try{const response=await wsSend(text),stillInSubmittedChat=WS.project?.id===submittedProjectId&&(!submittedConversationId||WS.conv?.id===submittedConversationId);if(stillInSubmittedChat&&input.value===draft)input.value='';if(stillInSubmittedChat){const warnings=response?.context_warnings||[];if(warnings.length){$('#chat-msg').className='msg warn-text';$('#chat-msg').textContent='Задача принята. Контекст: '+warnings.join(' ')}else{$('#chat-msg').className='msg ok';$('#chat-msg').textContent='Задача принята. Ответ появится в этом чате.'}}}catch(error){if(WS.project?.id===submittedProjectId&&(!submittedConversationId||WS.conv?.id===submittedConversationId)){$('#chat-msg').className='msg error';$('#chat-msg').textContent=error.message;workspaceError(error)}}finally{WS.sending=false;wsUpdateRecipient()}};
  $('#chat-input').onkeydown=event=>{if(event.key==='Enter'&&(event.ctrlKey||event.metaKey)){event.preventDefault();$('#chat-form').requestSubmit()}};$('#token-form').onsubmit=event=>{event.preventDefault();saveToken().catch(workspaceError)};
 }

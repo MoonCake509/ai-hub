@@ -630,11 +630,18 @@ async def role_update(project_id: str, role_id: str, request: Request) -> dict:
 
 
 @app.get("/projects/{project_id}/conversations", dependencies=[Depends(require_token)])
-async def conversations(project_id: str) -> dict:
+async def conversations(project_id: str, limit: int = 0, cursor: str = "", q: str = "") -> dict:
+    """Разговоры проекта: страницы по курсору и поиск по названию.
+
+    Без limit отдаётся весь список — так работали прежние клиенты.
+    """
     if not await asyncio.to_thread(db.get_project, project_id):
         raise HTTPException(status_code=404, detail="project not found")
-    items = await asyncio.to_thread(db.list_conversations, project_id)
-    return {"conversations": items}
+    if cursor and not db.decode_cursor(cursor):
+        raise HTTPException(status_code=400, detail="bad cursor")
+    page = await asyncio.to_thread(db.list_conversations_page, project_id,
+                                   max(0, min(int(limit or 0), 200)), cursor, (q or "").strip()[:200])
+    return page
 
 
 @app.post("/projects/{project_id}/conversations", dependencies=[Depends(require_token)])

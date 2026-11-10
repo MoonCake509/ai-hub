@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import threading
@@ -135,6 +136,8 @@ DDL = [
         title text not null default '',
         created_at timestamptz not null default now()
     )""",
+    "create index if not exists conversations_project_page on aihub.conversations"
+    "(project_id, created_at desc, id desc)",
     """create table if not exists aihub.messages (
         id bigserial primary key,
         conversation_id text not null references aihub.conversations(id) on delete cascade,
@@ -797,6 +800,66 @@ def list_conversations(project_id: str) -> list[dict]:
         return _rows(conn, _qualify(
             "select * from aihub.conversations where project_id = :p order by created_at desc"),
             p=project_id)
+
+
+def encode_cursor(row: dict) -> str:
+    """Курсор страницы: время создания и id последней строки, без смещений."""
+    stamp = row.get("created_at")
+    iso = stamp.isoformat() if hasattr(stamp, "isoformat") else str(stamp or "")
+    payload = json.dumps({"t": iso, "i": row.get("id") or ""}, ensure_ascii=False).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def decode_cursor(cursor: str | None) -> dict | None:
+    if not cursor:
+        return None
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        data = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
+    except Exception:
+        return None
+    if not data.get("t") or not data.get("i"):
+        return None
+    return {"created_at": data["t"], "id": data["i"]}
+
+
+def list_conversations_page(project_id: str, limit: int = 0, cursor: str = "",
+                            query: str = "") -> dict:
+    """Постраничный список разговоров: keyset по (created_at, id) плюс поиск по названию.
+
+    Ключ на (created_at, id) не даёт пропусков и дублей, когда в проект одновременно
+    добавляют новые разговоры. Пустой limit — прежнее поведение: весь список целиком.
+    """
+    text_query = (query or "").strip()
+    like = "%" + text_query + "%"
+    page_size = int(limit or 0)
+    with _lock:
+        conn = connect()
+        total_row = _one(conn, "select count(*) as n from aihub.conversations"
+                               " where project_id = :p and (:q = '' or title ilike :like)",
+                         p=project_id, q=text_query, like=like)
+        sql = ("select * from aihub.conversations where project_id = :p"
+               " and (:q = '' or title ilike :like)")
+        params = {"p": project_id, "q": text_query, "like": like}
+        anchor = decode_cursor(cursor)
+        if anchor:
+            sql += " and (created_at, id) < (:t::timestamptz, :i::text)"
+            params["t"] = anchor["created_at"]
+            params["i"] = anchor["id"]
+        sql += " order by created_at desc, id desc"
+        if page_size > 0:
+            sql += " limit :lim"
+            params["lim"] = page_size + 1
+        rows = _rows(conn, sql, **params)
+    has_more = page_size > 0 and len(rows) > page_size
+    if has_more:
+        rows = rows[:page_size]
+    return {
+        "conversations": rows,
+        "total": int((total_row or {}).get("n") or 0),
+        "has_more": has_more,
+        "next_cursor": encode_cursor(rows[-1]) if has_more and rows else "",
+    }
 
 
 def get_conversation(conversation_id: str) -> dict | None:

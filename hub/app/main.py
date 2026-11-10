@@ -26,9 +26,10 @@ from fastapi.staticfiles import StaticFiles
 from . import chat_context, db, observations, probes, quality, quality_db, quality_quick, workers
 from . import protocol as bridge_protocol
 from . import resources
+from . import workspace
 from .image_validation import validate_image
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 LITELLM_URL = os.environ.get("LITELLM_URL", "http://litellm:4000").rstrip("/")
 MASTER_KEY = os.environ.get("LITELLM_MASTER_KEY", "")
 HUB_TOKEN = os.environ.get("HUB_TOKEN", "")
@@ -1319,6 +1320,60 @@ async def resources_release(request: Request) -> dict:
     return {"ok": released, "key": key, "job_id": job_id}
 
 
+@app.get("/workspace/ops", dependencies=[Depends(require_token)])
+async def workspace_ops() -> dict:
+    """Каталог разрешённых операций: что можно попросить у устройства-воркера."""
+    return {
+        "ops": [{"name": name, "description": text} for name, text in workspace.OPS.items()],
+        "mutating": sorted(workspace.WRITES_ROOT),
+        "limits": {"list_files": workspace.MAX_LIST, "read_files": workspace.MAX_READ_FILES,
+                   "read_bytes": workspace.MAX_READ_BYTES,
+                   "patch_files": workspace.MAX_PATCH_FILES,
+                   "patch_bytes": workspace.MAX_PATCH_BYTES,
+                   "checks": workspace.MAX_CHECKS},
+    }
+
+
+@app.post("/workspace/jobs", dependencies=[Depends(require_token)])
+async def workspace_job_create(request: Request) -> JSONResponse:
+    """Ставит control-задание на устройство. Модель не присылает команды — только op+args."""
+    payload = await request.json()
+    try:
+        result = await asyncio.to_thread(
+            workspace.create_op_job,
+            payload.get("op") or "",
+            payload.get("args") or {},
+            payload.get("host_id") or "",
+            payload.get("project_id"),
+            payload.get("idempotency_key"),
+            payload.get("timeout_s"),
+        )
+    except workspace.OpError as exc:
+        return JSONResponse(status_code=400, content={"error": exc.as_dict()})
+    job = result["job"]
+    return JSONResponse({
+        "job_id": job["id"],
+        "status": job.get("status"),
+        "kind": job.get("kind"),
+        "op": result["op"],
+        "host_id": result["host_id"],
+        "root": result["root"],
+        "digest": result["digest"],
+        "idempotency_key": result["idempotency_key"],
+        "reused": not result["created"],
+        "receipt": result["receipt"],
+    })
+
+
+@app.get("/workspace/jobs/{job_id}", dependencies=[Depends(require_token)])
+async def workspace_job_get(job_id: str) -> dict:
+    """Состояние и результат операции: результат уже разобран и лежит в receipt."""
+    result = await asyncio.to_thread(workspace.job_result, job_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="unknown job")
+    return result
+
+
 @app.get("/workers", dependencies=[Depends(require_token)])
 async def workers_list() -> dict:
     items = await asyncio.to_thread(workers.list_workers)
@@ -1327,7 +1382,8 @@ async def workers_list() -> dict:
 
 @app.get("/bridge/jobs", dependencies=[Depends(require_token)])
 async def bridge_jobs(worker: str = "", agents: str = "",
-                      protocol_ver: str | None = Query(None, alias="protocol")) -> JSONResponse:
+                      protocol_ver: str | None = Query(None, alias="protocol"),
+                      kinds: str = "agent") -> JSONResponse:
     # Версия протокола обязательна. Старый poller (v1) не арендует задания v2:
     # иначе он получал бы задание, не умея ни durable-ack, ни heartbeat, и
     # «терял» бы его при первом падении. Отказ явный — 426, а не пустая очередь.
@@ -1342,13 +1398,14 @@ async def bridge_jobs(worker: str = "", agents: str = "",
         })
     client_protocol = int(bridge_protocol.version_of(protocol_ver))
     leased = await asyncio.to_thread(db.lease_job, worker or "unknown", LEASE_SECONDS, agents,
-                                     client_protocol)
+                                     client_protocol, kinds)
     if not leased:
         return JSONResponse({"job": None, "protocol": client_protocol,
                              "heartbeat_interval_s": bridge_protocol.heartbeat_interval(LEASE_SECONDS)})
     return JSONResponse({
         "id": leased["id"],
         "attempt_id": leased["attempt_id"],
+        "kind": leased.get("kind") or "agent",
         "agent": leased["agent_id"],
         "prompt": leased["prompt"],
         "timeout": leased["timeout_s"],
@@ -1425,6 +1482,33 @@ async def bridge_result(request: Request) -> dict:
                                     body or "", state)
         except Exception as exc:
             print("chat finish failed:", exc)
+    # CORE-02b: результат управляемой операции фиксируется как durable receipt —
+    # поздний повтор с тем же ключом вернёт его, а не применит патч заново.
+    if outcome == "applied" and payload.get("job_id"):
+        try:
+            job_row = await asyncio.to_thread(db.get_job, payload["job_id"])
+            if (job_row or {}).get("kind") == "workspace":
+                envelope = json.loads(job_row.get("prompt") or "{}")
+                body = output or ""
+                try:
+                    parsed = json.loads(body)
+                except ValueError:
+                    parsed = {"raw": body[:2000]}
+                snap = job_row.get("run_snapshot") or {}
+                await asyncio.to_thread(
+                    db.record_workspace_receipt,
+                    job_row.get("idempotency_key") or "",
+                    envelope.get("op") or "",
+                    snap.get("host_id") or "",
+                    payload["job_id"],
+                    envelope.get("digest") or "",
+                    "applied" if payload.get("ok") else "failed",
+                    parsed,
+                    hashlib.sha256(body.encode("utf-8")).hexdigest() if body else None,
+                )
+        except Exception as exc:  # noqa: BLE001
+            print("workspace receipt failed:", exc, flush=True)
+
     # late/stale: результат сохранён в late_results — воркер может удалять outbox,
     # но задание не переоткрывается и статус не переписывается.
     return {"ok": outcome in ("applied", "duplicate", "late", "stale"),

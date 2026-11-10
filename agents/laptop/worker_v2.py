@@ -31,6 +31,19 @@ sys.path.insert(0, HERE)
 
 from bridge import AGENTS, TOKEN, _agent_path, log  # noqa: E402
 
+# CORE-02b: управляемые операции рабочего пространства на этом устройстве.
+# Модуль необязателен: без него воркер обслуживает только kind=agent.
+try:
+    import workspace_host  # noqa: E402
+except Exception as _ws_exc:  # noqa: BLE001
+    workspace_host = None
+    log(f"workspace ops disabled: {_ws_exc}")
+
+KINDS = ["agent"] + (["workspace"] if workspace_host is not None else [])
+# Служебный агент workspace: хаб адресует ему control-задания, а фильтр
+# аренды отбирает их по списку агентов поллера.
+POLL_AGENTS = list(AGENTS) + (["workspace"] if workspace_host is not None else [])
+
 HUB_FILE = os.path.join(HERE, "hub.txt")
 OUTBOX = os.path.join(HERE, "outbox")
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "3"))
@@ -173,7 +186,7 @@ def acquire_single_instance() -> bool:
 
 
 PROTOCOL = 2
-ADAPTER_VERSION = "2.1"
+ADAPTER_VERSION = "2.2"
 HEARTBEAT_S = int(os.environ.get("WORKER_HEARTBEAT_S", "60"))
 _VERSION_CACHE: dict[str, str | None] = {}
 
@@ -235,7 +248,9 @@ def worker_heartbeat_payload() -> dict:
         "hb_interval_s": HEARTBEAT_S,
         "adapter_version": ADAPTER_VERSION,
         "agents": served,
-        "capabilities": {"workdir": True, "attachments": True, "outbox": "file"},
+        "capabilities": {"workdir": True, "attachments": True, "outbox": "file",
+                         "kinds": KINDS,
+                         **(workspace_host.capabilities() if workspace_host else {})},
         "identity": {"worker_home": HERE, "python": platform.python_version(), "service": "laptop-worker_v2"},
     }
 
@@ -256,6 +271,32 @@ def send_worker_heartbeat(base: str) -> dict:
 def worker_heartbeat_loop(base: str, stop: threading.Event) -> None:
     while not stop.wait(HEARTBEAT_S):
         send_worker_heartbeat(base)
+
+
+def run_workspace_job(job: dict, base: str) -> dict:
+    """Control-задание: операция рабочего пространства с heartbeat и без ретраев."""
+    job_id = job.get("id")
+    attempt_id = job.get("attempt_id")
+    lease = int(job.get("lease_seconds") or 300)
+    stop = threading.Event()
+    threading.Thread(target=heartbeat_loop,
+                     args=(base, attempt_id, lease, stop, job.get("heartbeat_interval_s")),
+                     daemon=True).start()
+    try:
+        if workspace_host is None:
+            payload = {"job_id": job_id, "attempt_id": attempt_id, "ok": False,
+                       "error": "host не поддерживает workspace-операции"}
+        else:
+            payload = workspace_host.run_job(job)
+        log(f"workspace job {job_id} op={(payload.get('usage') or {}).get('workspace_op')} "
+            f"ok={payload.get('ok')} {str(payload.get('error') or '')[:160]}")
+    except Exception as exc:  # noqa: BLE001
+        log("workspace job error " + traceback.format_exc())
+        payload = {"job_id": job_id, "attempt_id": attempt_id, "ok": False,
+                   "error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        stop.set()
+    return payload
 
 
 def main() -> int:
@@ -284,7 +325,8 @@ def main() -> int:
     while True:
         try:
             code, job = http("GET", f"{base}/bridge/jobs?worker={WORKER}"
-                                    f"&agents={','.join(AGENTS)}&protocol={PROTOCOL}", timeout=45)
+                                    f"&agents={','.join(POLL_AGENTS)}&protocol={PROTOCOL}"
+                                    f"&kinds={','.join(KINDS)}", timeout=45)
         except Exception as exc:  # noqa: BLE001
             log(f"poll error: {exc}")
             time.sleep(5)
@@ -305,6 +347,17 @@ def main() -> int:
         prompt = job.get("prompt")
         if not job_id or not attempt_id or not agent_id or not prompt:
             time.sleep(POLL_INTERVAL)
+            continue
+
+        if (job.get("kind") or "agent") == "workspace":
+            payload = run_workspace_job(job, base)
+            path = outbox_path(job_id, attempt_id)
+            tmp_path = path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False)
+            os.replace(tmp_path, path)
+            deliver(path)
+            drain_outbox()
             continue
 
         spec = AGENTS.get(agent_id)

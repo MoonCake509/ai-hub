@@ -20,6 +20,8 @@ from urllib.parse import urlparse
 import pg8000.native
 
 _lock = threading.RLock()
+# Сколько кандидатов очереди просматривать в поисках свободного checkout.
+CANDIDATES = max(1, min(50, int(os.environ.get("LEASE_CANDIDATES", "10"))))
 _conn: pg8000.native.Connection | None = None
 
 
@@ -178,6 +180,21 @@ DDL = [
     # CORE-01: протокол, на котором задание поставлено и на котором его арендовали.
     "alter table aihub.jobs add column if not exists protocol int not null default 2",
     "alter table aihub.job_attempts add column if not exists protocol int not null default 2",
+    # CORE-02b: kind отделяет агентский prompt от управляемой операции host worker.
+    "alter table aihub.jobs add column if not exists kind text not null default 'agent'",
+    "create index if not exists jobs_kind_status on aihub.jobs(kind, status, created_at)",
+    """create table if not exists aihub.workspace_receipts (
+        idempotency_key text primary key,
+        op text not null,
+        host_id text not null,
+        job_id text,
+        args_digest text not null,
+        status text not null default 'pending',
+        result_digest text,
+        result jsonb,
+        created_at timestamptz not null default now(),
+        updated_at timestamptz not null default now()
+    )""",
 ]
 
 
@@ -248,7 +265,8 @@ def create_job(agent_id: str, prompt: str, prompt_sha: str, timeout_s: int,
                idempotency_key: str | None, max_queue: int | None = None,
                requested_model: str | None = None,
                requested_profile: str | None = None,
-               workspace: dict | None = None) -> tuple[dict, bool]:
+               workspace: dict | None = None,
+               kind: str = "agent") -> tuple[dict, bool]:
     """Возвращает (job, created). При совпадении ключа с другим телом — ValueError."""
     job_id = uuid.uuid4().hex
     with _lock:
@@ -263,7 +281,8 @@ def create_job(agent_id: str, prompt: str, prompt_sha: str, timeout_s: int,
                 if existing:
                     # Модель и профиль — часть назначения: смена модели под тем же
                     # ключом не должна молча вернуть задание со старым назначением.
-                    if (existing["prompt_sha"] != prompt_sha
+                    if ((existing.get("kind") or "agent") != kind
+                            or existing["prompt_sha"] != prompt_sha
                             or existing["agent_id"] != agent_id
                             or int(existing["timeout_s"]) != int(timeout_s)
                             or (existing.get("requested_model") or None) != (requested_model or None)
@@ -278,12 +297,12 @@ def create_job(agent_id: str, prompt: str, prompt_sha: str, timeout_s: int,
             workspace = workspace or {}
             conn.run(_qualify(
                 "insert into aihub.jobs(id, agent_id, prompt, prompt_sha, timeout_s, idempotency_key,"
-                " requested_model, requested_profile, project_id, conversation_id, role_id, run_snapshot)"
-                " values (:i, :a, :p, :s, :t, :k, :rm, :rp, :pr, :cv, :ri, :sn::jsonb)"),
+                " requested_model, requested_profile, project_id, conversation_id, role_id, run_snapshot, kind)"
+                " values (:i, :a, :p, :s, :t, :k, :rm, :rp, :pr, :cv, :ri, :sn::jsonb, :kd)"),
                 i=job_id, a=agent_id, p=prompt, s=prompt_sha, t=timeout_s, k=idempotency_key,
                 rm=requested_model, rp=requested_profile, pr=workspace.get("project_id"),
                 cv=workspace.get("conversation_id"), ri=workspace.get("role_id"),
-                sn=json.dumps(workspace, ensure_ascii=False),
+                sn=json.dumps(workspace, ensure_ascii=False), kd=kind,
             )
             conn.run(_qualify("insert into aihub.job_events(job_id, event) values (:j, 'queued')"), j=job_id)
             conn.run("commit")
@@ -385,6 +404,12 @@ def _checkout_key(conn, row: dict) -> str | None:
     места, куда писать файлы. Ключ строится из фактического host+path, а не из
     имени агента, поэтому два проекта с одним каталогом — один ресурс.
     """
+    if (row.get("kind") or "agent") == "workspace":
+        # Чтение/снимок/упаковка не меняют рабочее дерево пользователя: держать
+        # на них checkout — значит останавливать кодеров без причины.
+        op = _json_object(row.get("run_snapshot")).get("op")
+        if op != "apply_patch":
+            return None
     from . import resources
 
     snap = row.get("run_snapshot") or {}
@@ -412,7 +437,7 @@ def _checkout_key(conn, row: dict) -> str | None:
 
 
 def lease_job(worker: str, lease_seconds: int = 300, agents: str = "",
-              client_protocol: int = 0) -> dict | None:
+              client_protocol: int = 0, kinds: str = "agent") -> dict | None:
     """Атомарно берёт задание из очереди, создаёт попытку. None — очередь пуста.
 
     Аренда возможна только клиентом, который говорит на протоколе не ниже
@@ -424,28 +449,56 @@ def lease_job(worker: str, lease_seconds: int = 300, agents: str = "",
         conn = connect()
         conn.run("begin")
         try:
-            row = _one(
+            # Голова очереди может ждать занятый checkout. Перебираем кандидатов
+            # по порядку и берём первое задание, которое можно выполнить сейчас:
+            # воркер не простаивает из-за одного занятого каталога, а порядок
+            # остаётся FIFO для всех остальных.
+            candidates = _rows(
                 conn,
-                """with c as (
-                       select id from aihub.jobs
-                        where status = 'queued'
-                          and protocol <= :cp
-                          and (:agents = '' or agent_id = any(string_to_array(:agents, ',')))
-                        order by created_at
-                        limit 1
-                        for update skip locked
-                   )
-                   update aihub.jobs j
-                      set status = 'running',
-                          started_at = now(),
-                          lease_until = now() + (:lease || ' seconds')::interval,
-                          worker = :w,
-                          attempts = j.attempts + 1
-                     from c where j.id = c.id
-                   returning j.id, j.agent_id, j.prompt, j.timeout_s, j.attempts, j.requested_model,
-                        j.requested_profile, j.run_snapshot, j.project_id, j.protocol""",
-                lease=str(int(lease_seconds)), w=worker, agents=agents, cp=int(client_protocol),
+                """select id from aihub.jobs
+                    where status = 'queued'
+                      and protocol <= :cp
+                      and kind = any(string_to_array(:kinds, ','))
+                      and (:agents = '' or agent_id = any(string_to_array(:agents, ',')))
+                    order by created_at
+                    limit :n""",
+                cp=int(client_protocol), kinds=kinds or "agent", agents=agents,
+                n=CANDIDATES,
             )
+            row = None
+            resource = None
+            for cand in candidates:
+                conn.run("savepoint cand")
+                row = _one(
+                    conn,
+                    """update aihub.jobs j
+                          set status = 'running',
+                              started_at = now(),
+                              lease_until = now() + (:lease || ' seconds')::interval,
+                              worker = :w,
+                              attempts = j.attempts + 1
+                        where j.id = :i and j.status = 'queued'
+                      returning j.id, j.agent_id, j.prompt, j.timeout_s, j.attempts,
+                                j.requested_model, j.requested_profile, j.run_snapshot,
+                                j.project_id, j.protocol, j.kind""",
+                    lease=str(int(lease_seconds)), w=worker, i=cand["id"],
+                )
+                if not row:
+                    conn.run("rollback to savepoint cand")
+                    conn.run("release savepoint cand")
+                    continue
+                resource_key = _checkout_key(conn, row)
+                if resource_key:
+                    from . import resources
+                    resource = resources.acquire(conn, resource_key, worker or "unknown",
+                                                 row["id"], lease_seconds)
+                    if resource is None:
+                        conn.run("rollback to savepoint cand")
+                        conn.run("release savepoint cand")
+                        row, resource = None, None
+                        continue
+                conn.run("release savepoint cand")
+                break
             if not row:
                 conn.run("commit")
                 return None
@@ -453,15 +506,6 @@ def lease_job(worker: str, lease_seconds: int = 300, agents: str = "",
             # Если каталог занят другим живым заданием, транзакция откатывается и
             # задание остаётся queued: воркер не получает двух писателей в один
             # checkout даже при одновременном опросе.
-            resource = None
-            resource_key = _checkout_key(conn, row)
-            if resource_key:
-                from . import resources
-                resource = resources.acquire(conn, resource_key, worker or "unknown",
-                                            row["id"], lease_seconds)
-                if resource is None:
-                    conn.run("rollback")
-                    return None
             attempt_id = uuid.uuid4().hex
             conn.run(_qualify(
                 "insert into aihub.job_attempts(id, job_id, attempt_no, worker, lease_until, protocol)"
@@ -1162,3 +1206,65 @@ def create_chat_job(agent_id: str, prompt: str, prompt_sha: str, timeout_s: int,
     workspace.update(project_id=project_id, conversation_id=conversation_id, role_id=role_id)
     return create_job(agent_id, prompt, prompt_sha, timeout_s, idempotency_key,
                       max_queue, requested_model, requested_profile, workspace)
+
+
+def _iso(value):
+    if value is None:
+        return None
+    try:
+        return value.isoformat()
+    except AttributeError:
+        return str(value)
+
+
+def workspace_receipt(key: str) -> dict | None:
+    """Durable receipt операции по её idempotency key."""
+    if not key:
+        return None
+    with _lock:
+        conn = connect()
+        row = _one(conn, "select * from aihub.workspace_receipts where idempotency_key = :k", k=key)
+    if not row:
+        return None
+    result = row.get("result")
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except ValueError:
+            result = None
+    return {
+        "idempotency_key": row.get("idempotency_key"),
+        "op": row.get("op"),
+        "host_id": row.get("host_id"),
+        "job_id": row.get("job_id"),
+        "args_digest": row.get("args_digest"),
+        "status": row.get("status"),
+        "result_digest": row.get("result_digest"),
+        "result": result,
+        "created_at": _iso(row.get("created_at")),
+        "updated_at": _iso(row.get("updated_at")),
+    }
+
+
+def record_workspace_receipt(key: str, op: str, host_id: str, job_id: str | None,
+                             args_digest: str, status: str, result: dict | None = None,
+                             result_digest: str | None = None) -> dict | None:
+    """Пишет receipt. Повтор с тем же ключом не двигает статус назад."""
+    if not key:
+        return None
+    with _lock:
+        conn = connect()
+        conn.run(_qualify(
+            "insert into aihub.workspace_receipts(idempotency_key, op, host_id, job_id,"
+            " args_digest, status, result, result_digest)"
+            " values (:k, :o, :h, :j, :d, :s, :r::jsonb, :rd)"
+            " on conflict (idempotency_key) do update set"
+            "   status = case when aihub.workspace_receipts.status = 'applied'"
+            "                 then aihub.workspace_receipts.status else excluded.status end,"
+            "   job_id = coalesce(excluded.job_id, aihub.workspace_receipts.job_id),"
+            "   result = coalesce(excluded.result, aihub.workspace_receipts.result),"
+            "   result_digest = coalesce(excluded.result_digest, aihub.workspace_receipts.result_digest),"
+            "   updated_at = now()"),
+            k=key, o=op, h=host_id, j=job_id, d=args_digest, s=status,
+            r=json.dumps(result, ensure_ascii=False) if result is not None else None, rd=result_digest)
+    return workspace_receipt(key)

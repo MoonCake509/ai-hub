@@ -194,10 +194,44 @@ FIXED_LINES = [
 ]
 FIXED_BODY = chr(10).join(FIXED_LINES)
 
+BROKEN_LINES = [
+    '"""Учебный модуль: расчёт скидки (fixture для сквозной проверки операций)."""',
+    "",
+    "",
+    "def final_price(amount: int, percent: int = 10) -> float:",
+    "    return amount - amount * percent / 100.0",
+    "",
+]
+BROKEN_BODY = chr(10).join(BROKEN_LINES)
+
+
 def patch_args(base: str, body: str, preimage: str | None) -> dict:
     return {"root": ROOT, "base_tree_digest": base, "changes": [{
         "path": "discount.py", "preimage_sha256": preimage,
         "content_b64": base64.b64encode(body.encode("utf-8")).decode("ascii")}]}
+
+
+def test_prepare_baseline():
+    """Возвращает fixture в исходное «сломанное» состояние.
+
+    Дерево на ноутбуке — реальный рабочий каталог, и прошлый прогон оставляет в
+    нём исправленный файл. Без нормализации проверка «до правки тесты падают»
+    проверяет уже исправленное дерево и врёт.
+    """
+    result = ok_result(op("read_files", {"root": ROOT, "files": [{"path": "discount.py"}]}, PROJECT))
+    item = result["files"][0]
+    if "amount must be >= 0" not in item["text"]:
+        assert result["files"][0]["sha256"] == hashlib.sha256(
+            BROKEN_BODY.encode("utf-8")).hexdigest(), "fixture не в исходном состоянии"
+        return
+    job = op("apply_patch", patch_args(STATE["tree"], BROKEN_BODY, item["sha256"]), PROJECT,
+             key="core02b-live-reset-" + RUN)
+    ok_result(job)
+    fresh = ok_result(op("inspect", {"root": ROOT}, PROJECT))
+    STATE["tree"] = fresh["tree_digest"]
+    again = ok_result(op("read_files", {"root": ROOT, "files": [{"path": "discount.py"}]}, PROJECT))
+    assert "amount must be >= 0" not in again["files"][0]["text"], again["files"][0]["text"][:120]
+    STATE["discount_sha"] = again["files"][0]["sha256"]
 
 
 def test_apply_patch_updates_file():
@@ -272,6 +306,7 @@ def main() -> int:
         "test_inspect",
         "test_list_files_hides_secret",
         "test_read_files",
+        "test_prepare_baseline",
         "test_read_env_rejected",
         "test_root_outside_project_rejected",
         "test_host_without_capability_rejected",

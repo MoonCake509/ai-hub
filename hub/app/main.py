@@ -25,6 +25,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import chat_context, db, observations, probes, quality, quality_db, quality_quick, workers
 from . import protocol as bridge_protocol
+from . import resources
 from .image_validation import validate_image
 
 VERSION = "0.3.0"
@@ -55,6 +56,8 @@ async def _sweeper() -> None:
             expired = await asyncio.to_thread(db.expire_leases)
             if expired:
                 print(f"expired leases: {expired}", flush=True)
+            # CORE-02: истёкшие аренды ресурсов освобождаются тем же тиком.
+            await asyncio.to_thread(resources.sweep)
             # Quick-run deadlines are enforced even with no browser open.
             await asyncio.to_thread(quality.refresh_active_runs)
         except Exception as exc:  # noqa: BLE001
@@ -67,6 +70,7 @@ async def lifespan(app: FastAPI):
     await asyncio.to_thread(quality_db.init)
     await asyncio.to_thread(observations.init)
     await asyncio.to_thread(workers.init)
+    await asyncio.to_thread(resources.init)
     try:
         written = await asyncio.to_thread(
             observations.record_registry, load_agents().get("agents", []), None, VERSION)
@@ -1293,6 +1297,28 @@ async def worker_heartbeat(request: Request) -> dict:
         raise HTTPException(status_code=409, detail=str(exc)) from None
 
 
+@app.get("/resources", dependencies=[Depends(require_token)])
+async def resources_list() -> dict:
+    items = await asyncio.to_thread(resources.list_leases)
+    return {"count": len(items), "resources": items}
+
+
+@app.post("/resources/release", dependencies=[Depends(require_token)])
+async def resources_release(request: Request) -> dict:
+    """Освободить аренду ресурса по ключу и владельцу-заданию.
+
+    Только явное действие оператора: аренда чужого задания так не снимается,
+    потому что ключ и job_id должны совпасть.
+    """
+    payload = await request.json()
+    key = str(payload.get("key") or "").strip()
+    job_id = str(payload.get("job_id") or "").strip()
+    if not key or not job_id:
+        raise HTTPException(status_code=400, detail="key and job_id are required")
+    released = await asyncio.to_thread(resources.release, key, job_id)
+    return {"ok": released, "key": key, "job_id": job_id}
+
+
 @app.get("/workers", dependencies=[Depends(require_token)])
 async def workers_list() -> dict:
     items = await asyncio.to_thread(workers.list_workers)
@@ -1328,6 +1354,7 @@ async def bridge_jobs(worker: str = "", agents: str = "",
         "timeout": leased["timeout_s"],
         "lease_seconds": LEASE_SECONDS,
         "protocol": leased.get("protocol") or client_protocol,
+        "resource": leased.get("resource"),
         "heartbeat_interval_s": bridge_protocol.heartbeat_interval(LEASE_SECONDS),
         "requested_model": leased.get("requested_model"),
         "requested_profile": leased.get("requested_profile"),

@@ -378,6 +378,39 @@ def events(job_id: str) -> list[dict]:
         )
 
 
+def _checkout_key(conn, row: dict) -> str | None:
+    """Ключ писательского checkout для задания (CORE-02).
+
+    Задание без проекта и без рабочего каталога не занимает checkout: у него нет
+    места, куда писать файлы. Ключ строится из фактического host+path, а не из
+    имени агента, поэтому два проекта с одним каталогом — один ресурс.
+    """
+    from . import resources
+
+    snap = row.get("run_snapshot") or {}
+    if isinstance(snap, str):
+        try:
+            snap = json.loads(snap)
+        except Exception:
+            snap = {}
+    workdir = snap.get("project_workdir") or snap.get("workdir")
+    host_id = snap.get("project_host_id") or snap.get("host_id")
+    project_id = row.get("project_id")
+    if project_id and (not workdir or not host_id):
+        proj = _one(conn, _qualify("select workdir, host_id from aihub.projects where id = :p"),
+                    p=project_id)
+        if proj:
+            workdir = workdir or proj.get("workdir")
+            host_id = host_id or proj.get("host_id")
+    if not workdir or not host_id:
+        return None
+    try:
+        return resources.key_for("checkout", host_id, workdir)
+    except ValueError as exc:
+        print("checkout key rejected:", exc, flush=True)
+        return None
+
+
 def lease_job(worker: str, lease_seconds: int = 300, agents: str = "",
               client_protocol: int = 0) -> dict | None:
     """Атомарно берёт задание из очереди, создаёт попытку. None — очередь пуста.
@@ -416,6 +449,19 @@ def lease_job(worker: str, lease_seconds: int = 300, agents: str = "",
             if not row:
                 conn.run("commit")
                 return None
+            # CORE-02: писательская аренда checkout берётся в этой же транзакции.
+            # Если каталог занят другим живым заданием, транзакция откатывается и
+            # задание остаётся queued: воркер не получает двух писателей в один
+            # checkout даже при одновременном опросе.
+            resource = None
+            resource_key = _checkout_key(conn, row)
+            if resource_key:
+                from . import resources
+                resource = resources.acquire(conn, resource_key, worker or "unknown",
+                                            row["id"], lease_seconds)
+                if resource is None:
+                    conn.run("rollback")
+                    return None
             attempt_id = uuid.uuid4().hex
             conn.run(_qualify(
                 "insert into aihub.job_attempts(id, job_id, attempt_no, worker, lease_until, protocol)"
@@ -472,6 +518,7 @@ def lease_job(worker: str, lease_seconds: int = 300, agents: str = "",
                                     "message_id": ref.get("message_id") if isinstance(ref, dict) else None})
         return {**row, "attempt_id": attempt_id, "lease_seconds": lease_seconds,
                 "protocol": int(row.get("protocol") or client_protocol),
+                "resource": resource,
                 "workdir": workdir or None, "host_id": host_id, "attachments": attachments}
 
 
@@ -585,6 +632,9 @@ def finish_attempt(attempt_id: str, ok: bool, output: str | None, error: str | N
                 j=job["id"], a=attempt_id, e=status,
                 p=json.dumps({"elapsed": elapsed}, ensure_ascii=False),
             )
+            # CORE-02: задание закрыто — его checkout свободен для следующего.
+            from . import resources
+            resources.release_for_job(conn, job["id"])
             conn.run("commit")
         except Exception:
             conn.run("rollback")
@@ -614,6 +664,9 @@ def cancel_job(job_id: str) -> str:
             conn.run(_qualify(
                 "insert into aihub.job_events(job_id, event) values (:j, :e)"), j=job_id, e=status,
             )
+            if status == "cancelled":
+                from . import resources
+                resources.release_for_job(conn, job_id)
             conn.run("commit")
         except Exception:
             conn.run("rollback")
@@ -643,6 +696,12 @@ def expire_leases() -> int:
                      from expired e
                     where j.id = e.job_id and j.status = 'running'
                    returning j.id
+               ),
+               res as (
+                   update aihub.resource_leases
+                      set released_at = now(), lease_until = now(), job_id = null, holder = null
+                    where job_id in (select job_id from expired)
+                   returning 1
                ),
                ev as (
                    insert into aihub.job_events(job_id, attempt_id, event)

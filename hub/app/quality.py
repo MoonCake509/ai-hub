@@ -92,6 +92,11 @@ def select_cases(case_count: int, case_ids: list[str] | None = None) -> list[dic
     return [json.loads(json.dumps(case, ensure_ascii=False)) for case in selected]
 
 
+def _normalize_ocr(value: str) -> str:
+    """Compare OCR output by the characters it actually produced."""
+    return re.sub(r"[^A-Z0-9]", "", (value or "").upper())
+
+
 def _strip_json_fence(text: str) -> str:
     value = text.strip()
     match = re.fullmatch(r"```(?:json)?\s*([\s\S]*?)\s*```", value, re.IGNORECASE)
@@ -113,6 +118,13 @@ def grade(case_snapshot: dict[str, Any], response: str | None) -> dict[str, Any]
         actual = int(match.group(1)) if match else None
         passed = actual == expected
         return {"passed": passed, "reason": "Числовой ответ совпал." if passed else "Нужен только целый ответ; получено другое значение."}
+    if kind == "ocr-normalized":
+        expected = _normalize_ocr(str(check.get("value", "")))
+        actual = _normalize_ocr(text)
+        passed = bool(expected) and actual == expected
+        return {"passed": passed,
+                "reason": ("Распознанный текст совпал после нормализации символов." if passed
+                           else "Распознанный текст не совпал с ожидаемым.")}
     if kind == "json-object":
         try:
             value = json.loads(_strip_json_fence(text))
@@ -249,6 +261,11 @@ def _sum_attempt_usage(attempts: list[dict[str, Any]]) -> dict[str, Any] | None:
 
 def _refresh_item(run_id: str, item: dict[str, Any]) -> dict[str, Any]:
     from . import db, quality_db
+    from .quality_quick import SKIPPED_STATES
+    if item.get("status") in SKIPPED_STATES:
+        # A probe that never ran keeps its reason; grading it would turn a
+        # partial result into a fake failure.
+        return item
     job_id = item.get("job_id")
     if not job_id:
         return item
@@ -315,6 +332,10 @@ def _aggregate(run: dict[str, Any]) -> None:
         status = "failed"
     elif finished:
         status = "completed"
+    elif run.get("budget_exhausted"):
+        # All work accepted before the cap has been observed. Probes that never
+        # ran are explicit partial results, not permanently running jobs.
+        status = "completed"
     elif any(state == "running" for state in states):
         status = "running"
     elif any(state in ("queued", "pending", "starting") for state in states):
@@ -364,11 +385,46 @@ def _aggregate(run: dict[str, Any]) -> None:
     })
 
 
+def _apply_quick_budget(run: dict[str, Any]) -> dict[str, Any]:
+    """Stop accepting/awaiting work once a quick run's wall cap has passed."""
+    from . import db, quality_db, quality_quick
+    if run.get("mode") != "quick" or not isinstance(run.get("budget_s"), int):
+        return run
+    created = _as_datetime(run.get("created_at"))
+    if not created:
+        return run
+    from datetime import datetime, timezone
+    elapsed = (datetime.now(timezone.utc) - created).total_seconds()
+    if not quality_quick.budget_exhausted(run, elapsed):
+        return run
+    reason = quality_quick.skip_reason(run)
+    for item in run.get("items") or []:
+        if item.get("status") not in quality_quick.PENDING_STATES:
+            continue
+        # A queued job is safe to withdraw before it gets a lease. A running
+        # job is not silently called stopped; the existing lease/timeout path
+        # remains its final authority, while this probe is reported partial.
+        if item.get("job_id") and item.get("status") in ("queued", "pending", "starting"):
+            db.cancel_job(item["job_id"])
+        quality_db.mark_item_skipped(item["id"], "budget_exhausted", reason)
+    quality_db.mark_budget_exhausted(run["id"], reason)
+    return quality_db.get_run(run["id"]) or run
+
+
 def refresh_run(run_id: str) -> dict[str, Any] | None:
     from . import quality_db
     run = quality_db.get_run(run_id)
     if not run:
         return None
+    run = _apply_quick_budget(run)
+    snapshot = quality_db.get_run(run_id)
+    if snapshot:
+        cases = (snapshot.get("suite_snapshot") or {}).get("cases") or []
+        for item in snapshot.get("items") or []:
+            case = next((row for row in cases if row.get("id") == item.get("case_id")), None)
+            if case and "fixture" in case:
+                item.setdefault("fixture", case["fixture"])
+        run = snapshot
     for item in run.get("items") or []:
         _refresh_item(run_id, item)
     run = quality_db.get_run(run_id)
@@ -400,7 +456,10 @@ def public_run(run: dict[str, Any], include_items: bool = True) -> dict[str, Any
         "id", "suite_id", "suite_version", "grader_version", "channel_id", "agent_id",
         "profile", "model", "case_count", "timeout_s", "status", "created_at", "started_at",
         "finished_at", "passed_count", "failed_count", "score", "queue_wait_seconds",
-        "execution_seconds", "wall_seconds", "total_usage", "error")}
+        "execution_seconds", "wall_seconds", "total_usage", "error",
+        "mode", "budget_s", "max_calls", "budget_exhausted")}
+    from . import quality_quick
+    result["verdict"] = quality_quick.verdict(run)
     result["identity_note"] = IDENTITY_NOTE
     result["cost"] = None
     result["first_token_latency_seconds"] = None
@@ -421,7 +480,8 @@ def public_run(run: dict[str, Any], include_items: bool = True) -> dict[str, Any
                 "grader_reason", "raw_response", "error", "queue_wait_seconds", "execution_seconds",
                 "wall_seconds", "usage", "cost", "first_token_latency_seconds", "reported_model",
                 "identity_evidence_source", "finished_at")}
-                | {"case": {key: case.get(key) for key in ("id", "title", "category", "description")},
+                | {"case": {key: (case.get(key) if key != "fixture" else (case.get("fixture") or item.get("fixture")))
+                            for key in ("id", "title", "category", "description", "fixture") if key in case or key == "fixture"},
                    "requested_model": run.get("model"), "requested_profile": run.get("profile"),
                    "identity_note": IDENTITY_NOTE, "attempts": attempts})
         result["items"] = items

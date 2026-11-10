@@ -13,7 +13,7 @@ import argparse
 import importlib.util
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import re
 import subprocess
 import sys
@@ -60,7 +60,22 @@ def validated(config, request):
     snapshot = request.get('snapshot') or {}
     require(snapshot.get('read_only') is True, 'read-only snapshot required')
     raw = snapshot.get('path')
-    require(isinstance(raw, str) and Path(raw).is_absolute(), 'absolute snapshot required')
+    require(isinstance(raw, str), 'absolute snapshot required')
+    if re.match(r'^[a-zA-Z]:[\\/]', raw):
+        original = PureWindowsPath(raw)
+        require('..' not in original.parts, 'snapshot traversal refused')
+        mapped = None
+        for mapping in config.get('windows_roots', []):
+            source = PureWindowsPath(mapping['source'])
+            target = Path(mapping['target'])
+            require(source.is_absolute() and source.drive and not source.drive.startswith('\\\\')
+                    and target.is_absolute(), 'invalid admin path mapping')
+            if source in original.parents:
+                require(mapped is None, 'ambiguous admin path mapping')
+                mapped = target.joinpath(*original.relative_to(source).parts)
+        require(mapped is not None, 'Windows snapshot has no configured local WSL mapping')
+        raw = str(mapped)
+    require(Path(raw).is_absolute(), 'absolute snapshot required')
     path = Path(raw)
     require(path.is_dir() and not path.is_symlink(), 'snapshot unavailable')
     require(path.absolute() == path.resolve(), 'symlink snapshot ancestor refused')

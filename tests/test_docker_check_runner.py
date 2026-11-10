@@ -87,6 +87,24 @@ print(json.dumps(dict(host_file=Path(%r).exists(),secret=os.environ.get('AIHUB_R
         code, result = invoke(['python','hello.py'],mutate=lambda r:r['snapshot'].update(path=str(base)))
         assert code != 0 and result.get('error'), result
         results['outside_managed_root_rejected'] = True
+        # An explicit operator mapping of the same Windows drive into WSL, not a
+        # fallback to another host. This fixture lives on the actual R: mount.
+        mapped_parent = ROOT/'tmp'
+        mapped_parent.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='runner-map-',dir=mapped_parent) as mapped_folder:
+            mapped = Path(mapped_folder)
+            (mapped/'mapped.py').write_text("print('MAPPED-OK')\n")
+            windows_root = str(mapped_parent).replace('/mnt/r/', 'R:\\').replace('/', '\\')
+            windows_path = str(mapped).replace('/mnt/r/', 'R:\\').replace('/', '\\')
+            mapped_config = dict(config,allowed_roots=[str(mapped_parent)],
+                                 windows_roots=[{'source':windows_root,'target':str(mapped_parent)}])
+            config_path.write_text(json.dumps(mapped_config))
+            def mapped_request(r):
+                r['snapshot'].update(path=windows_path,tree_digest=host.tree_digest(str(mapped)))
+            code,result = invoke(['python','mapped.py'],mutate=mapped_request)
+            assert code == 0 and result['exit_code'] == 0 and result['stdout'].strip() == 'MAPPED-OK', result
+            results['explicit_same_device_windows_mapping'] = True
+            config_path.write_text(json.dumps(config))
         (snapshot/'escape').symlink_to(sentinel)
         code, result = invoke(['python','hello.py'],digest_override='0'*64)
         assert code != 0 and result.get('error'), result

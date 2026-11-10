@@ -1513,6 +1513,12 @@ async def run_create(request: Request) -> JSONResponse:
     return JSONResponse(status_code=202, content=result)
 
 
+@app.get("/runs", dependencies=[Depends(require_token)])
+async def runs_list(project_id: str | None = None, limit: int = 30) -> dict:
+    items = await asyncio.to_thread(runs_ctrl.list_runs, project_id, max(1, min(limit, 100)))
+    return {"count": len(items), "items": items}
+
+
 @app.get("/runs/{run_id}", dependencies=[Depends(require_token)])
 async def run_get(run_id: str) -> dict:
     item = await asyncio.to_thread(runs_ctrl.get_run, run_id)

@@ -86,6 +86,13 @@
       <div class="more-wrap"><button id="more" type="button" hidden>Показать ещё</button></div>
     </div>
   </section>
+  <section class="panel runs-panel" aria-labelledby="runs-title">
+    <div class="panel-head"><div><div class="eyebrow">FLOW</div><h2 id="runs-title">Запуски процесса</h2></div>
+      <div class="recon-toolbar"><button type="button" class="ghost small" id="runs-refresh">Обновить</button></div></div>
+    <p class="hint" id="runs-status" role="status" aria-live="polite">Загрузка запусков…</p>
+    <div id="runs-list" class="runs-list"></div>
+    <section id="run-detail" class="run-detail" hidden aria-live="polite"></section>
+  </section>
   <section class="panel recon-panel" aria-labelledby="recon-title">
     <div class="panel-head"><div><div class="eyebrow">CORE-03</div><h2 id="recon-title">Исключения и сверка</h2></div><div class="recon-toolbar">
       <label>Решение<select id="recon-decision-state"><option value="unresolved">Открытые</option><option value="accepted_historical">Принятые как исторические</option><option value="rejected">Отклонённые</option><option value="all">Все</option></select></label>

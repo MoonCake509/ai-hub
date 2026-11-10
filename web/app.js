@@ -445,6 +445,56 @@ async function loadAgentProfiles(agentId) {
   }
 }
 
+// FLOW-04: запуски процесса — состояние читается из базы, браузер ничего не держит.
+const RUN_STATE_RU = {active:'идёт', paused:'пауза', cancelled:'отменён', done:'завершён', failed:'ошибка'};
+const TASK_STATE_RU = {pending:'ожидает', dispatched:'выдан', running:'в работе', done:'готово',
+  failed:'ошибка', skipped:'пропущен', cancelled:'отменён'};
+
+async function loadRuns() {
+  const box = $('#runs-list');
+  const status = $('#runs-status');
+  if (!box) return;
+  try {
+    const data = await api('/runs?limit=30');
+    const items = data.items || [];
+    status.textContent = items.length ? 'Запусков: ' + items.length : 'Запусков пока нет';
+    box.replaceChildren();
+    for (const run of items) {
+      const row = el('article', 'run-row');
+      const head = el('div', 'run-head');
+      head.append(el('strong', '', (run.template_id || 'запуск') + ' · ' + run.id.slice(0, 8)));
+      head.append(el('span', 'badge run-' + run.state, RUN_STATE_RU[run.state] || run.state));
+      head.append(el('span', 'muted', (run.done || 0) + ' из ' + (run.total || 0) +
+        (run.current ? ' · сейчас: ' + run.current : '')));
+      row.append(head);
+      const bar = el('div', 'run-bar');
+      const fill = el('span', 'run-bar-fill');
+      fill.style.width = Math.round(100 * (run.done || 0) / Math.max(1, run.total || 0)) + '%';
+      bar.append(fill);
+      row.append(bar);
+      const actions = el('div', 'row');
+      const act = (label, action) => {
+        const button = el('button', 'ghost small', label);
+        button.type = 'button';
+        button.onclick = async () => {
+          button.disabled = true;
+          try { await api('/runs/' + run.id + '/' + action, {method: 'POST'}); await loadRuns(); }
+          catch (error) { status.textContent = 'Не удалось: ' + error.message; }
+          finally { button.disabled = false; }
+        };
+        return button;
+      };
+      if (run.state === 'active') { actions.append(act('Выполнить шаг', 'dispatch'), act('Пауза', 'pause')); }
+      if (run.state === 'paused') actions.append(act('Продолжить', 'resume'));
+      if (run.state === 'active' || run.state === 'paused') actions.append(act('Отменить', 'cancel'));
+      row.append(actions);
+      box.append(row);
+    }
+  } catch (error) {
+    status.textContent = 'Не удалось загрузить запуски: ' + error.message;
+  }
+}
+
 // ADAPTER-01: возможности канала под селектором модели. Выключенное — с причиной.
 const CAP_RU = {text:'текст',patch:'файлы',workdir:'каталог',commands:'команды',
   usage:'usage',streaming:'поток',stop:'остановка',output_control:'лимит вывода'};
@@ -777,7 +827,7 @@ const WS={projects:[],project:null,convs:[],conv:null,roles:{},atts:[],messages:
 function toast(message,error=false){const box=$('#toast');box.textContent=message;box.classList.toggle('error',error);box.hidden=false;clearTimeout(toast.timer);toast.timer=setTimeout(()=>box.hidden=true,5500)}
 function workspaceError(error){const text=String(error?.message||error);if(text==='unauthorized')return;$('#workspace-error-text').textContent=text.includes('404')||text==='Not Found'?'Сервер ещё не обновлён: API проектов недоступен. Обновите backend вместе с интерфейсом.':text;$('#workspace-error').hidden=false}
 function action(fn){return async(...args)=>{try{return await fn(...args)}catch(error){workspaceError(error);toast(error.message||String(error),true)}}}
-function switchView(name){WS.view=name;document.querySelectorAll('.tab').forEach(b=>{b.classList.toggle('active',b.dataset.view===name);b.setAttribute('aria-pressed',String(b.dataset.view===name))});$('#view-workspace').hidden=name!=='workspace';$('#view-ops').hidden=name!=='ops';$('#detail').hidden=true;currentJob=null;if(name==='workspace'&&token)wsRefreshAll().catch(workspaceError);if(name==='ops'&&token){loadJobs();loadAgents().catch(error=>{if(error.message!=='unauthorized')$('#health-text').textContent='ошибка наблюдений: '+error.message});reconLoad(false)}}
+function switchView(name){WS.view=name;document.querySelectorAll('.tab').forEach(b=>{b.classList.toggle('active',b.dataset.view===name);b.setAttribute('aria-pressed',String(b.dataset.view===name))});$('#view-workspace').hidden=name!=='workspace';$('#view-ops').hidden=name!=='ops';$('#detail').hidden=true;currentJob=null;if(name==='workspace'&&token)wsRefreshAll().catch(workspaceError);if(name==='ops'&&token){loadJobs();loadRuns();loadAgents().catch(error=>{if(error.message!=='unauthorized')$('#health-text').textContent='ошибка наблюдений: '+error.message});reconLoad(false)}}
 function putOptions(select,items,value){select.replaceChildren();for(const item of items){const option=el('option','',item.name||item.id);option.value=item.id;select.append(option)}if(items.some(x=>x.id===value))select.value=value;else if(items.length)select.value=items[0].id}
 function roleInfo(id){return ROLE_META[id]||[id,'?','']}
 function selectedAssignment(){return WS.roles[WS.roleId]||{role_id:WS.roleId,agent_id:'codex',profile:'',model:'',instructions:''}}

@@ -110,6 +110,35 @@ def event(conn, run_id: str, task_id: str | None, name: str, payload: dict | Non
         r=run_id, t=task_id, e=name,
         p=json.dumps(payload or {}, ensure_ascii=False))
 
+def list_runs(project_id: str | None = None, limit: int = 30) -> list[dict]:
+    """Список запусков с прогрессом: интерфейс восстанавливает состояние из базы."""
+    with db._lock:
+        conn = db.connect()
+        if project_id:
+            rows = db._rows(conn, db._qualify(
+                "select r.*, (select count(*) from aihub.run_tasks t where t.run_id = r.id) as total,"
+                " (select count(*) from aihub.run_tasks t where t.run_id = r.id and t.state = 'done') as done,"
+                " (select t.key from aihub.run_tasks t where t.run_id = r.id and t.state in ('dispatched','running') limit 1) as current"
+                " from aihub.runs r where r.project_id = :p order by r.created_at desc limit :l"),
+                p=project_id, l=int(limit))
+        else:
+            rows = db._rows(conn, db._qualify(
+                "select r.*, (select count(*) from aihub.run_tasks t where t.run_id = r.id) as total,"
+                " (select count(*) from aihub.run_tasks t where t.run_id = r.id and t.state = 'done') as done,"
+                " (select t.key from aihub.run_tasks t where t.run_id = r.id and t.state in ('dispatched','running') limit 1) as current"
+                " from aihub.runs r order by r.created_at desc limit :l"), l=int(limit))
+    out = []
+    for row in rows:
+        item = dict(row)
+        for key in ("created_at", "updated_at", "finished_at"):
+            if item.get(key) is not None:
+                item[key] = item[key].isoformat()
+        if isinstance(item.get("policy"), str):
+            item["policy"] = json.loads(item["policy"] or "{}")
+        out.append(item)
+    return out
+
+
 def get_run(run_id: str) -> dict | None:
     with db._lock:
         conn = db.connect()

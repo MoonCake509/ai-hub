@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import getpass
+import hashlib
 import json
 import msvcrt
 import os
@@ -107,9 +108,14 @@ def deliver(path: str) -> bool:
             and isinstance(resp, dict)
             and resp.get("ok") is True
             and resp.get("recorded") is True
-            and outcome in ("applied", "duplicate", "late", "stale")
+            and outcome in ("applied", "duplicate", "late", "stale", "unknown")
         )
         if confirmed:
+            if (workspace_host is not None
+                    and (payload.get("usage") or {}).get("workspace_op") == "apply_patch"):
+                workspace_host.mark_effect_reported(
+                    payload.get("job_id") or "", payload.get("attempt_id") or "",
+                    hashlib.sha256(base.rstrip("/").lower().encode("utf-8")).hexdigest())
             try:
                 os.remove(path)
             except OSError as exc:
@@ -135,6 +141,27 @@ def drain_outbox() -> None:
             deliver(os.path.join(OUTBOX, name))
 
 
+def drain_workspace_effect_journals(base: str) -> None:
+    """Report durable apply_patch journals left by a prior process crash."""
+    if workspace_host is None:
+        return
+    hub_identity = hashlib.sha256(base.rstrip("/").lower().encode("utf-8")).hexdigest()
+    for payload in workspace_host.pending_effect_payloads(hub_identity):
+        path = outbox_path(payload["job_id"], payload["attempt_id"])
+        if not os.path.exists(path):
+            tmp_path = path + ".tmp"
+            try:
+                with open(tmp_path, "w", encoding="utf-8") as fh:
+                    json.dump(payload, fh, ensure_ascii=False)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp_path, path)
+            except OSError as exc:
+                log(f"could not persist effect journal outbox: {type(exc).__name__}")
+                continue
+        deliver(path)
+
+
 def attempt_heartbeat_interval(lease: int, advertised=None) -> int:
     """Интервал подтверждения аренды: треть аренды, но не больше минуты.
 
@@ -149,17 +176,29 @@ def attempt_heartbeat_interval(lease: int, advertised=None) -> int:
 
 
 def heartbeat_loop(base: str, attempt_id: str, lease: int, stop: threading.Event,
-                   advertised=None) -> None:
+                   advertised=None, resource_generation: int | None = None,
+                   resource_key: str | None = None, lease_lost: threading.Event | None = None) -> None:
     interval = attempt_heartbeat_interval(lease, advertised)
     while not stop.wait(interval):
         try:
-            code, resp = http("POST", f"{base}/bridge/heartbeat",
-                              {"attempt_id": attempt_id, "hb_interval_s": interval}, timeout=30)
-            if code == 200 and not resp.get("ok"):
-                log(f"heartbeat rejected for {attempt_id} (lease lost)")
+            body = {"attempt_id": attempt_id, "hb_interval_s": interval}
+            if resource_generation is not None:
+                body["resource_generation"] = resource_generation
+            code, resp = http("POST", f"{base}/bridge/heartbeat", body, timeout=30)
+            resource = resp.get("resource") or {}
+            if (code != 200 or not resp.get("ok")
+                    or (resource_generation is not None
+                        and (resource.get("generation") != resource_generation
+                             or resource.get("key") != resource_key))):
+                log(f"heartbeat rejected for {attempt_id} (lease not verified)")
+                if lease_lost is not None:
+                    lease_lost.set()
                 return
         except Exception as exc:  # noqa: BLE001
             log(f"heartbeat error {attempt_id}: {exc}")
+            if lease_lost is not None:
+                lease_lost.set()
+            return
 
 
 LOCK_PATH = os.path.join(HERE, "worker.lock")
@@ -278,16 +317,34 @@ def run_workspace_job(job: dict, base: str) -> dict:
     job_id = job.get("id")
     attempt_id = job.get("attempt_id")
     lease = int(job.get("lease_seconds") or 300)
+    resource = job.get("resource") or {}
+    generation = resource.get("generation")
     stop = threading.Event()
     threading.Thread(target=heartbeat_loop,
-                     args=(base, attempt_id, lease, stop, job.get("heartbeat_interval_s")),
+                     args=(base, attempt_id, lease, stop, job.get("heartbeat_interval_s"), generation),
                      daemon=True).start()
+
+    def verify_fence() -> bool:
+        if not resource.get("key") or not isinstance(generation, int):
+            return False
+        try:
+            code, resp = http("POST", f"{base}/bridge/heartbeat",
+                              {"attempt_id": attempt_id, "resource_generation": generation}, timeout=15)
+            live = resp.get("resource") or {}
+            return (code == 200 and bool(resp.get("ok"))
+                    and live.get("key") == resource.get("key")
+                    and live.get("generation") == generation)
+        except Exception as exc:  # noqa: BLE001
+            log(f"fence verification failed for {attempt_id}: {type(exc).__name__}")
+            return False
     try:
         if workspace_host is None:
             payload = {"job_id": job_id, "attempt_id": attempt_id, "ok": False,
                        "error": "host не поддерживает workspace-операции"}
         else:
-            payload = workspace_host.run_job(job)
+            payload = workspace_host.run_job(
+                job, fence_check=verify_fence,
+                hub_identity=hashlib.sha256(base.rstrip("/").lower().encode("utf-8")).hexdigest())
         log(f"workspace job {job_id} op={(payload.get('usage') or {}).get('workspace_op')} "
             f"ok={payload.get('ok')} {str(payload.get('error') or '')[:160]}")
     except Exception as exc:  # noqa: BLE001
@@ -321,6 +378,7 @@ def main() -> int:
     send_worker_heartbeat(base)
     print(f"aihub agent polling {base} as {WORKER}")
     drain_outbox()
+    drain_workspace_effect_journals(base)
 
     while True:
         try:
@@ -397,8 +455,12 @@ def main() -> int:
             if paths:
                 prompt += "\n\nФайлы приложены и доступны по путям:\n" + "\n".join(paths)
         stop = threading.Event()
+        lease_lost = threading.Event()
+        resource_generation = (job.get("resource") or {}).get("generation")
         threading.Thread(target=heartbeat_loop,
-                         args=(base, attempt_id, lease, stop, job.get("heartbeat_interval_s")),
+                         args=(base, attempt_id, lease, stop, job.get("heartbeat_interval_s"),
+                               resource_generation, (job.get("resource") or {}).get("key"),
+                               lease_lost),
                          daemon=True).start()
 
         log(f"job {job_id} attempt={attempt_id} agent={agent_id} timeout={timeout} "
@@ -435,6 +497,13 @@ def main() -> int:
             payload = {"job_id": job_id, "attempt_id": attempt_id, "ok": False, "error": str(exc)}
         finally:
             stop.set()
+
+        if lease_lost.is_set() and (job.get("resource") or {}).get("key"):
+            # Native adapter processes cannot be fenced between filesystem
+            # syscalls. Preserve their outcome as unknown and let the Hub
+            # quarantine the checkout instead of reporting a definite write.
+            payload["uncertain"] = True
+            payload["error"] = payload.get("error") or "heartbeat lost during native execution"
 
         payload["elapsed_total"] = round(time.time() - started, 2)
         path = outbox_path(job_id, attempt_id)

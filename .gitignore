@@ -18,3 +18,10 @@ infra/certs/*.key
 # рабочие дампы БД не входят в дерево исходников
 backups/
 *.dump
+
+# CORE-03 stage-only artifacts
+infra/.core03-token
+infra/.env.core03
+forensics/
+tools/q.sh
+.core03-*

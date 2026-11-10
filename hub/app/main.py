@@ -13,6 +13,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -24,12 +25,15 @@ from fastapi.responses import JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from . import chat_context, db, observations, probes, quality, quality_db, quality_quick, workers
+from . import reconciliation
 from . import protocol as bridge_protocol
 from . import resources
 from . import workspace
 from .image_validation import validate_image
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
+_build_sha = os.environ.get("HUB_BUILD_SHA", "").strip().lower()
+BUILD_SHA = _build_sha if re.fullmatch(r"[0-9a-f]{40,64}", _build_sha) else None
 LITELLM_URL = os.environ.get("LITELLM_URL", "http://litellm:4000").rstrip("/")
 MASTER_KEY = os.environ.get("LITELLM_MASTER_KEY", "")
 HUB_TOKEN = os.environ.get("HUB_TOKEN", "")
@@ -121,7 +125,8 @@ async def health() -> dict:
         db_ok = True
     except Exception as exc:  # noqa: BLE001
         db_ok = str(exc)[:120]
-    return {"status": "ok", "service": "hub-agent", "version": VERSION, "db": db_ok}
+    return {"status": "ok", "service": "hub-agent", "version": VERSION,
+            "build_sha": BUILD_SHA, "db": db_ok}
 
 
 def with_observations(item: dict, summary: dict | None = None) -> dict:
@@ -1349,7 +1354,8 @@ async def workspace_job_create(request: Request) -> JSONResponse:
             payload.get("timeout_s"),
         )
     except workspace.OpError as exc:
-        return JSONResponse(status_code=400, content={"error": exc.as_dict()})
+        status = 409 if exc.code == "idempotency_conflict" else 400
+        return JSONResponse(status_code=status, content={"error": exc.as_dict()})
     job = result["job"]
     return JSONResponse({
         "job_id": job["id"],
@@ -1372,6 +1378,47 @@ async def workspace_job_get(job_id: str) -> dict:
     if not result:
         raise HTTPException(status_code=404, detail="unknown job")
     return result
+
+
+@app.get("/workspace/reconciliation/cases", dependencies=[Depends(require_token)])
+async def workspace_reconciliation_cases(
+        cursor: str | None = None, limit: int = 50,
+        decision_state: str = "unresolved", job_status: str = "all") -> dict:
+    try:
+        return await asyncio.to_thread(reconciliation.list_cases, cursor, limit,
+                                       decision_state, job_status)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+
+
+@app.get("/workspace/reconciliation/cases/{case_id}", dependencies=[Depends(require_token)])
+async def workspace_reconciliation_case(case_id: str) -> dict:
+    result = await asyncio.to_thread(reconciliation.get_case, case_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="unknown reconciliation case")
+    return result
+
+
+@app.post("/workspace/reconciliation/cases/{case_id}/decision",
+          dependencies=[Depends(require_token)])
+async def workspace_reconciliation_decide(case_id: str, request: Request) -> dict:
+    if not HUB_TOKEN:
+        raise HTTPException(status_code=503, detail="reconciliation requires configured Hub authentication")
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="request body must be an object")
+    try:
+        # The API has a shared bearer token, so the auditable principal is the
+        # token holder; a client-supplied actor field is deliberately ignored.
+        return await asyncio.to_thread(
+            reconciliation.decide, case_id, payload.get("action"),
+            payload.get("expected_revision"), payload.get("reason"), "hub-token-holder")
+    except reconciliation.CaseNotFound:
+        raise HTTPException(status_code=404, detail="unknown reconciliation case") from None
+    except reconciliation.DecisionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
 
 
 @app.get("/workers", dependencies=[Depends(require_token)])
@@ -1433,7 +1480,8 @@ async def bridge_heartbeat(request: Request) -> dict:
     attempt_id = payload.get("attempt_id")
     if not attempt_id:
         raise HTTPException(status_code=400, detail="attempt_id is required")
-    detail = await asyncio.to_thread(db.heartbeat_detail, attempt_id, LEASE_SECONDS)
+    detail = await asyncio.to_thread(db.heartbeat_detail, attempt_id, LEASE_SECONDS,
+                                     payload.get("resource_generation"))
     if detail is None:
         return {"ok": False, "lease_seconds": LEASE_SECONDS}
     if detail["attempt_protocol"] != detail["job_protocol"]:
@@ -1447,7 +1495,8 @@ async def bridge_heartbeat(request: Request) -> dict:
     risk = bridge_protocol.lease_risk(reported, LEASE_SECONDS) if reported is not None else None
     return {"ok": True, "lease_seconds": LEASE_SECONDS,
             "heartbeat_interval_s": interval, "lease_risk": risk,
-            "protocol": detail["job_protocol"]}
+            "protocol": detail["job_protocol"],
+            "resource": detail.get("resource")}
 
 
 @app.post("/bridge/result", dependencies=[Depends(require_token)])
@@ -1468,9 +1517,12 @@ async def bridge_result(request: Request) -> dict:
         payload.get("usage") or {},
         payload.get("elapsed"),
         payload.get("job_id"),
+        bool(payload.get("uncertain")),
     )
     if outcome == "not_found":
         raise HTTPException(status_code=404, detail="unknown attempt")
+    if outcome == "attempt_mismatch":
+        raise HTTPException(status_code=409, detail="job_id does not match attempt")
     if payload.get("job_id"):
         await asyncio.to_thread(quality.refresh_job, payload["job_id"])
     # Задание из чата: ответ агента дописывается в сообщение-«ожидание».
@@ -1484,7 +1536,7 @@ async def bridge_result(request: Request) -> dict:
             print("chat finish failed:", exc)
     # CORE-02b: результат управляемой операции фиксируется как durable receipt —
     # поздний повтор с тем же ключом вернёт его, а не применит патч заново.
-    if outcome == "applied" and payload.get("job_id"):
+    if outcome in ("applied", "unknown", "late", "duplicate") and payload.get("job_id"):
         try:
             job_row = await asyncio.to_thread(db.get_job, payload["job_id"])
             if (job_row or {}).get("kind") == "workspace":
@@ -1495,23 +1547,38 @@ async def bridge_result(request: Request) -> dict:
                 except ValueError:
                     parsed = {"raw": body[:2000]}
                 snap = job_row.get("run_snapshot") or {}
-                await asyncio.to_thread(
-                    db.record_workspace_receipt,
-                    job_row.get("idempotency_key") or "",
-                    envelope.get("op") or "",
-                    snap.get("host_id") or "",
-                    payload["job_id"],
-                    envelope.get("digest") or "",
-                    "applied" if payload.get("ok") else "failed",
-                    parsed,
-                    hashlib.sha256(body.encode("utf-8")).hexdigest() if body else None,
-                )
+                key = job_row.get("idempotency_key") or ""
+                existing_receipt = await asyncio.to_thread(db.workspace_receipt, key)
+                # A late artifact may follow a previously recorded uncertain
+                # receipt for this attempt. Keep the first immutable receipt;
+                # the late payload remains separately stored by finish_attempt.
+                record_late = (outcome != "late" or not existing_receipt or
+                               (existing_receipt.get("status") == "pending"
+                                and not existing_receipt.get("attempt_id")))
+                if record_late:
+                    if outcome == "late":
+                        receipt_status = "late"
+                    elif outcome == "unknown" or job_row.get("status") == "unknown":
+                        receipt_status = "unknown"
+                    elif job_row.get("status") == "succeeded":
+                        receipt_status = "applied"
+                    else:
+                        receipt_status = "failed"
+                    await asyncio.to_thread(
+                        db.record_workspace_receipt, key, envelope.get("op") or "",
+                        snap.get("host_id") or "", payload["job_id"],
+                        envelope.get("digest") or "", receipt_status, parsed,
+                        hashlib.sha256(body.encode("utf-8")).hexdigest() if body else None,
+                        attempt_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
         except Exception as exc:  # noqa: BLE001
-            print("workspace receipt failed:", exc, flush=True)
+            print("workspace receipt failed:", type(exc).__name__, flush=True)
+            raise HTTPException(status_code=503, detail="workspace receipt was not durably recorded") from None
 
     # late/stale: результат сохранён в late_results — воркер может удалять outbox,
     # но задание не переоткрывается и статус не переписывается.
-    return {"ok": outcome in ("applied", "duplicate", "late", "stale"),
+    return {"ok": outcome in ("applied", "duplicate", "late", "stale", "unknown"),
             "outcome": outcome, "recorded": outcome != "not_found"}
 
 

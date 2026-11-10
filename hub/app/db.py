@@ -195,6 +195,19 @@ DDL = [
         created_at timestamptz not null default now(),
         updated_at timestamptz not null default now()
     )""",
+    "alter table aihub.workspace_receipts add column if not exists attempt_id text",
+    "create unique index if not exists workspace_receipts_attempt on aihub.workspace_receipts(attempt_id) where attempt_id is not null",
+    """create table if not exists aihub.workspace_reconciliation_audit (
+        case_id text not null,
+        revision int not null,
+        action text not null,
+        actor text not null,
+        reason text not null,
+        evidence jsonb not null default '{}',
+        created_at timestamptz not null default now(),
+        primary key (case_id, revision)
+    )""",
+    "create index if not exists workspace_reconciliation_audit_created on aihub.workspace_reconciliation_audit(created_at desc, case_id)",
 ]
 
 
@@ -570,7 +583,8 @@ def heartbeat(attempt_id: str, lease_seconds: int = 300) -> bool:
     return heartbeat_detail(attempt_id, lease_seconds) is not None
 
 
-def heartbeat_detail(attempt_id: str, lease_seconds: int = 300) -> dict | None:
+def heartbeat_detail(attempt_id: str, lease_seconds: int = 300,
+                     resource_generation: int | None = None) -> dict | None:
     """Продлить аренду и вернуть версии протокола попытки и задания.
 
     None означает, что продлевать нечего (попытка или задание уже не running):
@@ -578,20 +592,38 @@ def heartbeat_detail(attempt_id: str, lease_seconds: int = 300) -> dict | None:
     """
     with _lock:
         conn = connect()
-        row = _one(
-            conn,
-            """update aihub.job_attempts a
-                  set lease_until = now() + (:lease || ' seconds')::interval
-                from aihub.jobs j
-               where a.id = :a and a.status = 'running' and j.id = a.job_id and j.status = 'running'
-               returning a.id, a.protocol, j.protocol as job_protocol, j.id as job_id""",
-            a=attempt_id, lease=str(int(lease_seconds)),
-        )
-        if not row:
-            return None
-        return {"id": row["id"], "job_id": row["job_id"],
-                "attempt_protocol": int(row["protocol"] or 0),
-                "job_protocol": int(row["job_protocol"] or 0)}
+        conn.run("begin")
+        try:
+            row = _one(
+                conn,
+                """update aihub.job_attempts a
+                      set lease_until = now() + (:lease || ' seconds')::interval
+                    from aihub.jobs j
+                   where a.id = :a and a.status = 'running'
+                     and j.id = a.job_id and j.status = 'running'
+                   returning a.id, a.protocol, j.protocol as job_protocol, j.id as job_id, j.kind,
+                             j.run_snapshot->>'op' as workspace_op""",
+                a=attempt_id, lease=str(int(lease_seconds)),
+            )
+            if not row:
+                conn.run("rollback")
+                return None
+            from . import resources
+            resource = resources.renew_for_job(
+                conn, row["job_id"], resource_generation, lease_seconds)
+            if ((row.get("kind") == "workspace" and row.get("workspace_op") == "apply_patch"
+                     and not resource) or (resource_generation is not None and not resource)):
+                conn.run("rollback")
+                return None
+            conn.run("commit")
+            return {"id": row["id"], "job_id": row["job_id"],
+                    "attempt_protocol": int(row["protocol"] or 0),
+                    "job_protocol": int(row["job_protocol"] or 0),
+                    "resource": ({"key": resource["key"],
+                                  "generation": int(resource["generation"])} if resource else None)}
+        except Exception:
+            conn.run("rollback")
+            raise
 
 
 def _store_late(conn, job_id: str | None, attempt_id: str, attempt_status: str | None,
@@ -602,16 +634,26 @@ def _store_late(conn, job_id: str | None, attempt_id: str, attempt_status: str |
         "ok": ok, "output": output, "error": error,
         "usage": usage or {}, "elapsed": elapsed,
     }, ensure_ascii=False)
-    conn.run(_qualify(
+    inserted = _one(conn, _qualify(
         "insert into aihub.late_results(job_id, attempt_id, attempt_status, payload)"
-        " values (:j, :a, :s, :p::jsonb) on conflict (attempt_id) do nothing"),
-        j=job_id, a=attempt_id, s=attempt_status, p=payload,
-    )
+        " values (:j, :a, :s, :p::jsonb) on conflict (attempt_id) do nothing returning attempt_id"),
+        j=job_id, a=attempt_id, s=attempt_status, p=payload)
+    if inserted:
+        return
+    prior = _one(conn, _qualify(
+        "select job_id, attempt_status, payload from aihub.late_results where attempt_id = :a"),
+        a=attempt_id)
+    prior_payload = _json_object(prior.get("payload")) if prior else None
+    wanted_payload = _json_object(payload)
+    if (not prior or prior.get("job_id") != job_id
+            or prior.get("attempt_status") != attempt_status
+            or prior_payload != wanted_payload):
+        raise ValueError("late_result_attempt_conflict")
 
 
 def finish_attempt(attempt_id: str, ok: bool, output: str | None, error: str | None,
                    usage: dict | None, elapsed: float | None,
-                   job_id_hint: str | None = None) -> str:
+                   job_id_hint: str | None = None, uncertain: bool = False) -> str:
     """Идемпотентно закрывает попытку.
 
     applied   — результат сохранён в задание;
@@ -627,12 +669,17 @@ def finish_attempt(attempt_id: str, ok: bool, output: str | None, error: str | N
             attempt = _one(conn, "select * from aihub.job_attempts where id = :a", a=attempt_id)
             if not attempt:
                 conn.run("rollback")
-                if job_id_hint:
-                    _store_late(conn, job_id_hint, attempt_id, None, ok, output, error, usage, elapsed)
-                    conn.run("commit")
-                    return "late"
                 return "not_found"
+            if job_id_hint and job_id_hint != attempt["job_id"]:
+                conn.run("rollback")
+                return "attempt_mismatch"
             if attempt["status"] in ("succeeded", "failed"):
+                conn.run("rollback")
+                return "duplicate"
+            if (attempt["status"] == "unknown"
+                    and attempt.get("output") == output
+                    and attempt.get("error") == error
+                    and _json_object(attempt.get("usage")) == (usage or {})):
                 conn.run("rollback")
                 return "duplicate"
             if attempt["status"] != "running":
@@ -655,6 +702,30 @@ def finish_attempt(attempt_id: str, ok: bool, output: str | None, error: str | N
                             ok, output, error, usage, elapsed)
                 conn.run("commit")
                 return "stale"
+            if uncertain:
+                conn.run(_qualify(
+                    "update aihub.job_attempts set status = 'unknown', finished_at = now(),"
+                    " output = :o, error = :e, usage = :u::jsonb where id = :a and status = 'running'"),
+                    o=output, e=error, u=json.dumps(usage or {}, ensure_ascii=False), a=attempt_id)
+                conn.run(_qualify(
+                    "update aihub.jobs set status = 'unknown', finished_at = now(),"
+                    " result_output = :o, result_error = :e, result_usage = :u::jsonb,"
+                    " lease_until = null, needs_reconcile = true where id = :j and status = 'running'"),
+                    o=output, e=error, u=json.dumps(usage or {}, ensure_ascii=False), j=job["id"])
+                conn.run(_qualify(
+                    "insert into aihub.job_events(job_id, attempt_id, event, payload)"
+                    " values (:j, :a, 'execution_uncertain', :p::jsonb)"),
+                    j=job["id"], a=attempt_id,
+                    p=json.dumps({"elapsed": elapsed}, ensure_ascii=False))
+                # An unknown outcome may still have a native writer running
+                # after its worker lost heartbeats. Keep the checkout blocked
+                # until explicit recovery; TTL alone must not invite a second
+                # writer into the same tree.
+                conn.run(_qualify(
+                    "update aihub.resource_leases set lease_until = 'infinity'::timestamptz"
+                    " where job_id = :j"), j=job["id"])
+                conn.run("commit")
+                return "unknown"
             status = "succeeded" if ok else "failed"
             conn.run(_qualify(
                 "update aihub.job_attempts set status = :s, finished_at = now(), output = :o,"
@@ -743,7 +814,7 @@ def expire_leases() -> int:
                ),
                res as (
                    update aihub.resource_leases
-                      set released_at = now(), lease_until = now(), job_id = null, holder = null
+                      set lease_until = 'infinity'::timestamptz
                     where job_id in (select job_id from expired)
                    returning 1
                ),
@@ -1239,6 +1310,7 @@ def workspace_receipt(key: str) -> dict | None:
         "job_id": row.get("job_id"),
         "args_digest": row.get("args_digest"),
         "status": row.get("status"),
+        "attempt_id": row.get("attempt_id"),
         "result_digest": row.get("result_digest"),
         "result": result,
         "created_at": _iso(row.get("created_at")),
@@ -1248,23 +1320,57 @@ def workspace_receipt(key: str) -> dict | None:
 
 def record_workspace_receipt(key: str, op: str, host_id: str, job_id: str | None,
                              args_digest: str, status: str, result: dict | None = None,
-                             result_digest: str | None = None) -> dict | None:
-    """Пишет receipt. Повтор с тем же ключом не двигает статус назад."""
+                             result_digest: str | None = None,
+                             attempt_id: str | None = None) -> dict | None:
+    """Write a receipt once, bound to one job/attempt; conflicting replays fail closed."""
     if not key:
         return None
     with _lock:
         conn = connect()
-        conn.run(_qualify(
-            "insert into aihub.workspace_receipts(idempotency_key, op, host_id, job_id,"
-            " args_digest, status, result, result_digest)"
-            " values (:k, :o, :h, :j, :d, :s, :r::jsonb, :rd)"
-            " on conflict (idempotency_key) do update set"
-            "   status = case when aihub.workspace_receipts.status = 'applied'"
-            "                 then aihub.workspace_receipts.status else excluded.status end,"
-            "   job_id = coalesce(excluded.job_id, aihub.workspace_receipts.job_id),"
-            "   result = coalesce(excluded.result, aihub.workspace_receipts.result),"
-            "   result_digest = coalesce(excluded.result_digest, aihub.workspace_receipts.result_digest),"
-            "   updated_at = now()"),
-            k=key, o=op, h=host_id, j=job_id, d=args_digest, s=status,
-            r=json.dumps(result, ensure_ascii=False) if result is not None else None, rd=result_digest)
+        encoded_result = json.dumps(result, ensure_ascii=False) if result is not None else None
+        conn.run("begin")
+        try:
+            if status not in {"pending", "applied", "failed", "unknown", "late"}:
+                raise ValueError("workspace_receipt_status_invalid")
+            if attempt_id:
+                linked_attempt = _one(conn,
+                    "select job_id from aihub.job_attempts where id = :a", a=attempt_id)
+                if not linked_attempt or linked_attempt.get("job_id") != job_id:
+                    raise ValueError("workspace_receipt_attempt_link_mismatch")
+            row = _one(conn, _qualify(
+                "select * from aihub.workspace_receipts where idempotency_key = :k for update"), k=key)
+            if not row:
+                conn.run(_qualify(
+                    "insert into aihub.workspace_receipts(idempotency_key, op, host_id, job_id,"
+                    " args_digest, status, result, result_digest, attempt_id)"
+                    " values (:k, :o, :h, :j, :d, :s, :r::jsonb, :rd, :a)"),
+                    k=key, o=op, h=host_id, j=job_id, d=args_digest, s=status,
+                    r=encoded_result, rd=result_digest, a=attempt_id)
+            else:
+                identity = (row.get("op"), row.get("host_id"), row.get("job_id"), row.get("args_digest"))
+                if identity != (op, host_id, job_id, args_digest):
+                    raise ValueError("workspace_receipt_identity_conflict")
+                if attempt_id is None:
+                    if row.get("status") != status or row.get("attempt_id") is not None:
+                        raise ValueError("workspace_receipt_terminal_conflict")
+                elif row.get("attempt_id") is None and row.get("status") == "pending":
+                    conn.run(_qualify(
+                        "update aihub.workspace_receipts set status = :s, result = :r::jsonb,"
+                        " result_digest = :rd, attempt_id = :a, updated_at = now()"
+                        " where idempotency_key = :k and attempt_id is null and status = 'pending'"),
+                        s=status, r=encoded_result, rd=result_digest, a=attempt_id, k=key)
+                else:
+                    existing_result = row.get("result")
+                    if isinstance(existing_result, str):
+                        try:
+                            existing_result = json.loads(existing_result)
+                        except ValueError:
+                            existing_result = None
+                    if (row.get("attempt_id") != attempt_id or row.get("status") != status
+                            or existing_result != result or row.get("result_digest") != result_digest):
+                        raise ValueError("workspace_receipt_attempt_conflict")
+            conn.run("commit")
+        except Exception:
+            conn.run("rollback")
+            raise
     return workspace_receipt(key)

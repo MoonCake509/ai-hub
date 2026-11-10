@@ -1,0 +1,49 @@
+name: aihub-core03
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: aihub_core03
+      POSTGRES_PASSWORD: ${CORE03_DB_PASSWORD}
+      POSTGRES_DB: aihub_core03
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aihub_core03 -d aihub_core03"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    volumes:
+      - core03_pgdata:/var/lib/postgresql/data
+    logging:
+      options:
+        max-size: "5m"
+        max-file: "2"
+  hub:
+    build:
+      context: ../hub
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://aihub_core03:${CORE03_DB_PASSWORD}@postgres:5432/aihub_core03
+      AGENTS_YAML: /app/config/agents.yaml
+      HUB_TOKEN: ${CORE03_HUB_TOKEN}
+      HUB_BUILD_SHA: ${CORE03_BUILD_SHA}
+      LEASE_SECONDS: "3"
+      MAX_QUEUE: "50"
+      MAX_PROMPT_CHARS: "20000"
+      MAX_RESULT_CHARS: "100000"
+    volumes:
+      - ../hub/app:/app/app:ro
+      - ../web:/app/web:ro
+      - ../config/agents.yaml:/app/config/agents.yaml:ro
+    ports:
+      - "127.0.0.1:8202:8000"
+    command: ["python", "-m", "app.serve"]
+    logging:
+      options:
+        max-size: "5m"
+        max-file: "2"
+volumes:
+  core03_pgdata:
+    driver: local

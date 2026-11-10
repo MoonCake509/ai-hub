@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import fnmatch
 import hashlib
 import json
@@ -24,6 +25,7 @@ import platform
 import re
 import shutil
 import subprocess
+import stat
 import sys
 import tempfile
 import time
@@ -139,17 +141,50 @@ def sha256_file(path: str) -> str:
     return digest.hexdigest()
 
 
+def _safe_regular_file(root: str, path: str) -> os.stat_result:
+    """Refuse links/special files and paths that resolve outside the checkout."""
+    if os.path.islink(path):
+        raise OpFail("symlink_forbidden", f"symbolic link in workspace: {_rel(root, path)}")
+    info = os.stat(path, follow_symlinks=False)
+    if not stat.S_ISREG(info.st_mode):
+        raise OpFail("not_regular_file", f"not a regular file: {_rel(root, path)}")
+    real_root = os.path.normcase(os.path.realpath(root))
+    real_path = os.path.normcase(os.path.realpath(path))
+    if real_path != real_root and not real_path.startswith(real_root + os.sep):
+        raise OpFail("outside_root", f"path outside workspace: {_rel(root, path)}")
+    return info
+
+
+def _check_no_link_components(root: str, rel: str) -> str:
+    """Re-resolve a write target and reject symlink/junction parents at effect time."""
+    full = resolve(root, rel)
+    current = os.path.abspath(root)
+    is_junction = getattr(os.path, "isjunction", lambda _p: False)
+    for part in rel.replace("\\", "/").split("/"):
+        if not part:
+            continue
+        current = os.path.join(current, part)
+        if os.path.lexists(current) and (os.path.islink(current) or is_junction(current)):
+            raise OpFail("symlink_forbidden", f"link in write path: {_rel(root, current)}")
+    return full
+
+
 def walk_files(root: str, limit: int = MAX_WALK):
     """Файлы корня без служебных каталогов. Возвращает (rel, size)."""
     count = 0
-    for base, dirs, names in os.walk(root):
+    for base, dirs, names in os.walk(root, followlinks=False):
+        for d in dirs:
+            full_dir = os.path.join(base, d)
+            if os.path.islink(full_dir):
+                raise OpFail("symlink_forbidden", f"symbolic link directory: {_rel(root, full_dir)}")
         dirs[:] = sorted(d for d in dirs if d.lower() not in DENY_DIRS)
         for name in sorted(names):
             rel = _rel(root, os.path.join(base, name))
             if denied(rel):
                 continue
             try:
-                size = os.path.getsize(os.path.join(base, name))
+                full = os.path.join(base, name)
+                size = _safe_regular_file(root, full).st_size
             except OSError:
                 continue
             yield rel, size
@@ -159,25 +194,19 @@ def walk_files(root: str, limit: int = MAX_WALK):
 
 
 def tree_digest(root: str, files: list[tuple[str, int]] | None = None) -> str:
-    """Digest дерева по содержимому: путь + размер + хеш или mtime для крупных.
-
-    Размер и путь сами по себе не различают две свежие копии шаблона, поэтому
-    база для apply_patch обязана включать содержимое.
-    """
+    """Strong deterministic digest: path, size and content SHA-256 for every file."""
     digest = hashlib.sha256()
     items = files if files is not None else list(walk_files(root))
     for rel, size in sorted(items):
         full = os.path.join(root, *rel.split("/"))
-        if size <= MAX_FILE_HASH:
-            try:
-                mark = sha256_file(full)
-            except OSError:
-                mark = "unreadable"
-        else:
-            try:
-                mark = "mtime:" + str(int(os.path.getmtime(full)))
-            except OSError:
-                mark = "missing"
+        before = _safe_regular_file(root, full)
+        mark = sha256_file(full)
+        after = _safe_regular_file(root, full)
+        if (before.st_size, before.st_mtime_ns, before.st_ino) != (
+                after.st_size, after.st_mtime_ns, after.st_ino):
+            raise OpFail("tree_changed_during_hash", f"file changed while hashing: {rel}")
+        if after.st_size != size:
+            raise OpFail("tree_changed_during_hash", f"file size changed while hashing: {rel}")
         digest.update((rel + "|" + str(size) + "|" + mark + '\n').encode("utf-8"))
     return digest.hexdigest()
 
@@ -309,6 +338,7 @@ def op_snapshot(root: str, args: dict, job_id: str = "") -> dict:
     if os.path.exists(target):
         raise OpFail("snapshot_exists", f"{snap_id}: уже существует")
     os.makedirs(target, exist_ok=False)
+    source_before = tree_digest(root)
     copied = 0
     total = 0
     files = []
@@ -319,6 +349,7 @@ def op_snapshot(root: str, args: dict, job_id: str = "") -> dict:
                          f"{MAX_SNAPSHOT_BYTES} байт")
         src = os.path.join(root, *rel.split("/"))
         dst = os.path.join(target, *rel.split("/"))
+        _safe_regular_file(root, src)
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         try:
             shutil.copy2(src, dst)
@@ -328,6 +359,10 @@ def op_snapshot(root: str, args: dict, job_id: str = "") -> dict:
         total += size
         files.append((rel, size))
     digest = tree_digest(target, files)
+    source_after = tree_digest(root)
+    if source_after != source_before:
+        shutil.rmtree(target, ignore_errors=True)
+        raise OpFail("snapshot_source_changed", "workspace changed while snapshot was copied")
     meta = {
         "id": snap_id,
         "root": os.path.abspath(root),
@@ -335,7 +370,7 @@ def op_snapshot(root: str, args: dict, job_id: str = "") -> dict:
         "files": copied,
         "bytes": total,
         "tree_digest": digest,
-        "source_tree_digest": tree_digest(root),
+        "source_tree_digest": source_after,
         "job_id": job_id,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "host": platform.node(),
@@ -367,92 +402,332 @@ def _receipt_path(job_id: str) -> str:
     return os.path.join(folder, f"{job_id or 'nokey'}.json")
 
 
-def op_apply_patch(root: str, args: dict, job_id: str = "") -> dict:
-    """Применяет write_set после проверки preimages; повтор job_id не применяется дважды."""
+@contextlib.contextmanager
+def _writer_lock(root: str, timeout: float = 90):
+    """Interprocess lock shared by workspace workers on this host."""
+    lock_dir = os.path.join(effect_state_root(), "locks")
+    os.makedirs(lock_dir, exist_ok=True)
+    key = hashlib.sha256(os.path.normcase(os.path.realpath(root)).encode("utf-8")).hexdigest()[:24]
+    path = os.path.join(lock_dir, key + ".lock")
+    fh = open(path, "a+b")
+    acquired = False
+    try:
+        fh.seek(0, os.SEEK_END)
+        if fh.tell() == 0:
+            fh.write(b"0")
+            fh.flush()
+        fh.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                    acquired = True
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise OpFail("writer_busy", "another workspace writer holds this checkout")
+                    time.sleep(0.1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            acquired = True
+        yield
+    finally:
+        if acquired:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            finally:
+                fh.close()
+        else:
+            fh.close()
+
+
+def _write_json_durable(path: str, data: dict) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + "." + uuid.uuid4().hex + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    # POSIX directory fsync makes the rename durable across host power loss.
+    # Windows does not expose a portable directory fsync through Python.
+    if os.name != "nt":
+        dir_fd = os.open(os.path.dirname(path), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+
+
+def effect_state_root() -> str:
+    """Stable per-user durable area, independent of AIHUB_WORKSPACE_DIR overrides."""
+    base = os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_STATE_HOME")
+    if not base:
+        base = os.path.join(os.path.expanduser("~"), ".local", "state")
+    path = os.path.join(os.path.abspath(base), "aihub", "workspace-effects")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _effect_path(root: str, job_id: str, hub_identity: str = "") -> str:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", job_id or ""):
+        raise OpFail("bad_job_id", "apply_patch requires a valid job id")
+    root_key = hashlib.sha256(os.path.normcase(os.path.realpath(root)).encode("utf-8")).hexdigest()[:24]
+    namespace = hashlib.sha256(hub_identity.encode("utf-8")).hexdigest()[:24]
+    folder = os.path.join(effect_state_root(), "effects", root_key, namespace)
+    os.makedirs(folder, exist_ok=True)
+    return os.path.join(folder, job_id + ".json")
+
+
+def pending_effect_payloads(hub_identity: str = "") -> list[dict]:
+    """Return durable effects that need Hub acknowledgement after a worker restart."""
+    base = os.path.join(effect_state_root(), "effects")
+    if not os.path.isdir(base):
+        return []
+    payloads = []
+    for root_key in sorted(os.listdir(base)):
+        root_folder = os.path.join(base, root_key)
+        if not os.path.isdir(root_folder):
+            continue
+        for namespace in sorted(os.listdir(root_folder)):
+            folder = os.path.join(root_folder, namespace)
+            if not os.path.isdir(folder):
+                continue
+            for name in sorted(os.listdir(folder)):
+                if not name.endswith(".json"):
+                    continue
+                try:
+                    with open(os.path.join(folder, name), encoding="utf-8") as fh:
+                        journal = json.load(fh)
+                except (OSError, ValueError):
+                    continue
+                if journal.get("reported") or journal.get("state") not in ("applying", "uncertain", "applied"):
+                    continue
+                if journal.get("hub_identity") != hub_identity:
+                    continue
+                job_id, attempt_id = journal.get("job_id"), journal.get("attempt_id")
+                if not job_id or not attempt_id:
+                    continue
+                if journal.get("state") == "applied" and isinstance(journal.get("result"), dict):
+                    ok, output, error, uncertain = True, json.dumps(journal["result"], ensure_ascii=False), None, False
+                else:
+                    detail = {k: journal.get(k) for k in (
+                        "schema", "state", "job_id", "attempt_id", "resource_generation",
+                        "candidate_digest", "base_tree_digest", "preimage_digest", "write_set", "applied")}
+                    output = json.dumps({"error": {"code": "effect_uncertain",
+                                                     "message": "host restarted with unresolved filesystem effect"},
+                                         "op": "apply_patch", "job_id": job_id,
+                                         "attempt_id": attempt_id, "effect_journal": detail},
+                                        ensure_ascii=False)
+                    ok, error, uncertain = False, "effect_uncertain: host restarted with unresolved filesystem effect", True
+                payloads.append({"job_id": job_id, "attempt_id": attempt_id, "ok": ok,
+                                 "output": output, "error": error, "usage": {"workspace_op": "apply_patch"},
+                                 "uncertain": uncertain})
+    return payloads
+
+
+def mark_effect_reported(job_id: str, attempt_id: str, hub_identity: str = "") -> bool:
+    """Mark a local journal only after the Hub confirmed durable receipt."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", job_id or "") or not re.fullmatch(
+            r"[A-Za-z0-9_-]{1,128}", attempt_id or ""):
+        return False
+    base = os.path.join(effect_state_root(), "effects")
+    if not os.path.isdir(base):
+        return False
+    for root_key in os.listdir(base):
+        folder = os.path.join(base, root_key)
+        try:
+            namespaces = os.listdir(folder)
+        except OSError:
+            continue
+        for namespace in namespaces:
+            path = os.path.join(folder, namespace, job_id + ".json")
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    journal = json.load(fh)
+            except (OSError, ValueError):
+                continue
+            if (journal.get("job_id") != job_id or journal.get("attempt_id") != attempt_id
+                    or journal.get("hub_identity") != hub_identity):
+                continue
+            if journal.get("reported"):
+                return True
+            journal["reported"] = True
+            journal["reported_at"] = time.time()
+            _write_json_durable(path, journal)
+            return True
+    return False
+
+
+def op_apply_patch(root: str, args: dict, job_id: str = "", attempt_id: str = "",
+                   resource_generation: int | None = None,
+                   fence_check=None, candidate_digest: str | None = None,
+                   hub_identity: str = "") -> dict:
+    """Fenced write with a durable intent journal; partial outcomes never replay."""
+    if not job_id or not attempt_id or not callable(fence_check):
+        raise OpFail("fence_unavailable", "apply_patch requires job, attempt and active lease verifier")
     if not os.path.isdir(root):
         raise OpFail("path_unavailable", f"blocked: path unavailable {root}")
-    receipt_file = _receipt_path(job_id)
-    if job_id and os.path.isfile(receipt_file):
-        with open(receipt_file, encoding="utf-8") as fh:
-            previous = json.load(fh)
-        if previous.get("base_tree_digest") == args.get("base_tree_digest"):
-            previous["replayed"] = True
-            return previous
-    base = args.get("base_tree_digest")
-    current = tree_digest(root)
-    if base and current != base:
-        raise OpFail("tree_changed",
-                     "рабочее дерево изменилось после inspect: нужен новый base_tree_digest")
-    changes = args.get("changes") or []
-    if not changes or len(changes) > MAX_PATCH_FILES:
-        raise OpFail("bad_arg", f"changes: 1..{MAX_PATCH_FILES}")
-    backup_dir = os.path.join(state_root(), "backups",
-                              f"{time.strftime('%Y%m%d-%H%M%S')}-{(job_id or 'nokey')[:8]}")
-    plan = []
-    for change in changes:
-        rel = change.get("path") or ""
-        reason = denied(rel)
-        if reason:
-            raise OpFail("denied_path", f"{rel}: {reason}")
-        full = resolve(root, rel)
-        preimage = (change.get("preimage_sha256") or "").lower() or None
-        content_b64 = change.get("content_b64")
-        if content_b64 is None and not preimage:
-            raise OpFail("bad_arg", f"{rel}: нужен content_b64 или preimage_sha256")
-        exists = os.path.isfile(full)
-        if preimage:
-            if not exists:
-                raise OpFail("preimage_missing", f"{rel}: файл не найден, патч не применён")
-            actual = sha256_file(full)
-            if actual != preimage:
-                raise OpFail("preimage_mismatch",
-                             f"{rel}: файл изменён (ожидался {preimage[:12]}…, получен {actual[:12]}…)")
-        elif exists:
-            raise OpFail("preimage_missing",
-                         f"{rel}: файл уже существует, нужен preimage_sha256")
-        plan.append((rel, full, content_b64, exists))
-    applied = []
-    for rel, full, content_b64, exists in plan:
-        if exists:
-            dst = os.path.join(backup_dir, *rel.split("/"))
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            shutil.copy2(full, dst)
-        if content_b64 is None:
-            os.remove(full)
-            applied.append({"path": rel, "action": "delete"})
-            continue
-        raw = base64.b64decode(content_b64, validate=True)
-        os.makedirs(os.path.dirname(full), exist_ok=True)
-        tmp = full + f".aihub-{uuid.uuid4().hex[:8]}.tmp"
-        with open(tmp, "wb") as fh:
-            fh.write(raw)
-        os.replace(tmp, full)
-        applied.append({"path": rel, "action": "update" if exists else "create",
-                        "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)})
-    result = {
-        "root": os.path.abspath(root),
-        "applied": applied,
-        "base_tree_digest": base,
-        "tree_digest": tree_digest(root),
-        "backup_dir": backup_dir if os.path.isdir(backup_dir) else None,
-        "job_id": job_id,
-        "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-    }
-    if job_id:
-        tmp = receipt_file + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(result, fh, ensure_ascii=False, indent=1)
-        os.replace(tmp, receipt_file)
-    return result
+    journal_path = _effect_path(root, job_id, hub_identity)
+    args_digest = hashlib.sha256(json.dumps(
+        args, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
+    candidate_digest = candidate_digest or args_digest
+    with _writer_lock(root):
+        root_effect_dir = os.path.dirname(os.path.dirname(journal_path))
+        root_canonical = os.path.normcase(os.path.realpath(root))
+        for namespace in os.listdir(root_effect_dir):
+            namespace_dir = os.path.join(root_effect_dir, namespace)
+            if not os.path.isdir(namespace_dir):
+                continue
+            for name in os.listdir(namespace_dir):
+                if not name.endswith(".json"):
+                    continue
+                path = os.path.join(namespace_dir, name)
+                try:
+                    with open(path, encoding="utf-8") as fh:
+                        existing = json.load(fh)
+                except (OSError, ValueError):
+                    raise OpFail("checkout_requires_reconciliation", "unreadable effect journal blocks writes") from None
+                if (os.path.normcase(os.path.realpath(existing.get("root") or "")) == root_canonical
+                        and existing.get("state") in ("applying", "uncertain")):
+                    raise OpFail("checkout_requires_reconciliation",
+                                 "unresolved prior filesystem effect blocks all writes to this checkout")
+        if os.path.exists(journal_path):
+            with open(journal_path, encoding="utf-8") as fh:
+                prior = json.load(fh)
+            if (prior.get("job_id") == job_id and prior.get("attempt_id") == attempt_id
+                    and prior.get("candidate_digest") == candidate_digest
+                    and prior.get("state") == "applied" and isinstance(prior.get("result"), dict)):
+                prior["result"]["replayed"] = True
+                return prior["result"]
+            raise OpFail("effect_uncertain", "durable operation journal exists; manual reconciliation required")
+
+        base = args.get("base_tree_digest")
+        current = tree_digest(root)
+        if base and current != base:
+            raise OpFail("tree_changed", "workspace tree changed since inspect")
+        changes = args.get("changes") or []
+        if not changes or len(changes) > MAX_PATCH_FILES:
+            raise OpFail("bad_arg", f"changes: 1..{MAX_PATCH_FILES}")
+        backup_dir = os.path.join(state_root(), "backups",
+                                  f"{time.strftime('%Y%m%d-%H%M%S')}-{job_id[:8]}")
+        plan = []
+        for change in changes:
+            rel = change.get("path") or ""
+            reason = denied(rel)
+            if reason:
+                raise OpFail("denied_path", f"{rel}: {reason}")
+            full = resolve(root, rel)
+            preimage = (change.get("preimage_sha256") or "").lower() or None
+            content_b64 = change.get("content_b64")
+            if content_b64 is None and not preimage:
+                raise OpFail("bad_arg", f"{rel}: нужен content_b64 или preimage_sha256")
+            exists = os.path.isfile(full)
+            if preimage:
+                if not exists:
+                    raise OpFail("preimage_missing", f"{rel}: файл не найден, патч не применён")
+                if sha256_file(full) != preimage:
+                    raise OpFail("preimage_mismatch", f"{rel}: файл изменён относительно preimage")
+            elif exists:
+                raise OpFail("preimage_missing", f"{rel}: файл уже существует, нужен preimage_sha256")
+            if content_b64 is not None:
+                try:
+                    raw = base64.b64decode(content_b64, validate=True)
+                except (ValueError, TypeError):
+                    raise OpFail("bad_arg", f"{rel}: invalid base64 content") from None
+            else:
+                raw = None
+            plan.append({"path": rel, "full": full, "exists": exists,
+                         "preimage_sha256": preimage,
+                         "action": "delete" if raw is None else ("update" if exists else "create"),
+                         "sha256": hashlib.sha256(raw).hexdigest() if raw is not None else None,
+                         "content": raw})
+        if not fence_check():
+            raise OpFail("lease_lost", "workspace lease is no longer current")
+        journal = {
+            "schema": 1, "state": "applying", "job_id": job_id,
+            "root": root_canonical,
+            "attempt_id": attempt_id, "resource_generation": resource_generation,
+            "hub_identity": hub_identity,
+            "candidate_digest": candidate_digest, "base_tree_digest": base,
+            "preimage_digest": hashlib.sha256(json.dumps(
+                [{"path": x["path"], "sha256": x["preimage_sha256"]} for x in plan],
+                sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest(),
+            "write_set": [{k: x[k] for k in ("path", "action", "preimage_sha256", "sha256")} for x in plan],
+            "applied": [], "started_at": time.time(),
+        }
+        _write_json_durable(journal_path, journal)
+        applied = []
+        try:
+            for item in plan:
+                if not fence_check():
+                    raise OpFail("lease_lost", "workspace lease is no longer current")
+                full = _check_no_link_components(root, item["path"])
+                if os.path.normcase(full) != os.path.normcase(item["full"]):
+                    raise OpFail("path_changed", "write path changed after validation")
+                if item["exists"]:
+                    _safe_regular_file(root, full)
+                    if sha256_file(full) != item["preimage_sha256"]:
+                        raise OpFail("preimage_mismatch", f"{item['path']}: changed immediately before write")
+                elif os.path.lexists(full):
+                    raise OpFail("preimage_mismatch", f"{item['path']}: appeared immediately before write")
+                if item["exists"]:
+                    dst = os.path.join(backup_dir, *item["path"].split("/"))
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    shutil.copy2(full, dst)
+                if item["action"] == "delete":
+                    os.remove(full)
+                else:
+                    os.makedirs(os.path.dirname(full), exist_ok=True)
+                    tmp = full + f".aihub-{uuid.uuid4().hex[:8]}.tmp"
+                    with open(tmp, "wb") as fh:
+                        fh.write(item["content"])
+                        fh.flush()
+                        os.fsync(fh.fileno())
+                    os.replace(tmp, full)
+                done = {k: item[k] for k in ("path", "action", "preimage_sha256", "sha256")}
+                applied.append(done)
+                journal["applied"] = list(applied)
+                _write_json_durable(journal_path, journal)
+            result = {
+                "root": os.path.abspath(root), "operation": "apply_patch", "applied": applied,
+                "base_tree_digest": base, "tree_digest": tree_digest(root),
+                "backup_dir": backup_dir if os.path.isdir(backup_dir) else None,
+                "job_id": job_id, "attempt_id": attempt_id,
+                "candidate_digest": candidate_digest,
+                "preimage_digest": journal["preimage_digest"],
+                "resource_generation": resource_generation,
+                "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            }
+            journal.update({"state": "applied", "result": result, "finished_at": time.time()})
+            _write_json_durable(journal_path, journal)
+            return result
+        except Exception as exc:
+            journal.update({"state": "uncertain", "error_type": type(exc).__name__,
+                            "applied": list(applied), "finished_at": time.time()})
+            _write_json_durable(journal_path, journal)
+            raise OpFail("effect_uncertain", "patch effect is partial or uncertain; manual reconciliation required") from None
 
 
 def op_run_checks(root: str, args: dict) -> dict:
-    """Утверждённый план проверок в тестовой среде (снимок), не в рабочем дереве."""
+    """Run checks only through an explicitly configured isolated executor."""
     snap_id = args.get("snapshot_id") or ""
     workdir = _snapshot_dir(snap_id)
     plan = (args.get("plan") or {}).get("checks") or []
     if not plan:
         raise OpFail("no_check_plan", "план проверок пуст")
+    runner_argv = isolated_runner_argv()
+    if not runner_argv:
+        raise OpFail("runner_unavailable", "isolated runner is not configured")
     results = []
     ok = True
     for item in plan:
@@ -461,17 +736,54 @@ def op_run_checks(root: str, args: dict) -> dict:
         timeout = int(item.get("timeout_s") or 120)
         if not isinstance(cmd, list) or not cmd or not all(isinstance(x, str) for x in cmd):
             raise OpFail("bad_check_plan", f"{name}: cmd должен быть списком строк")
+        before = tree_digest(workdir)
+        request_id = uuid.uuid4().hex
+        request = {
+            "protocol": 1,
+            "request_id": request_id,
+            "snapshot": {"path": os.path.realpath(workdir), "read_only": True,
+                         "tree_digest": before},
+            "command": cmd,
+            "timeout_s": timeout,
+            "limits": {"network": "none", "rootfs_read_only": True,
+                       "cap_drop": ["ALL"], "no_new_privileges": True,
+                       "memory_mb": 512, "cpus": 1, "pids": 64,
+                       "tmpfs_mb": 64, "stdout_bytes": 65536,
+                       "stderr_bytes": 65536},
+        }
         started = time.time()
         try:
-            proc = subprocess.run(cmd, cwd=workdir, capture_output=True,
-                                  stdin=subprocess.DEVNULL, timeout=timeout)
-            code = proc.returncode
-            out = (proc.stdout or b"").decode("utf-8", "replace")
-            err = (proc.stderr or b"").decode("utf-8", "replace")
+            proc = subprocess.run(
+                runner_argv, cwd=state_root(), capture_output=True,
+                input=json.dumps(request, ensure_ascii=False).encode("utf-8"),
+                env=isolated_runner_env(), timeout=timeout + 60, shell=False)
+            if proc.returncode != 0:
+                raise OpFail("runner_failed", f"isolated runner exited {proc.returncode}")
+            response = json.loads((proc.stdout or b"").decode("utf-8"))
+            required_isolation = {
+                "network": "none", "rootfs_read_only": True,
+                "cap_drop_all": True, "no_new_privileges": True,
+                "resource_limits": True, "snapshot_read_only": True,
+                "nonroot": True, "ephemeral_workspace": True,
+            }
+            isolation = response.get("isolation") or {}
+            if (response.get("protocol") != 1 or response.get("request_id") != request_id
+                    or any(isolation.get(k) != v for k, v in required_isolation.items())
+                    or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(isolation.get("image") or ""))
+                    or response.get("termination_confirmed") is not True
+                    or response.get("snapshot_tree_digest_before") != before
+                    or response.get("snapshot_tree_digest_after") != before):
+                raise OpFail("runner_unverified", "isolated runner response failed verification")
+            code = int(response["exit_code"])
+            out = str(response.get("stdout") or "")[:65536]
+            err = str(response.get("stderr") or "")[:65536]
+            after = tree_digest(workdir)
+            if after != before:
+                raise OpFail("snapshot_changed", "isolated runner modified read-only snapshot")
         except subprocess.TimeoutExpired:
-            code, out, err = -1, "", f"timeout after {timeout}s"
-        except OSError as exc:
-            code, out, err = -2, "", f"не запустилось: {exc}"
+            code, out, err = -1, "", f"isolated runner timeout after {timeout}s"
+        except (ValueError, KeyError, TypeError, OSError) as exc:
+            raise OpFail("runner_unverified", f"isolated runner unavailable/invalid: {type(exc).__name__}") from None
         passed = code == 0
         ok = ok and passed
         results.append({"name": name, "cmd": cmd, "exit_code": code, "passed": passed,
@@ -479,6 +791,31 @@ def op_run_checks(root: str, args: dict) -> dict:
                         "stdout_tail": out[-4000:], "stderr_tail": err[-2000:]})
     return {"snapshot_id": snap_id, "workdir": workdir, "ok": ok, "checks": results,
             "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+
+
+def isolated_runner_argv() -> list[str] | None:
+    """Admin-only JSON argv for the restricted runner; never uses a shell."""
+    raw = os.environ.get("AIHUB_ISOLATED_RUNNER_ARGV", "")
+    if not raw:
+        return None
+    try:
+        argv = json.loads(raw)
+    except ValueError:
+        return None
+    if (not isinstance(argv, list) or not argv
+            or not all(isinstance(x, str) and x for x in argv)
+            or not os.path.isabs(argv[0]) or not os.path.isfile(argv[0])):
+        return None
+    return argv
+
+
+def isolated_runner_env() -> dict:
+    """Minimal environment for the trusted runner executable."""
+    env = {"PATH": os.defpath, "LANG": "C.UTF-8"}
+    for key in ("SYSTEMROOT", "WINDIR", "TEMP", "TMP"):
+        if os.environ.get(key):
+            env[key] = os.environ[key]
+    return env
 
 
 def op_package(root: str, args: dict, job_id: str = "") -> dict:
@@ -540,11 +877,17 @@ TAKES_JOB = {"snapshot", "apply_patch", "package"}
 
 def capabilities() -> dict:
     """Что этот хост реально умеет: хаб пускает control-задание только по этому списку."""
-    return {"workspace_ops": list(OPS), "workspace_root": state_root(),
+    ops = list(OPS)
+    if not isolated_runner_argv() and "run_checks" in ops:
+        ops.remove("run_checks")
+    return {"workspace_ops": ops, "workspace_root": state_root(),
+            "workspace_protocol": 3, "workspace_fencing": 1,
+            "workspace_effect_journal": 1,
+            "isolated_runner_protocol": 1 if isolated_runner_argv() else None,
             "host": platform.node(), "kinds": ["agent", "workspace"]}
 
 
-def run_job(job: dict) -> dict:
+def run_job(job: dict, fence_check=None, hub_identity: str = "") -> dict:
     """Исполняет control-задание и возвращает payload для /bridge/result."""
     job_id = job.get("id") or ""
     attempt_id = job.get("attempt_id") or ""
@@ -562,16 +905,34 @@ def run_job(job: dict) -> dict:
         return {"job_id": job_id, "attempt_id": attempt_id, "ok": False,
                 "error": f"операция {op!r} не поддерживается этим хостом"}
     try:
-        result = handler(root, args, job_id) if op in TAKES_JOB else handler(root, args)
+        if op == "apply_patch" and (not callable(fence_check) or not fence_check()):
+            raise OpFail("lease_lost", "workspace lease is not current")
+        if op == "apply_patch":
+            result = handler(root, args, job_id, attempt_id,
+                             (job.get("resource") or {}).get("generation"), fence_check,
+                             envelope.get("digest"), hub_identity)
+        else:
+            result = handler(root, args, job_id) if op in TAKES_JOB else handler(root, args)
         payload = {"job_id": job_id, "attempt_id": attempt_id, "ok": True,
                    "output": json.dumps(result, ensure_ascii=False),
                    "usage": {"workspace_op": op}}
     except OpFail as exc:
+        detail = {"error": exc.as_dict(), "op": op, "root": root,
+                  "job_id": job_id, "attempt_id": attempt_id}
+        if exc.code == "effect_uncertain":
+            try:
+                with open(_effect_path(root, job_id, hub_identity), encoding="utf-8") as fh:
+                    journal = json.load(fh)
+                detail["effect_journal"] = {k: journal.get(k) for k in (
+                    "schema", "state", "job_id", "attempt_id", "resource_generation",
+                    "candidate_digest", "base_tree_digest", "preimage_digest", "write_set", "applied")}
+            except (OSError, ValueError, OpFail):
+                detail["effect_journal"] = {"state": "unavailable"}
         payload = {"job_id": job_id, "attempt_id": attempt_id, "ok": False,
-                   "error": f"{exc.code}: {exc}", "output": json.dumps(
-                       {"error": exc.as_dict(), "op": op, "root": root},
-                       ensure_ascii=False),
-                   "usage": {"workspace_op": op}}
+                   "error": f"{exc.code}: {exc}",
+                   "output": json.dumps(detail, ensure_ascii=False),
+                   "usage": {"workspace_op": op},
+                   "uncertain": exc.code == "effect_uncertain"}
     except Exception as exc:  # noqa: BLE001
         payload = {"job_id": job_id, "attempt_id": attempt_id, "ok": False,
                    "error": f"{type(exc).__name__}: {exc}",

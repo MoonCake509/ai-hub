@@ -84,4 +84,8 @@ services:
 
 volumes:
   pgdata:
+    # Immutable name: the volume must not depend on the compose project name.
+    # A previous `-p aihub` run silently created an empty project-scoped volume and
+    # the service came up on a blank database (2026-11-10 incident).
+    name: aihub_pgdata
     driver: local

@@ -266,7 +266,8 @@ async function testReconciliationRenderAndDecision() {
   assert.ok(form, 'server allowed rejection action is displayed');
   const reason = form.find(node => node.tag === 'textarea');
   assert.equal(reason.required, true);
-  assert.equal(reason.minLength, 3);
+  assert.equal(reason.minLength, 10);
+  assert.equal(reason.maxLength, 1000);
   const buttons = form.querySelectorAll('button');
   assert.equal(buttons.length, 1, 'only the server-allowed reject action is shown');
   assert.equal(buttons[0].dataset.action, 'reject');
@@ -288,9 +289,11 @@ async function testReconciliationRenderAndDecision() {
   assert.equal(item.job_status, 'unknown', 'manual decision does not rewrite original execution state');
 
   const countBefore = posts.length;
-  await ctx.reconDecide(item, 'reject', '  ', form);
-  assert.equal(posts.length, countBefore, 'blank/too short reason is rejected client-side');
-  assert.match(form.querySelector('.recon-decision-msg').textContent, /основание/);
+  await ctx.reconDecide(item, 'reject', '123456789', form);
+  assert.equal(posts.length, countBefore, 'nine-character reason is rejected client-side');
+  assert.match(form.querySelector('.recon-decision-msg').textContent, /10 до 1000/);
+  await ctx.reconDecide(item, 'reject', 'x'.repeat(1001), form);
+  assert.equal(posts.length, countBefore, 'overlong reason is rejected client-side');
 
   ctx.api = async () => { throw new Error('409 stale revision'); };
   await ctx.reconDecide(item, 'reject', 'Проверено повторно', form);

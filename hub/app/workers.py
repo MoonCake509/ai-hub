@@ -16,10 +16,14 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from . import db, observations
+from .protocol import SUPPORTED
+from .protocol import PROTOCOL
+from .protocol import heartbeat_interval as recommended_heartbeat
+from .protocol import lease_risk
 
-PROTOCOL = 2
-SUPPORTED_PROTOCOLS = (2,)
+SUPPORTED_PROTOCOLS = SUPPORTED
 TTL_S = int(os.environ.get("WORKER_TTL_S", "180"))
+LEASE_SECONDS = int(os.environ.get("LEASE_SECONDS", "300"))
 
 DDL = [
     """create table if not exists aihub.workers (
@@ -36,6 +40,7 @@ DDL = [
         hb_at timestamptz not null default now()
     )""",
     "create index if not exists workers_hb on aihub.workers(hb_at desc)",
+    "alter table aihub.workers add column if not exists hb_interval_s int",
 ]
 
 
@@ -116,18 +121,28 @@ def heartbeat(payload: dict, at=None, agents: list[dict] | None = None) -> dict:
     os_user = str(payload.get("os_user") or "")[:200] or None
     pid = payload.get("pid") if isinstance(payload.get("pid"), int) else None
     adapter = str(payload.get("adapter_version") or "")[:120] or None
+    # CORE-01: воркер сообщает, как часто подтверждает аренду. Если интервал не
+    # короче самой аренды, живая попытка станет unknown между подтверждениями —
+    # это неверная настройка, и она должна быть видна в /workers, а не выглядеть
+    # как потеря связи.
+    try:
+        hb_interval = int(payload.get("hb_interval_s") or 0) or None
+    except (TypeError, ValueError):
+        raise ProtocolError("hb_interval_s must be an integer") from None
+    risk = lease_risk(hb_interval, LEASE_SECONDS)
 
     with db._lock:
         conn = db.connect()
         conn.run(db._qualify(
             "insert into aihub.workers(worker_id, host, os_user, pid, protocol, adapter_version,"
-            " agents, capabilities, identity, started_at, hb_at)"
-            " values (:id, :host, :u, :pid, :p, :av, :ag::jsonb, :cap::jsonb, :ident::jsonb, :start, :hb)"
+            " hb_interval_s, agents, capabilities, identity, started_at, hb_at)"
+            " values (:id, :host, :u, :pid, :p, :av, :hbi, :ag::jsonb, :cap::jsonb, :ident::jsonb, :start, :hb)"
             " on conflict (worker_id) do update set host = excluded.host, os_user = excluded.os_user,"
             " pid = excluded.pid, protocol = excluded.protocol, adapter_version = excluded.adapter_version,"
+            " hb_interval_s = excluded.hb_interval_s,"
             " agents = excluded.agents, capabilities = excluded.capabilities, identity = excluded.identity,"
             " started_at = coalesce(aihub.workers.started_at, excluded.started_at), hb_at = excluded.hb_at"),
-            id=worker_id, host=host, u=os_user, pid=pid, p=protocol, av=adapter,
+            id=worker_id, host=host, u=os_user, pid=pid, p=protocol, av=adapter, hbi=hb_interval,
             ag=json.dumps(served, ensure_ascii=False), cap=json.dumps(capabilities, ensure_ascii=False),
             ident=json.dumps(identity, ensure_ascii=False),
             start=observations._parse(payload.get("started_at")), hb=observations._parse(moment))
@@ -154,7 +169,10 @@ def heartbeat(payload: dict, at=None, agents: list[dict] | None = None) -> dict:
             reason = str(item.get("problem") or "исполнитель отвечает, но не готов")
         observations.record(canonical, "availability", state, "worker:" + worker_id, moment, TTL_S, reason, detail)
         written += 1
-    return {"ok": True, "worker_id": worker_id, "protocol": protocol, "agents": written, "ttl_s": TTL_S}
+    return {"ok": True, "worker_id": worker_id, "protocol": protocol, "agents": written,
+            "ttl_s": TTL_S, "hb_interval_s": hb_interval,
+            "heartbeat_interval_s": recommended_heartbeat(LEASE_SECONDS),
+            "lease_seconds": LEASE_SECONDS, "lease_risk": risk}
 
 
 def list_workers(at=None) -> list[dict]:
@@ -162,8 +180,9 @@ def list_workers(at=None) -> list[dict]:
     with db._lock:
         conn = db.connect()
         rows = db._rows(conn, db._qualify(
-            "select worker_id, host, os_user, pid, protocol, adapter_version, agents, capabilities,"
-            " identity, started_at, hb_at from aihub.workers order by hb_at desc"))
+            "select worker_id, host, os_user, pid, protocol, adapter_version, hb_interval_s,"
+            " agents, capabilities, identity, started_at, hb_at from aihub.workers"
+            " order by hb_at desc"))
     items = []
     for row in rows:
         agents = row.get("agents") if isinstance(row.get("agents"), list) else json.loads(row.get("agents") or "[]")
@@ -175,6 +194,10 @@ def list_workers(at=None) -> list[dict]:
             "pid": row.get("pid"),
             "protocol": row.get("protocol"),
             "adapter_version": row.get("adapter_version"),
+            "hb_interval_s": row.get("hb_interval_s"),
+            "heartbeat_interval_s": recommended_heartbeat(LEASE_SECONDS),
+            "lease_seconds": LEASE_SECONDS,
+            "lease_risk": lease_risk(row.get("hb_interval_s"), LEASE_SECONDS),
             "agents": [item.get("id") for item in agents if isinstance(item, dict)],
             "agent_details": agents,
             "capabilities": capabilities,

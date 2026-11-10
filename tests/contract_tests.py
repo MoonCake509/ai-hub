@@ -71,7 +71,9 @@ def new_job(prompt, key=None, timeout=600, agent="openclaw-laptop"):
 
 
 def lease(agent="openclaw"):
-    code, d = api("GET", f"/bridge/jobs?worker=contract-test&agents={agent}")
+    # CORE-01: без версии протокола хаб обязан отказать (426), поэтому воркер
+    # всегда называет свою версию.
+    code, d = api("GET", f"/bridge/jobs?worker=contract-test&agents={agent}&protocol=2")
     if code != 200:
         print("   lease http:", code, d)
     return d if "attempt_id" in d else None
@@ -314,11 +316,57 @@ def test_diag03_workers():
     sql(cleanup)
 
 
+def test_core01_protocol_gate():
+    """CORE-01: старый клиент не арендует задание, интервал сверяется с арендой."""
+    for path in ("/bridge/jobs?worker=ct-legacy",
+                 "/bridge/jobs?worker=ct-legacy&protocol=1",
+                 "/bridge/jobs?worker=ct-legacy&protocol=abc"):
+        code, d = api("GET", path)
+        check(f"CORE-01: {path} → 426 с версиями", code == 426 and 2 in (d.get("supported") or []),
+              str(code) + " " + str(d)[:120])
+    # Аренда берёт старейшее задание в очереди: остатки прошлых проверок
+    # сделали бы проверку «арендовали именно наше» ложной.
+    sql("update aihub.jobs set status='cancelled', finished_at=now()"
+        " where status='queued' and agent_id='openclaw'")
+    code, j = new_job("CT-PROTO", timeout=60)
+    job_id = j["job_id"]
+    # Старый клиент не может увести задание: после отказа оно остаётся в очереди.
+    status = sql(f"select status from aihub.jobs where id='{job_id}'")
+    check("CORE-01: после отказа старому клиенту задание осталось queued", status == "queued", status)
+    att = lease()
+    check("CORE-01: клиент v2 арендовал задание", bool(att) and att.get("id") == job_id, str(att)[:120])
+    if att:
+        lease_s = float(att.get("lease_seconds") or 0)
+        interval = float(att.get("heartbeat_interval_s") or 0)
+        check("CORE-01: аренда объявляет протокол 2", att.get("protocol") == 2, att.get("protocol"))
+        check("CORE-01: heartbeat короче аренды", 0 < interval < lease_s,
+              f"{interval}/{lease_s}")
+        proto = sql(f"select protocol from aihub.job_attempts where id='{att['attempt_id']}'")
+        check("CORE-01: протокол попытки записан", proto == "2", proto)
+        code, hb = api("POST", "/bridge/heartbeat",
+                       {"attempt_id": att["attempt_id"], "hb_interval_s": int(lease_s * 2)})
+        check("CORE-01: слишком длинный интервал помечен риском",
+              code == 200 and bool(hb.get("lease_risk")), str(hb)[:160])
+        api("POST", "/bridge/result", {"job_id": job_id, "attempt_id": att["attempt_id"], "ok": True,
+                                      "output": "CT-PROTO-OK", "usage": {}, "elapsed": 0.1})
+    body = {"worker_id": "ct-lease-1", "host": "CT-HOST", "os_user": "ct-user", "pid": 1,
+            "protocol": 2, "hb_interval_s": 60, "agents": []}
+    code, d = api("POST", "/bridge/worker/heartbeat", body)
+    check("CORE-01: воркер с интервалом длиннее аренды помечен риском",
+          code == 200 and bool(d.get("lease_risk")), str(code) + " " + str(d)[:160])
+    code, w = api("GET", "/workers")
+    mine = [x for x in (w.get("workers") or []) if x.get("worker_id") == "ct-lease-1"]
+    check("CORE-01: /workers отдаёт интервал и риск по аренде",
+          bool(mine) and mine[0].get("hb_interval_s") == 60 and bool(mine[0].get("lease_risk")),
+          str(mine[:1])[:200])
+    sql("delete from aihub.workers where worker_id = 'ct-lease-1'")
+
+
 if __name__ == "__main__":
     TOKEN = open(TOKEN_FILE, encoding="utf-8").read().strip()
     for fn in (test_idem_conflict, test_timeout_bounds, test_prompt_limit,
                test_duplicate_result, test_late_result, test_concurrent_queue,
-               test_diag01_observations, test_diag03_workers):
+               test_diag01_observations, test_diag03_workers, test_core01_protocol_gate):
         print("==", fn.__name__)
         try:
             fn()

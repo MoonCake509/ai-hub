@@ -175,6 +175,9 @@ DDL = [
     "alter table aihub.jobs add column if not exists conversation_id text",
     "alter table aihub.jobs add column if not exists role_id text",
     "alter table aihub.jobs add column if not exists run_snapshot jsonb",
+    # CORE-01: протокол, на котором задание поставлено и на котором его арендовали.
+    "alter table aihub.jobs add column if not exists protocol int not null default 2",
+    "alter table aihub.job_attempts add column if not exists protocol int not null default 2",
 ]
 
 
@@ -375,8 +378,15 @@ def events(job_id: str) -> list[dict]:
         )
 
 
-def lease_job(worker: str, lease_seconds: int = 300, agents: str = "") -> dict | None:
-    """Атомарно берёт задание из очереди, создаёт попытку. None — очередь пуста."""
+def lease_job(worker: str, lease_seconds: int = 300, agents: str = "",
+              client_protocol: int = 0) -> dict | None:
+    """Атомарно берёт задание из очереди, создаёт попытку. None — очередь пуста.
+
+    Аренда возможна только клиентом, который говорит на протоколе не ниже
+    протокола задания: старый poller (v1) не видит заданий v2 и не может
+    украсть исполнение. Версия клиента записывается в попытку, чтобы поздний
+    результат можно было отнести к протоколу исполнения.
+    """
     with _lock:
         conn = connect()
         conn.run("begin")
@@ -386,6 +396,7 @@ def lease_job(worker: str, lease_seconds: int = 300, agents: str = "") -> dict |
                 """with c as (
                        select id from aihub.jobs
                         where status = 'queued'
+                          and protocol <= :cp
                           and (:agents = '' or agent_id = any(string_to_array(:agents, ',')))
                         order by created_at
                         limit 1
@@ -399,17 +410,18 @@ def lease_job(worker: str, lease_seconds: int = 300, agents: str = "") -> dict |
                           attempts = j.attempts + 1
                      from c where j.id = c.id
                    returning j.id, j.agent_id, j.prompt, j.timeout_s, j.attempts, j.requested_model,
-                        j.requested_profile, j.run_snapshot, j.project_id""",
-                lease=str(int(lease_seconds)), w=worker, agents=agents,
+                        j.requested_profile, j.run_snapshot, j.project_id, j.protocol""",
+                lease=str(int(lease_seconds)), w=worker, agents=agents, cp=int(client_protocol),
             )
             if not row:
                 conn.run("commit")
                 return None
             attempt_id = uuid.uuid4().hex
             conn.run(_qualify(
-                "insert into aihub.job_attempts(id, job_id, attempt_no, worker, lease_until)"
-                " values (:a, :j, :n, :w, now() + (:lease || ' seconds')::interval)"),
+                "insert into aihub.job_attempts(id, job_id, attempt_no, worker, lease_until, protocol)"
+                " values (:a, :j, :n, :w, now() + (:lease || ' seconds')::interval, :p)"),
                 a=attempt_id, j=row["id"], n=row["attempts"], w=worker, lease=str(int(lease_seconds)),
+                p=int(client_protocol),
             )
             conn.run(_qualify(
                 "insert into aihub.job_events(job_id, attempt_id, event) values (:j, :a, 'leased')"),
@@ -459,10 +471,20 @@ def lease_job(worker: str, lease_seconds: int = 300, agents: str = "") -> dict |
                                     "source": ref.get("source") if isinstance(ref, dict) else None,
                                     "message_id": ref.get("message_id") if isinstance(ref, dict) else None})
         return {**row, "attempt_id": attempt_id, "lease_seconds": lease_seconds,
+                "protocol": int(row.get("protocol") or client_protocol),
                 "workdir": workdir or None, "host_id": host_id, "attachments": attachments}
 
 
 def heartbeat(attempt_id: str, lease_seconds: int = 300) -> bool:
+    return heartbeat_detail(attempt_id, lease_seconds) is not None
+
+
+def heartbeat_detail(attempt_id: str, lease_seconds: int = 300) -> dict | None:
+    """Продлить аренду и вернуть версии протокола попытки и задания.
+
+    None означает, что продлевать нечего (попытка или задание уже не running):
+    хаб отвечает воркеру ok=false, и воркер знает, что аренда потеряна.
+    """
     with _lock:
         conn = connect()
         row = _one(
@@ -471,10 +493,14 @@ def heartbeat(attempt_id: str, lease_seconds: int = 300) -> bool:
                   set lease_until = now() + (:lease || ' seconds')::interval
                 from aihub.jobs j
                where a.id = :a and a.status = 'running' and j.id = a.job_id and j.status = 'running'
-               returning a.id""",
+               returning a.id, a.protocol, j.protocol as job_protocol, j.id as job_id""",
             a=attempt_id, lease=str(int(lease_seconds)),
         )
-        return bool(row)
+        if not row:
+            return None
+        return {"id": row["id"], "job_id": row["job_id"],
+                "attempt_protocol": int(row["protocol"] or 0),
+                "job_protocol": int(row["job_protocol"] or 0)}
 
 
 def _store_late(conn, job_id: str | None, attempt_id: str, attempt_status: str | None,

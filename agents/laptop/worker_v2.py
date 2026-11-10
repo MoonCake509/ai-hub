@@ -122,11 +122,26 @@ def drain_outbox() -> None:
             deliver(os.path.join(OUTBOX, name))
 
 
-def heartbeat_loop(base: str, attempt_id: str, lease: int, stop: threading.Event) -> None:
-    interval = max(20, lease // 3)
+def attempt_heartbeat_interval(lease: int, advertised=None) -> int:
+    """Интервал подтверждения аренды: треть аренды, но не больше минуты.
+
+    Раньше здесь было max(20, lease // 3): при короткой тестовой аренде (3 с)
+    первое подтверждение приходило на 20-й секунде, уже после истечения, и
+    живая попытка становилась unknown. Теперь интервал не длиннее трети
+    аренды, а хаб присылает его же в ответе на аренду.
+    """
+    lease = max(1, int(lease or 0))
+    value = int(advertised or 0) or lease // 3 or 1
+    return max(1, min(60, value, lease // 3 or 1))
+
+
+def heartbeat_loop(base: str, attempt_id: str, lease: int, stop: threading.Event,
+                   advertised=None) -> None:
+    interval = attempt_heartbeat_interval(lease, advertised)
     while not stop.wait(interval):
         try:
-            code, resp = http("POST", f"{base}/bridge/heartbeat", {"attempt_id": attempt_id}, timeout=30)
+            code, resp = http("POST", f"{base}/bridge/heartbeat",
+                              {"attempt_id": attempt_id, "hb_interval_s": interval}, timeout=30)
             if code == 200 and not resp.get("ok"):
                 log(f"heartbeat rejected for {attempt_id} (lease lost)")
                 return
@@ -217,6 +232,7 @@ def worker_heartbeat_payload() -> dict:
         "os_user": getpass.getuser(),
         "pid": os.getpid(),
         "protocol": PROTOCOL,
+        "hb_interval_s": HEARTBEAT_S,
         "adapter_version": ADAPTER_VERSION,
         "agents": served,
         "capabilities": {"workdir": True, "attachments": True, "outbox": "file"},
@@ -267,12 +283,18 @@ def main() -> int:
 
     while True:
         try:
-            code, job = http("GET", f"{base}/bridge/jobs?worker={WORKER}&agents={','.join(AGENTS)}", timeout=45)
+            code, job = http("GET", f"{base}/bridge/jobs?worker={WORKER}"
+                                    f"&agents={','.join(AGENTS)}&protocol={PROTOCOL}", timeout=45)
         except Exception as exc:  # noqa: BLE001
             log(f"poll error: {exc}")
             time.sleep(5)
             continue
 
+        if code == 426:
+            # Хаб требует другую версию протокола: опрос дальше бессмысленен.
+            log(f"hub refused protocol {PROTOCOL}: {str(job.get('detail'))[:200]}")
+            time.sleep(max(30.0, POLL_INTERVAL * 10))
+            continue
         if code != 200:
             time.sleep(POLL_INTERVAL)
             continue
@@ -322,7 +344,9 @@ def main() -> int:
             if paths:
                 prompt += "\n\nФайлы приложены и доступны по путям:\n" + "\n".join(paths)
         stop = threading.Event()
-        threading.Thread(target=heartbeat_loop, args=(base, attempt_id, lease, stop), daemon=True).start()
+        threading.Thread(target=heartbeat_loop,
+                         args=(base, attempt_id, lease, stop, job.get("heartbeat_interval_s")),
+                         daemon=True).start()
 
         log(f"job {job_id} attempt={attempt_id} agent={agent_id} timeout={timeout} "
             f"profile={requested_profile} model={requested_model}")

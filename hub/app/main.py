@@ -18,12 +18,13 @@ from pathlib import Path
 
 import httpx
 import yaml
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from . import chat_context, db, observations, probes, quality, quality_db, quality_quick, workers
+from . import protocol as bridge_protocol
 from .image_validation import validate_image
 
 VERSION = "0.3.0"
@@ -1299,10 +1300,26 @@ async def workers_list() -> dict:
 
 
 @app.get("/bridge/jobs", dependencies=[Depends(require_token)])
-async def bridge_jobs(worker: str = "", agents: str = "") -> JSONResponse:
-    leased = await asyncio.to_thread(db.lease_job, worker or "unknown", LEASE_SECONDS, agents)
+async def bridge_jobs(worker: str = "", agents: str = "",
+                      protocol_ver: str | None = Query(None, alias="protocol")) -> JSONResponse:
+    # Версия протокола обязательна. Старый poller (v1) не арендует задания v2:
+    # иначе он получал бы задание, не умея ни durable-ack, ни heartbeat, и
+    # «терял» бы его при первом падении. Отказ явный — 426, а не пустая очередь.
+    problem = bridge_protocol.client_problem(protocol_ver)
+    if problem:
+        return JSONResponse(status_code=426, content={
+            "detail": problem,
+            "supported": list(bridge_protocol.SUPPORTED),
+            "current": bridge_protocol.PROTOCOL,
+            "heartbeat_interval_s": bridge_protocol.heartbeat_interval(LEASE_SECONDS),
+            "job": None,
+        })
+    client_protocol = int(bridge_protocol.version_of(protocol_ver))
+    leased = await asyncio.to_thread(db.lease_job, worker or "unknown", LEASE_SECONDS, agents,
+                                     client_protocol)
     if not leased:
-        return JSONResponse({"job": None})
+        return JSONResponse({"job": None, "protocol": client_protocol,
+                             "heartbeat_interval_s": bridge_protocol.heartbeat_interval(LEASE_SECONDS)})
     return JSONResponse({
         "id": leased["id"],
         "attempt_id": leased["attempt_id"],
@@ -1310,6 +1327,8 @@ async def bridge_jobs(worker: str = "", agents: str = "") -> JSONResponse:
         "prompt": leased["prompt"],
         "timeout": leased["timeout_s"],
         "lease_seconds": LEASE_SECONDS,
+        "protocol": leased.get("protocol") or client_protocol,
+        "heartbeat_interval_s": bridge_protocol.heartbeat_interval(LEASE_SECONDS),
         "requested_model": leased.get("requested_model"),
         "requested_profile": leased.get("requested_profile"),
         "workdir": leased.get("workdir"),
@@ -1330,8 +1349,21 @@ async def bridge_heartbeat(request: Request) -> dict:
     attempt_id = payload.get("attempt_id")
     if not attempt_id:
         raise HTTPException(status_code=400, detail="attempt_id is required")
-    alive = await asyncio.to_thread(db.heartbeat, attempt_id, LEASE_SECONDS)
-    return {"ok": alive}
+    detail = await asyncio.to_thread(db.heartbeat_detail, attempt_id, LEASE_SECONDS)
+    if detail is None:
+        return {"ok": False, "lease_seconds": LEASE_SECONDS}
+    if detail["attempt_protocol"] != detail["job_protocol"]:
+        raise HTTPException(status_code=409, detail=(
+            "attempt protocol " + str(detail["attempt_protocol"])
+            + " does not match job protocol " + str(detail["job_protocol"])))
+    interval = bridge_protocol.heartbeat_interval(LEASE_SECONDS)
+    # Воркер сообщает свой интервал: если он не короче аренды, это ошибка
+    # настройки, и хаб говорит об этом прямо, а не молча продлевает аренду.
+    reported = payload.get("hb_interval_s")
+    risk = bridge_protocol.lease_risk(reported, LEASE_SECONDS) if reported is not None else None
+    return {"ok": True, "lease_seconds": LEASE_SECONDS,
+            "heartbeat_interval_s": interval, "lease_risk": risk,
+            "protocol": detail["job_protocol"]}
 
 
 @app.post("/bridge/result", dependencies=[Depends(require_token)])

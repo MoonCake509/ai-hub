@@ -208,6 +208,37 @@ DDL = [
         primary key (case_id, revision)
     )""",
     "create index if not exists workspace_reconciliation_audit_created on aihub.workspace_reconciliation_audit(created_at desc, case_id)",
+    # CTX-01: неизменяемые пакеты входных артефактов.
+    """create table if not exists aihub.context_packets (
+        id text primary key,
+        project_id text not null,
+        conversation_id text,
+        state text not null default 'probing',
+        revision int not null default 1,
+        request jsonb not null default '{}',
+        digest text,
+        budget_bytes bigint not null default 0,
+        used_bytes bigint not null default 0,
+        manifest jsonb not null default '{}',
+        provider_job_id text,
+        provider_op text,
+        materialized_path text,
+        materialized_digest text,
+        created_at timestamptz not null default now(),
+        updated_at timestamptz not null default now(),
+        sealed_at timestamptz,
+        materialized_at timestamptz
+    )""",
+    "create index if not exists context_packets_project on aihub.context_packets(project_id, created_at desc)",
+    """create table if not exists aihub.context_packet_items (
+        packet_id text not null references aihub.context_packets(id) on delete cascade,
+        path text not null,
+        size bigint not null default 0,
+        sha256 text,
+        selected boolean not null default false,
+        reason text not null default '',
+        primary key (packet_id, path)
+    )""",
 ]
 
 

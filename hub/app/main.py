@@ -27,6 +27,7 @@ from fastapi.staticfiles import StaticFiles
 from . import chat_context, db, observations, probes, quality, quality_db, quality_quick, workers
 from . import reconciliation
 from . import capabilities
+from . import packets
 from . import protocol as bridge_protocol
 from . import resources
 from . import workspace
@@ -66,6 +67,7 @@ async def _sweeper() -> None:
             await asyncio.to_thread(resources.sweep)
             # Quick-run deadlines are enforced even with no browser open.
             await asyncio.to_thread(quality.refresh_active_runs)
+            await asyncio.to_thread(packets.poll_active)
         except Exception as exc:  # noqa: BLE001
             print(f"lease sweeper error: {exc}", flush=True)
 
@@ -1409,6 +1411,65 @@ async def workspace_job_get(job_id: str) -> dict:
     if not result:
         raise HTTPException(status_code=404, detail="unknown job")
     return result
+
+
+@app.post("/projects/{project_id}/context/packets", dependencies=[Depends(require_token)])
+async def context_packet_create(project_id: str, request: Request) -> JSONResponse:
+    """Собирает пакет входа: перечень файлов фиксируется хостом, не хабом."""
+    project = await asyncio.to_thread(db.get_project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="project not found")
+    payload = await request.json()
+    paths = payload.get("paths") or []
+    if not isinstance(paths, list) or any(not isinstance(p, str) for p in paths):
+        raise HTTPException(status_code=400, detail="paths must be a list of strings")
+    budget = payload.get("budget_bytes")
+    if not isinstance(budget, int) or isinstance(budget, bool) or budget <= 0:
+        raise HTTPException(status_code=400, detail="budget_bytes must be a positive integer")
+    try:
+        result = await asyncio.to_thread(
+            packets.start, project, paths, budget, payload.get("conversation_id"))
+    except packets.PacketError as exc:
+        raise HTTPException(status_code=400, detail=exc.as_dict()) from None
+    except workspace.OpError as exc:
+        raise HTTPException(status_code=400, detail=exc.as_dict()) from None
+    return JSONResponse(status_code=202, content=result)
+
+
+@app.get("/projects/{project_id}/context/packets", dependencies=[Depends(require_token)])
+async def context_packets(project_id: str, limit: int = 50) -> dict:
+    items = await asyncio.to_thread(packets.list_for_project, project_id, max(1, min(limit, 200)))
+    return {"count": len(items), "items": items}
+
+
+@app.get("/context/packets/{packet_id}", dependencies=[Depends(require_token)])
+async def context_packet(packet_id: str) -> dict:
+    item = await asyncio.to_thread(packets.get, packet_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="packet not found")
+    return item
+
+
+@app.post("/context/packets/{packet_id}/recheck", dependencies=[Depends(require_token)])
+async def context_packet_recheck(packet_id: str) -> dict:
+    try:
+        return await asyncio.to_thread(packets.start_recheck, packet_id)
+    except packets.PacketError as exc:
+        status = 404 if exc.code == "not_found" else 409
+        raise HTTPException(status_code=status, detail=exc.as_dict()) from None
+    except workspace.OpError as exc:
+        raise HTTPException(status_code=400, detail=exc.as_dict()) from None
+
+
+@app.post("/context/packets/{packet_id}/materialize", dependencies=[Depends(require_token)])
+async def context_packet_materialize(packet_id: str) -> dict:
+    try:
+        return await asyncio.to_thread(packets.start_materialize, packet_id)
+    except packets.PacketError as exc:
+        status = 404 if exc.code == "not_found" else 409
+        raise HTTPException(status_code=status, detail=exc.as_dict()) from None
+    except workspace.OpError as exc:
+        raise HTTPException(status_code=400, detail=exc.as_dict()) from None
 
 
 @app.get("/workspace/reconciliation/cases", dependencies=[Depends(require_token)])

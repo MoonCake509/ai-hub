@@ -3,6 +3,7 @@
 # transport— способ обращения: cli | http | cdp | acp
 # host     — где живёт агент: server | laptop
 # configured — карточка заполнена в реестре; доступность и качество — в observations API
+# probe    — пассивная проба DIAG-02; хост-сервисы из контейнера видны по шлюзу bridge (172.18.0.1)
 
 agents:
   - id: codex
@@ -370,3 +371,25 @@ agents:
     configured: true
     bridge_agent: qwen-server
     notes: "CDP 9333, node qwen.js; требует авторизации в приложении"
+
+# Пассивные пробы сервисов, которые видит контейнер хаба (DIAG-02).
+# Пробы агентов на хосте выполняет воркер (DIAG-03): 127.0.0.1 хоста из контейнера
+# принимает TCP, но не отвечает по HTTP.
+services:
+  - id: litellm
+    name: LiteLLM (прокси моделей)
+    probe:
+      kind: http_json
+      url: http://litellm:4000/v1/models
+      timeout_s: 4
+      bearer_env: LITELLM_MASTER_KEY
+      expect:
+        status: 200
+        require_keys: ["data"]
+  - id: postgres
+    name: Postgres (очередь заданий)
+    probe:
+      kind: tcp_port
+      host: "{db_host}"
+      port: 5432
+      timeout_s: 3

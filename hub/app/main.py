@@ -23,7 +23,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import chat_context, db, observations, quality, quality_db
+from . import chat_context, db, observations, probes, quality, quality_db
 from .image_validation import validate_image
 
 VERSION = "0.3.0"
@@ -394,6 +394,39 @@ def agent(agent_id: str) -> dict:
     if item is None:
         raise HTTPException(status_code=404, detail=f"agent '{agent_id}' not found")
     return with_observations(item)
+
+
+@app.get("/probes/plan", dependencies=[Depends(require_token)])
+def probes_plan() -> dict:
+    config = load_agents()
+    items = probes.plan(config.get("agents", []), config.get("services"))
+    return {"count": len(items),
+            "items": [{key: value for key, value in item.items() if key != "probe"} for item in items]}
+
+
+@app.post("/probes/run", dependencies=[Depends(require_token)])
+async def probes_run(request: Request) -> dict:
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 — тело необязательно
+        body = {}
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="request must be a JSON object")
+    agent_id = body.get("agent_id")
+    if agent_id is not None and not isinstance(agent_id, str):
+        raise HTTPException(status_code=400, detail="agent_id must be a string")
+    force = bool(body.get("force"))
+    config = load_agents()
+    result = await asyncio.to_thread(probes.run, config.get("agents", []), agent_id, force,
+                                     None, config.get("services"))
+    if agent_id and not result["results"]:
+        raise HTTPException(status_code=404, detail=f"agent '{agent_id}' has no probe")
+    return result
+
+
+@app.get("/probes/last", dependencies=[Depends(require_token)])
+def probes_last() -> dict:
+    return probes.last()
 
 
 @app.post("/agents/{agent_id}/run", dependencies=[Depends(require_token)])

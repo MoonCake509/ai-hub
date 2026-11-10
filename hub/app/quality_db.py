@@ -68,6 +68,12 @@ DDL = [
     "alter table aihub.quality_run_items add column if not exists reported_model text",
     "alter table aihub.quality_run_items add column if not exists identity_evidence_source text",
     "alter table aihub.quality_run_items add column if not exists first_started_at timestamptz",
+    # Q-01: additive only. Existing extended runs remain valid with NULL
+    # budget fields; do not infer that their per-job timeout was a wall cap.
+    "alter table aihub.quality_runs add column if not exists mode text",
+    "alter table aihub.quality_runs add column if not exists budget_s int",
+    "alter table aihub.quality_runs add column if not exists max_calls int",
+    "alter table aihub.quality_runs add column if not exists budget_exhausted boolean not null default false",
     """create index if not exists quality_items_run_order
        on aihub.quality_run_items(run_id, ordinal)""",
     """create table if not exists aihub.quality_channels (
@@ -134,12 +140,14 @@ def create_run(run: dict[str, Any], cases: list[dict[str, Any]]) -> tuple[dict[s
                 return _decode(existing), False
             conn.run(db._qualify(
                 "insert into aihub.quality_runs(id, idempotency_key, suite_id, suite_version, grader_version,"
-                " suite_snapshot, channel_id, agent_id, profile, model, case_count, timeout_s, status)"
-                " values (:i,:k,:si,:sv,:gv,:ss::jsonb,:ch,:a,:p,:m,:n,:t,'starting')"),
+                " suite_snapshot, channel_id, agent_id, profile, model, case_count, timeout_s, status,"
+                " mode, budget_s, max_calls)"
+                " values (:i,:k,:si,:sv,:gv,:ss::jsonb,:ch,:a,:p,:m,:n,:t,'starting',:mode,:budget,:calls)"),
                 i=run_id, k=run["idempotency_key"], si=run["suite_id"], sv=run["suite_version"],
                 gv=run["grader_version"], ss=_json(run["suite_snapshot"]), ch=run["channel_id"],
                 a=run["agent_id"], p=run.get("profile"), m=run.get("model"),
-                n=run["case_count"], t=run["timeout_s"])
+                n=run["case_count"], t=run["timeout_s"], mode=run.get("mode") or "extended",
+                budget=run.get("budget_s"), calls=run.get("max_calls") or run["case_count"])
             for index, case in enumerate(cases):
                 conn.run(db._qualify(
                     "insert into aihub.quality_run_items(id,run_id,ordinal,case_id,case_snapshot)"
@@ -205,6 +213,17 @@ def mark_item_enqueue_error(item_id: str, message: str) -> None:
             "grader_reason=:e,error=:e,finished_at=now() where id=:i"), e=message, i=item_id)
 
 
+def mark_item_skipped(item_id: str, state: str, message: str) -> None:
+    if state not in ("not_applicable", "budget_exhausted"):
+        raise ValueError("unsupported skipped state")
+    with db._lock:
+        conn = db.connect()
+        conn.run(db._qualify(
+            "update aihub.quality_run_items set status=:s,job_status=null,passed=null,"
+            "grader_reason=:e,error=null,finished_at=now() where id=:i"),
+            s=state, e=message, i=item_id)
+
+
 def item_by_job(job_id: str) -> dict[str, Any] | None:
     with db._lock:
         conn = db.connect()
@@ -229,6 +248,14 @@ def update_item(item_id: str, values: dict[str, Any]) -> None:
             wall=values.get("wall_seconds"), u=_json(values["usage"]) if values.get("usage") is not None else None,
             cost=values.get("cost"), ttft=values.get("first_token_latency_seconds"),
             finished=values.get("finished_at"), i=item_id)
+
+
+def mark_budget_exhausted(run_id: str, reason: str) -> None:
+    with db._lock:
+        conn = db.connect()
+        conn.run(db._qualify(
+            "update aihub.quality_runs set budget_exhausted=true,error=:e where id=:i"),
+            e=reason, i=run_id)
 
 
 def set_run_error(run_id: str, message: str) -> None:

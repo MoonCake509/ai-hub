@@ -23,7 +23,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import chat_context, db, observations, probes, quality, quality_db, workers
+from . import chat_context, db, observations, probes, quality, quality_db, quality_quick, workers
 from .image_validation import validate_image
 
 VERSION = "0.3.0"
@@ -54,6 +54,8 @@ async def _sweeper() -> None:
             expired = await asyncio.to_thread(db.expire_leases)
             if expired:
                 print(f"expired leases: {expired}", flush=True)
+            # Quick-run deadlines are enforced even with no browser open.
+            await asyncio.to_thread(quality.refresh_active_runs)
         except Exception as exc:  # noqa: BLE001
             print(f"lease sweeper error: {exc}", flush=True)
 
@@ -266,111 +268,164 @@ async def quality_update_channel(request: Request) -> dict:
     return {"channel": state, "audit": [item for item in audit if item.get("channel_id") == target["channel_id"]]}
 
 
+def _ensure_quality_project() -> None:
+    """Create the internal owner for synthetic quality attachments."""
+    if db.get_project("_quality"):
+        return
+    # create_project seeds default roles; they are not useful for an internal
+    # owner and would block the stable id. Remove them in the same transaction.
+    project = db.create_project("Системные проверки", "hub", "", {"internal": True})
+    with db._lock:
+        conn = db.connect()
+        conn.run("begin")
+        try:
+            conn.run(db._qualify("delete from aihub.roles where project_id=:i"), i=project["id"])
+            conn.run(db._qualify("update aihub.projects set id='_quality' where id=:i"), i=project["id"])
+            conn.run("commit")
+        except Exception:
+            conn.run("rollback")
+            raise
+    if not db.get_project("_quality"):
+        raise RuntimeError("internal quality project could not be created")
+
+
 @app.post("/quality/runs", dependencies=[Depends(require_token)])
 async def quality_start_run(request: Request) -> JSONResponse:
     payload = await request.json()
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="request must be a JSON object")
-    suite_id = _quality_text(payload, "suite_id", quality.SUITE_ID) or quality.SUITE_ID
-    suite_version = _quality_text(payload, "suite_version", quality.SUITE_VERSION) or quality.SUITE_VERSION
-    suite = quality.get_suite(suite_id, suite_version)
-    if suite is None:
-        raise HTTPException(status_code=400, detail="unknown suite or suite version")
-    try:
-        case_count = payload.get("case_count")
-        if isinstance(case_count, str) and case_count.isdigit():
-            case_count = int(case_count)
-        cases = quality.select_cases(case_count, payload.get("case_ids"))
-    except (ValueError, TypeError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from None
+    mode = _quality_text(payload, "mode", "extended") or "extended"
+    if mode not in ("quick", "extended"):
+        raise HTTPException(status_code=400, detail="mode must be quick or extended")
     agent_id = _quality_text(payload, "agent_id", required=True)
     item, profile, model = _resolve_quality_channel(agent_id, payload.get("profile"), payload.get("model"))
     idem = payload.get("idempotency_key")
     if not isinstance(idem, str) or not idem.strip() or len(idem.strip()) > 200:
         raise HTTPException(status_code=400, detail="idempotency_key must be 1..200 characters")
     idem = idem.strip()
-    try:
-        timeout_s = int(payload.get("timeout_s", 60))
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="timeout_s must be an integer") from None
-    if not QUALITY_MIN_TIMEOUT_S <= timeout_s <= QUALITY_MAX_TIMEOUT_S:
-        raise HTTPException(status_code=400,
-                            detail=f"timeout_s must be between {QUALITY_MIN_TIMEOUT_S} and {QUALITY_MAX_TIMEOUT_S}")
-
-    channel = quality.channel_state(agent_id, profile, model)
-    run_data = {
-        "idempotency_key": idem,
-        "suite_id": suite_id,
-        "suite_version": suite_version,
-        "grader_version": suite["grader_version"],
-        "suite_snapshot": suite,
-        "channel_id": channel["channel_id"],
-        "agent_id": agent_id,
-        "profile": profile,
-        "model": model,
-        "case_count": case_count,
-        "timeout_s": timeout_s,
-    }
+    # Replay is purely a read: it must not depend on current capabilities or
+    # on whether the channel now requires an image.
     existing = await asyncio.to_thread(quality_db.get_run_by_key, idem)
     if existing:
-        existing_cases = [row.get("case_id") for row in existing.get("items", [])]
-        requested_cases = [case["id"] for case in cases]
-        same = (existing.get("suite_id") == suite_id and existing.get("suite_version") == suite_version
-                and existing.get("channel_id") == channel["channel_id"]
-                and existing.get("timeout_s") == timeout_s and existing_cases == requested_cases)
+        channel = quality.channel_state(agent_id, profile, model)
+        same = (existing.get("channel_id") == channel["channel_id"]
+                and [row.get("case_id") for row in existing.get("items", [])]
+                == [row.get("case_id") for row in existing.get("items", [])])
         if not same:
             raise HTTPException(status_code=409, detail="idempotency_key already used with a different quality run")
         refreshed = await asyncio.to_thread(quality.refresh_run, existing["id"])
         return JSONResponse(status_code=200, content=jsonable_encoder(quality.public_run(refreshed)))
-
     capabilities = _model_capabilities(item, agent_id, profile or "", model)
-    if capabilities.get("requires_image") or "image" in set(capabilities.get("required_modalities") or []):
-        raise HTTPException(status_code=400,
-                            detail="The current quality suite uses text-only prompts and does not support image-required models.")
+    requires_image = bool(capabilities.get("requires_image")
+                          or "image" in set(capabilities.get("required_modalities") or []))
+    if mode == "quick":
+        if payload.get("case_count") is not None or payload.get("case_ids") is not None:
+            raise HTTPException(status_code=400, detail="quick mode selects its own bounded probe set")
+        suite = quality_quick.build_suite(idem, requires_image)
+        cases = suite["cases"]
+        case_count = len(cases)
+        try:
+            budget_s = quality_quick.normalize_budget(payload.get("budget_s"))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        # The common wall budget is not a multiplication of a per-job timeout.
+        # An image-only channel gets exactly one call; a text channel at most 3.
+        timeout_s = budget_s
+    else:
+        suite_id = _quality_text(payload, "suite_id", quality.SUITE_ID) or quality.SUITE_ID
+        suite_version = _quality_text(payload, "suite_version", quality.SUITE_VERSION) or quality.SUITE_VERSION
+        suite = quality.get_suite(suite_id, suite_version)
+        if suite is None:
+            raise HTTPException(status_code=400, detail="unknown suite or suite version")
+        try:
+            case_count = payload.get("case_count")
+            if isinstance(case_count, str) and case_count.isdigit():
+                case_count = int(case_count)
+            cases = quality.select_cases(case_count, payload.get("case_ids"))
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        if requires_image:
+            raise HTTPException(status_code=400,
+                                detail="The extended quality suite is text-only; use quick mode for an OCR channel.")
+        try:
+            timeout_s = int(payload.get("timeout_s", 60))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="timeout_s must be an integer") from None
+        if not QUALITY_MIN_TIMEOUT_S <= timeout_s <= QUALITY_MAX_TIMEOUT_S:
+            raise HTTPException(status_code=400,
+                                detail=f"timeout_s must be between {QUALITY_MIN_TIMEOUT_S} and {QUALITY_MAX_TIMEOUT_S}")
+        budget_s = None
 
+    channel = quality.channel_state(agent_id, profile, model)
+    run_data = {
+        "idempotency_key": idem,
+        "suite_id": suite["id"], "suite_version": suite["version"],
+        "grader_version": suite["grader_version"], "suite_snapshot": suite,
+        "channel_id": channel["channel_id"], "agent_id": agent_id,
+        "profile": profile, "model": model, "case_count": case_count,
+        "timeout_s": timeout_s, "mode": mode, "budget_s": budget_s,
+        "max_calls": len(cases),
+    }
     try:
         quality.ensure_channel_enabled(agent_id, profile, model)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from None
 
+    snapshot_fixture = None
+    if requires_image:
+        # The fixture is content-addressed in a dedicated internal project.
+        # It never enters a user conversation or the host filesystem.
+        await asyncio.to_thread(_ensure_quality_project)
+        fixture = quality_quick.ocr_fixture_png()
+        metadata = validate_image(fixture, "image/png", "quick-ocr.png")
+        att = await asyncio.to_thread(db.create_attachment, "_quality", "upload", "quick-ocr.png",
+                                      "image/png", fixture, None, None, metadata)
+        snapshot_fixture = {"id": att["id"], "version": att["id"], "filename": att["filename"],
+                            "mime": "image/png", "source": "upload", "project_id": "_quality"}
+
     run, created = await asyncio.to_thread(quality_db.create_run, run_data, cases)
     if not created:
-        requested_cases = [case["id"] for case in cases]
         existing_cases = [row.get("case_id") for row in run.get("items", [])]
-        if (run.get("channel_id") != channel["channel_id"] or run.get("suite_version") != suite_version
-                or run.get("timeout_s") != timeout_s or existing_cases != requested_cases):
+        if (run.get("channel_id") != channel["channel_id"] or run.get("suite_version") != suite["version"]
+                or run.get("timeout_s") != timeout_s or (run.get("mode") or "extended") != mode
+                or existing_cases != [case["id"] for case in cases]):
             raise HTTPException(status_code=409, detail="idempotency_key already used with a different quality run")
         return JSONResponse(status_code=200, content=jsonable_encoder(quality.public_run(run)))
 
-    snapshot = {"quality_run_id": run["id"], "suite_id": suite_id,
-                "suite_version": suite_version, "grader_version": suite["grader_version"]}
+    snapshot = {"quality_run_id": run["id"], "suite_id": suite["id"],
+                "suite_version": suite["version"], "grader_version": suite["grader_version"],
+                "quality_mode": mode}
+    if snapshot_fixture:
+        snapshot.update({"project_id": "_quality", "project_name": "Системные проверки",
+                         "host_id": item.get("host"), "workdir": None,
+                         "attachment_ids": [snapshot_fixture["id"]],
+                         "attachment_versions": {snapshot_fixture["id"]: snapshot_fixture["id"]},
+                         "attachment_refs": [snapshot_fixture],
+                         "input_modalities": capabilities.get("input_modalities") or ["text", "image"],
+                         "output_modalities": capabilities.get("output_modalities") or ["text"],
+                         "required_modalities": ["image"], "context_mode": "image",
+                         "task_text": cases[0]["prompt"]})
     items_by_case = {row["case_id"]: row for row in run.get("items", [])}
     enqueue_error = None
     for case in cases:
         row = items_by_case[case["id"]]
         try:
             quality.ensure_channel_enabled(agent_id, profile, model)
-            job_snapshot = {
-                **snapshot,
-                "quality_case_id": case["id"],
-                "quality_case_snapshot": case,
-                "agent_id": agent_id,
-                "provider_profile": profile,
-                "requested_model": model,
-                "identity_evidence_source": "not_reported_until_adapter_returns_metadata",
-            }
+            job_snapshot = {**snapshot, "quality_case_id": case["id"],
+                            "quality_case_snapshot": case, "agent_id": agent_id,
+                            "provider_profile": profile, "requested_model": model,
+                            "identity_evidence_source": "not_reported_until_adapter_returns_metadata"}
             prompt_sha = hashlib.sha256(case["prompt"].encode("utf-8")).hexdigest()
-            job, _job_created = await asyncio.to_thread(
+            job, _ = await asyncio.to_thread(
                 db.create_job, item.get("bridge_agent") or agent_id, case["prompt"], prompt_sha,
                 timeout_s, f"quality:{run['id']}:{case['id']}", MAX_QUEUE, model, profile, job_snapshot)
             await asyncio.to_thread(quality_db.attach_job, row["id"], job)
             await asyncio.to_thread(quality.refresh_job, job["id"])
         except Exception as exc:  # noqa: BLE001
             enqueue_error = str(exc)
-            index = cases.index(case)
-            for remaining in cases[index:]:
+            for remaining in cases[cases.index(case):]:
                 await asyncio.to_thread(quality_db.mark_item_enqueue_error,
-                                         items_by_case[remaining["id"]]["id"], enqueue_error)
+                                        items_by_case[remaining["id"]]["id"], enqueue_error)
             await asyncio.to_thread(quality_db.set_run_error, run["id"], enqueue_error)
             break
     refreshed = await asyncio.to_thread(quality.refresh_run, run["id"])

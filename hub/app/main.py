@@ -1472,6 +1472,65 @@ async def context_packet_materialize(packet_id: str) -> dict:
         raise HTTPException(status_code=400, detail=exc.as_dict()) from None
 
 
+@app.post("/projects/{project_id}/context/requests", dependencies=[Depends(require_token)])
+async def context_request_create(project_id: str, request: Request) -> JSONResponse:
+    """Собирает вход под конкретную задачу: точка входа, импорты, обязательные контракты."""
+    project = await asyncio.to_thread(db.get_project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="project not found")
+    payload = await request.json()
+    budget = payload.get("budget_tokens")
+    if not isinstance(budget, int) or isinstance(budget, bool) or budget <= 0:
+        raise HTTPException(status_code=400, detail="budget_tokens must be a positive integer")
+    contracts = payload.get("contracts") or []
+    if not isinstance(contracts, list) or any(not isinstance(c, str) for c in contracts):
+        raise HTTPException(status_code=400, detail="contracts must be a list of strings")
+    try:
+        result = await asyncio.to_thread(
+            packets.create_context, project, payload.get("goal") or "",
+            payload.get("entry") or "", contracts, budget, payload.get("conversation_id"))
+    except packets.PacketError as exc:
+        raise HTTPException(status_code=400, detail=exc.as_dict()) from None
+    except workspace.OpError as exc:
+        raise HTTPException(status_code=400, detail=exc.as_dict()) from None
+    return JSONResponse(status_code=202, content=result)
+
+
+@app.get("/context/requests/{request_id}", dependencies=[Depends(require_token)])
+async def context_request_get(request_id: str) -> dict:
+    item = await asyncio.to_thread(packets.get, request_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="context request not found")
+    manifest = item.get("manifest") or {}
+    return {
+        "id": item["id"], "project_id": item["project_id"], "state": item["state"],
+        "revision": item["revision"], "digest": item.get("digest"),
+        "created_at": item.get("created_at"), "sealed_at": item.get("sealed_at"),
+        "entry": (item.get("request") or {}).get("entry"),
+        "contracts": (item.get("request") or {}).get("contracts") or [],
+        "goal": (item.get("request") or {}).get("goal"),
+        "budget_tokens": manifest.get("budget_tokens"),
+        "used_tokens": manifest.get("used_tokens"),
+        "total_project_tokens": manifest.get("total_project_tokens"),
+        "saved_tokens": manifest.get("saved_tokens"),
+        "saved_ratio": manifest.get("saved_ratio"),
+        "imports": manifest.get("imports") or [],
+        "error": manifest.get("error"),
+        "items": item.get("items") or [],
+    }
+
+
+@app.post("/context/requests/{request_id}/recheck", dependencies=[Depends(require_token)])
+async def context_request_recheck(request_id: str) -> dict:
+    try:
+        return await asyncio.to_thread(packets.start_recheck, request_id)
+    except packets.PacketError as exc:
+        status = 404 if exc.code == "not_found" else 409
+        raise HTTPException(status_code=status, detail=exc.as_dict()) from None
+    except workspace.OpError as exc:
+        raise HTTPException(status_code=400, detail=exc.as_dict()) from None
+
+
 @app.get("/workspace/reconciliation/cases", dependencies=[Depends(require_token)])
 async def workspace_reconciliation_cases(
         cursor: str | None = None, limit: int = 50,

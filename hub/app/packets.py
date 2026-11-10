@@ -19,7 +19,7 @@ import json
 import os
 import uuid
 
-from . import db
+from . import context, db
 
 LIST_PAGE = 200
 
@@ -214,7 +214,7 @@ def _write_items(conn, packet_id: str, items: list[dict]) -> None:
         conn.run(db._qualify(
             "insert into aihub.context_packet_items(packet_id, path, size, sha256, selected, reason)"
             " values (:p, :path, :s, :h, :sel, :r)"),
-            p=packet_id, path=item["path"], s=int(item["size"]), h=item["sha256"],
+            p=packet_id, path=item["path"], s=int(item["size"]), h=item.get("sha256"),
             sel=bool(item["selected"]), r=item["reason"])
 
 
@@ -314,6 +314,34 @@ def safe_join(root: str, rel: str) -> str:
 TERMINAL = {"succeeded", "failed", "cancelled", "timeout", "unknown"}
 
 
+def create_context(project: dict, goal: str, entry: str, contracts: list[str],
+                   budget_tokens: int, conversation_id: str | None = None) -> dict:
+    """Запрос контекста под задачу: список файлов, затем содержимое входа и контрактов."""
+    from . import workspace
+    if not entry:
+        raise PacketError("no_entry", "нужна точка входа (entry)")
+    if budget_tokens <= 0:
+        raise PacketError("bad_budget", "бюджет должен быть положительным")
+    packet_id = uuid.uuid4().hex
+    request = {"kind": "context", "goal": goal or "", "entry": normalize_path(entry),
+               "contracts": [normalize_path(c) for c in contracts or []],
+               "budget_tokens": int(budget_tokens), "requested": []}
+    with db._lock:
+        conn = db.connect()
+        db._one(conn, db._qualify(
+            "insert into aihub.context_packets(id, project_id, conversation_id, state, revision,"
+            " budget_bytes, request) values (:i, :p, :c, 'probing', 1, 0, :r::jsonb) returning id"),
+            i=packet_id, p=project["id"], c=conversation_id,
+            r=json.dumps(request, ensure_ascii=False))
+    job = workspace.create_op_job(
+        "list_files", {"root": project.get("workdir") or "", "glob": "**/*",
+                       "limit": LIST_PAGE, "offset": 0},
+        project.get("host_id") or "", project["id"])
+    attach_job(packet_id, job["job"]["id"], "list_files")
+    return {"packet_id": packet_id, "state": "probing", "kind": "context",
+            "entry": request["entry"], "budget_tokens": int(budget_tokens)}
+
+
 def start(project: dict, requested: list[str], budget_bytes: int,
           conversation_id: str | None = None) -> dict:
     """Создаёт пакет и ставит задание list_files на хост проекта."""
@@ -337,6 +365,26 @@ def _entries_from_listing(result: dict | None) -> list[dict]:
         out.append({"path": item["path"], "size": int(item.get("size") or 0),
                     "sha256": item.get("sha256")})
     return out
+
+
+def _store_built(packet_id: str, built: dict) -> None:
+    """Пишет собранный вход; изменившийся digest означает конфликт, а не новую тишину."""
+    previous = (_packet_row(packet_id) or {}).get("digest")
+    state = "conflict" if previous and previous != built["digest"] else "sealed"
+    bump = ", revision = revision + 1" if state == "conflict" else ""
+    payload = dict(built)
+    if state == "conflict":
+        payload["previous_digest"] = previous
+    with db._lock:
+        conn = db.connect()
+        _write_items(conn, packet_id, built["items"])
+        db._one(conn, db._qualify(
+            "update aihub.context_packets set state = :st, digest = :d, used_bytes = :u,"
+            " budget_bytes = :b, manifest = :m::jsonb, sealed_at = now(), updated_at = now()"
+            + bump + " where id = :i returning id"),
+            st=state, d=built["digest"], u=int(built["used_tokens"]),
+            b=int(built["budget_tokens"]), i=packet_id,
+            m=json.dumps(payload, ensure_ascii=False))
 
 
 def _store_collected(packet_id: str, collected: list[dict]) -> None:
@@ -393,7 +441,44 @@ def poll_active(limit: int = 20) -> int:
                     project.get("host_id") or "", project["id"])
                 attach_job(row["id"], next_job["job"]["id"], op)
                 continue
+            request = packet_row.get("request") or {}
+            if isinstance(request, str):
+                request = json.loads(request)
+            if request.get("kind") == "context":
+                wanted = [request.get("entry")] + list(request.get("contracts") or [])
+                have = {e["path"] for e in collected}
+                files = [{"path": path} for path in wanted if path and path in have]
+                if not files:
+                    fail(row["id"], "точка входа или контракты не найдены в проекте")
+                    continue
+                _store_collected(row["id"], collected)
+                project = db.get_project(packet_row.get("project_id") or "")
+                if not project:
+                    fail(row["id"], "проект не найден")
+                    continue
+                read_job = workspace.create_op_job(
+                    "read_files", {"root": project.get("workdir") or "", "files": files},
+                    project.get("host_id") or "", project["id"])
+                attach_job(row["id"], read_job["job"]["id"], "read")
+                continue
             seal(row["id"], collected, recheck=(op == "recheck"))
+        elif op == "read":
+            packet_row = _packet_row(row["id"]) or {}
+            request = packet_row.get("request") or {}
+            if isinstance(request, str):
+                request = json.loads(request)
+            entries = (packet_row.get("manifest") or {}).get("collected") or []
+            contents = {f.get("path"): (f.get("text") or "")
+                        for f in ((job.get("result") or {}).get("files") or []) if f.get("path")}
+            try:
+                built = context.build(entries, contents, request.get("goal") or "",
+                                      request.get("entry") or "",
+                                      request.get("contracts") or [],
+                                      int(request.get("budget_tokens") or 0))
+            except context.ContextError as exc:
+                fail(row["id"], exc.message)
+                continue
+            _store_built(row["id"], built)
         elif op == "snapshot":
             result = job.get("result") or {}
             mark_materialized(row["id"], result.get("snapshot_id") or "", result.get("tree_digest"))

@@ -1049,6 +1049,9 @@ function startPolling(){pollTimers.forEach(clearInterval);pollTimers=[setInterva
 
 async function boot(){
  await loadAgents();await Promise.allSettled([health(),loadJobs()]);
+ // Панель сверки живёт во вкладке наблюдений, но счётчик открытых исключений
+ // нужен сразу: иначе раздел показывает заглушку «загрузка» до переключения вкладки.
+ reconLoad(false).catch(()=>{});
  try{await wsRefreshAll()}catch(error){workspaceError(error)}
  startPolling();
 }

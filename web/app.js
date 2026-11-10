@@ -310,7 +310,8 @@ function obsBadge(a, row) {
   const state = a.effective_state || 'unknown';
   const badge = el('button', 'status obs-' + state, OBS_EFFECTIVE_RU[state] || state);
   badge.type = 'button';
-  badge.title = 'Наблюдения: ' + (a.effective_reason || 'свежих данных нет');
+  badge.title = 'Наблюдения: ' + (a.effective_reason
+    || (state === 'ok' ? 'все виды свежие' : 'свежих данных нет'));
   badge.onclick = ev => {
     ev.stopPropagation();
     const wasOpen = !!row.querySelector('.obs-panel');

@@ -26,6 +26,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import chat_context, db, observations, probes, quality, quality_db, quality_quick, workers
 from . import reconciliation
+from . import capabilities
 from . import protocol as bridge_protocol
 from . import resources
 from . import workspace
@@ -195,8 +196,25 @@ async def agent_profiles(agent_id: str) -> dict:
         "filesystem_access": item.get("filesystem_access"),
         "supports_workdir": bool(item.get("supports_workdir")),
         "requires_image": bool(item.get("requires_image")),
+        # ADAPTER-01: что канал действительно умеет — с причиной для выключенного.
+        "capabilities": await asyncio.to_thread(capabilities.describe, item),
         **prof,
     }
+
+
+@app.get("/agents/{agent_id}/capabilities", dependencies=[Depends(require_token)])
+async def agent_capabilities(agent_id: str, profile: str | None = None,
+                             model: str | None = None) -> dict:
+    """Матрица возможностей канала: что подтверждено, что только заявлено."""
+    item = find_agent(agent_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail=f"agent '{agent_id}' not found")
+    try:
+        if profile or model:
+            return await asyncio.to_thread(capabilities.resolve, item, profile, model)
+        return await asyncio.to_thread(capabilities.describe, item)
+    except capabilities.CapabilityError as exc:
+        raise HTTPException(status_code=400, detail=exc.as_dict()) from None
 
 
 QUALITY_MIN_TIMEOUT_S = 10
@@ -562,6 +580,17 @@ async def run_agent(agent_id: str, request: Request) -> JSONResponse:
         if not requested_model and known_models:
             requested_model = known_models[0]
 
+    # ADAPTER-01: проверка требуемых возможностей до постановки в очередь.
+    # Неподдержанный режим отклоняется с причиной, а не исполняется «как получится».
+    needs = payload.get("needs") or []
+    if not isinstance(needs, list):
+        raise HTTPException(status_code=400, detail="needs must be a list of capability names")
+    try:
+        cap_snapshot = await asyncio.to_thread(
+            capabilities.preflight, item, requested_profile, requested_model, needs)
+    except capabilities.CapabilityError as exc:
+        raise HTTPException(status_code=409, detail=exc.as_dict()) from None
+
     # Return an accepted idempotent job even after its channel is disabled.
     if idem:
         existing = await asyncio.to_thread(db.get_job_by_idempotency_key, idem)
@@ -574,6 +603,7 @@ async def run_agent(agent_id: str, request: Request) -> JSONResponse:
                 raise HTTPException(status_code=409, detail="idempotency_key already used with another payload") from None
             return JSONResponse(status_code=202, content={
                 "job_id": job["id"], "status": job["status"], "created": created, "agent": agent_id,
+                "capabilities": cap_snapshot["capabilities"],
             })
     try:
         quality.ensure_channel_enabled(agent_id, requested_profile, requested_model)
@@ -597,6 +627,7 @@ async def run_agent(agent_id: str, request: Request) -> JSONResponse:
         "status": job["status"],
         "created": created,
         "agent": agent_id,
+        "capabilities": cap_snapshot["capabilities"],
     })
 
 

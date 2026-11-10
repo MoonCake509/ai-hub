@@ -425,9 +425,11 @@ async function loadAgentProfiles(agentId) {
       opt.value = p.id;
       profileSel.append(opt);
     }
+    runCaps = d.capabilities || null;
     if (profiles.length) {
       profileSel.value = profiles[0].id;
       await loadProfileModels(agentId, profiles[0].id, profiles);
+      updateCapabilityHint();
     } else {
       profileSel.disabled = true;
       modelSel.disabled = true;
@@ -441,6 +443,27 @@ async function loadAgentProfiles(agentId) {
     modelSel.disabled = true;
     if (hint) hint.textContent = 'Не удалось загрузить каталог провайдеров: ' + e.message;
   }
+}
+
+// ADAPTER-01: возможности канала под селектором модели. Выключенное — с причиной.
+const CAP_RU = {text:'текст',patch:'файлы',workdir:'каталог',commands:'команды',
+  usage:'usage',streaming:'поток',stop:'остановка',output_control:'лимит вывода'};
+let runCaps = null;
+
+function updateCapabilityHint() {
+  const hint = $('#run-model-hint');
+  if (!hint || !runCaps) return;
+  const profileId = $('#run-profile').value;
+  const modelId = $('#run-model').value;
+  const profile = (runCaps.profiles || []).find(p => p.id === profileId);
+  const entry = profile && (profile.models || []).find(m => (m.model || '') === modelId);
+  if (!entry) { hint.textContent = ''; hint.title = ''; return; }
+  const names = list => (list || []).map(n => CAP_RU[n] || n).join(', ');
+  const off = entry.unsupported || [];
+  hint.textContent = 'Доступно: ' + (names(entry.supported) || '—') +
+    (off.length ? ' · выключено: ' + names(off) : '');
+  hint.title = off.map(n => (CAP_RU[n] || n) + ': ' +
+    ((entry.capabilities[n] || {}).reason || 'не подтверждено')).join('\n');
 }
 
 async function loadProfileModels(agentId, profileId, profiles) {
@@ -457,6 +480,7 @@ async function loadProfileModels(agentId, profileId, profiles) {
 }
 
 $('#run-agent').onchange = () => loadAgentProfiles($('#run-agent').value);
+$('#run-model').onchange = () => updateCapabilityHint();
 $('#run-profile').onchange = async () => {
   const agentId = $('#run-agent').value;
   const profileId = $('#run-profile').value;

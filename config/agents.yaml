@@ -28,6 +28,15 @@ agents:
     transport: cli
     host: laptop
     configured: true
+    capabilities:
+      text: {supported: true, evidence: "catalog"}
+      patch: {supported: true, evidence: "fixture:core02b-apply-patch"}
+      workdir: {supported: true, evidence: "fixture:core02b-live"}
+      commands: {supported: true, evidence: "fixture:core02b-live"}
+      usage: {supported: true, evidence: "catalog"}
+      streaming: {supported: false, evidence: "catalog", reason: "CLI отдаёт финальный JSON; поток в работе не используется"}
+      stop: {supported: false, evidence: "catalog", reason: "подтверждённая остановка процесса не реализована"}
+      output_control: {supported: true, evidence: "catalog"}
     bridge_agent: codex
     command: "codex exec --json --skip-git-repo-check"
     notes: "бинаря нет в PATH: AppData/Local/OpenAI/Codex/bin/*/codex.exe; список моделей из ~/.codex/models_cache.json"
@@ -129,6 +138,15 @@ agents:
     transport: cli
     host: laptop
     configured: true
+    capabilities:
+      text: {supported: true, evidence: "catalog"}
+      patch: {supported: false, evidence: "unknown", reason: "правки не подтверждены"}
+      workdir: {supported: false, evidence: "catalog", reason: "адаптер отклоняет cwd: каталог проекта не гарантируется"}
+      commands: {supported: false, evidence: "unknown", reason: "запуск команд не подтверждён"}
+      usage: {supported: false, evidence: "catalog", reason: "канал не отдаёт usage"}
+      streaming: {supported: false, evidence: "catalog", reason: "поток не поддерживается"}
+      stop: {supported: false, evidence: "unknown", reason: "остановка не подтверждена"}
+      output_control: {supported: false, evidence: "catalog", reason: "обрезка вывода делается хабом, а не каналом"}
     bridge_agent: openclaw
     command: "openclaw agent --message-file <file> --json"
     notes: "gateway только на loopback, ходим через CLI"
@@ -224,6 +242,15 @@ agents:
     transport: cli
     host: laptop
     configured: true
+    capabilities:
+      text: {supported: true, evidence: "catalog"}
+      patch: {supported: false, evidence: "catalog", reason: "oneshot без подтверждения инструментов"}
+      workdir: {supported: true, evidence: "fixture:bridge-cwd"}
+      commands: {supported: false, evidence: "unknown", reason: "запуск команд не подтверждён"}
+      usage: {supported: false, evidence: "catalog", reason: "quiet/oneshot не отдаёт usage"}
+      streaming: {supported: false, evidence: "catalog", reason: "не используется"}
+      stop: {supported: false, evidence: "catalog", reason: "подтверждённая остановка не реализована"}
+      output_control: {supported: true, evidence: "catalog"}
     bridge_agent: hermes
     command: "hermes -z <prompt>"
     notes: "режим одного запроса; через хаб — pull-воркер ноутбука"
@@ -242,6 +269,15 @@ agents:
     transport: cdp
     host: laptop
     configured: true
+    capabilities:
+      text: {supported: true, evidence: "catalog"}
+      patch: {supported: false, evidence: "catalog", reason: "только CDP/DOM, без файловых операций"}
+      workdir: {supported: false, evidence: "catalog", reason: "каталог проекта недоступен через CDP"}
+      commands: {supported: false, evidence: "catalog", reason: "команды недоступны"}
+      usage: {supported: false, evidence: "catalog", reason: "usage не отдаётся"}
+      streaming: {supported: false, evidence: "unknown", reason: "не подтверждено"}
+      stop: {supported: false, evidence: "unknown", reason: "не подтверждено"}
+      output_control: {supported: false, evidence: "catalog", reason: "вывод не ограничивается каналом"}
     bridge_agent: qwen
     notes: "только через CDP/DOM, API нет"
 
@@ -271,6 +307,15 @@ agents:
     transport: http
     host: server
     configured: true
+    capabilities:
+      text: {supported: true, evidence: "catalog"}
+      patch: {supported: false, evidence: "catalog", reason: "файлы проекта недоступны"}
+      workdir: {supported: false, evidence: "catalog", reason: "файлы проекта недоступны"}
+      commands: {supported: false, evidence: "catalog", reason: "команды недоступны"}
+      usage: {supported: true, evidence: "catalog"}
+      streaming: {supported: false, evidence: "catalog", reason: "не используется"}
+      stop: {supported: false, evidence: "catalog", reason: "не реализовано"}
+      output_control: {supported: true, evidence: "catalog"}
     bridge_agent: llm-server
     model: dolphin-2.9-llama3-8b.Q4_K_M
     notes: "127.0.0.1:11434, OpenAI-совместимый; ctx 8192, max_tokens 1024"
@@ -306,6 +351,15 @@ agents:
     transport: http
     host: server
     configured: true
+    capabilities:
+      text: {supported: true, evidence: "catalog"}
+      patch: {supported: false, evidence: "catalog", reason: "OCR не пишет файлы"}
+      workdir: {supported: false, evidence: "catalog", reason: "файлы проекта недоступны"}
+      commands: {supported: false, evidence: "catalog", reason: "команды недоступны"}
+      usage: {supported: false, evidence: "catalog", reason: "usage не отдаётся"}
+      streaming: {supported: false, evidence: "catalog", reason: "не используется"}
+      stop: {supported: false, evidence: "catalog", reason: "не реализовано"}
+      output_control: {supported: true, evidence: "catalog"}
     bridge_agent: xiaomi-ocr-server
     notes: "Локальный OCR API 127.0.0.1:8787; модель xiaomi-ocr-q8"
 
@@ -329,6 +383,15 @@ agents:
     transport: cli
     host: server
     configured: true
+    capabilities:
+      text: {supported: true, evidence: "catalog"}
+      patch: {supported: false, evidence: "catalog", reason: "oneshot без подтверждения инструментов"}
+      workdir: {supported: true, evidence: "fixture:bridge-cwd"}
+      commands: {supported: false, evidence: "unknown", reason: "не подтверждено"}
+      usage: {supported: false, evidence: "catalog", reason: "quiet/oneshot не отдаёт usage"}
+      streaming: {supported: false, evidence: "catalog", reason: "не используется"}
+      stop: {supported: false, evidence: "catalog", reason: "не реализовано"}
+      output_control: {supported: true, evidence: "catalog"}
     bridge_agent: hermes-server
     command: "hermes -z <prompt>"
 
@@ -352,6 +415,15 @@ agents:
     transport: cli
     host: server
     configured: true
+    capabilities:
+      text: {supported: true, evidence: "catalog"}
+      patch: {supported: false, evidence: "unknown", reason: "правки не подтверждены"}
+      workdir: {supported: false, evidence: "catalog", reason: "каталог проекта не гарантируется"}
+      commands: {supported: false, evidence: "unknown", reason: "не подтверждено"}
+      usage: {supported: false, evidence: "catalog", reason: "канал не отдаёт usage"}
+      streaming: {supported: false, evidence: "catalog", reason: "не поддерживается"}
+      stop: {supported: false, evidence: "unknown", reason: "не подтверждено"}
+      output_control: {supported: false, evidence: "catalog", reason: "обрезка вывода делается хабом"}
     bridge_agent: openclaw-server
     command: "openclaw agent --message-file <file> --json"
 
@@ -369,6 +441,15 @@ agents:
     transport: cdp
     host: server
     configured: true
+    capabilities:
+      text: {supported: true, evidence: "catalog"}
+      patch: {supported: false, evidence: "catalog", reason: "только CDP/DOM, без файловых операций"}
+      workdir: {supported: false, evidence: "catalog", reason: "каталог проекта недоступен через CDP"}
+      commands: {supported: false, evidence: "catalog", reason: "команды недоступны"}
+      usage: {supported: false, evidence: "catalog", reason: "usage не отдаётся"}
+      streaming: {supported: false, evidence: "unknown", reason: "не подтверждено"}
+      stop: {supported: false, evidence: "unknown", reason: "не подтверждено"}
+      output_control: {supported: false, evidence: "catalog", reason: "вывод не ограничивается каналом"}
     bridge_agent: qwen-server
     notes: "CDP 9333, node qwen.js; требует авторизации в приложении"
 

@@ -29,6 +29,7 @@ from . import reconciliation
 from . import capabilities
 from . import packets
 from . import runs as runs_ctrl
+from . import templates as templates_ctrl
 from . import protocol as bridge_protocol
 from . import resources
 from . import workspace
@@ -1485,9 +1486,19 @@ def _resolve_run_agent(agent_id: str) -> tuple[str | None, str | None]:
     return bridge, None
 
 
+@app.get("/templates/five-roles", dependencies=[Depends(require_token)])
+async def five_roles_template(entry: str = "", contracts: str = "") -> dict:
+    parsed = [item.strip() for item in (contracts or "").split(",") if item.strip()]
+    return templates_ctrl.describe() | {"template": templates_ctrl.template(entry, parsed)}
+
+
 @app.post("/runs", dependencies=[Depends(require_token)])
 async def run_create(request: Request) -> JSONResponse:
     payload = await request.json()
+    if payload.get("template_id") == templates_ctrl.FIVE_ROLES_ID:
+        payload["template"] = templates_ctrl.template(
+            payload.get("entry") or "",
+            [c for c in (payload.get("contracts") or []) if isinstance(c, str)])
     project_id = payload.get("project_id")
     if not project_id:
         raise HTTPException(status_code=400, detail="project_id is required")

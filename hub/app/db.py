@@ -260,6 +260,8 @@ DDL = [
         updated_at timestamptz not null default now(),
         finished_at timestamptz
     )""",
+    "alter table aihub.run_tasks add column if not exists context jsonb not null default '{}'",
+    "alter table aihub.run_tasks add column if not exists context_id text",
     "create unique index if not exists run_tasks_key on aihub.run_tasks(run_id, key)",
     "create index if not exists run_tasks_job on aihub.run_tasks(job_id)",
     """create table if not exists aihub.run_events (

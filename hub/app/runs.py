@@ -10,7 +10,7 @@ import hashlib
 import json
 import uuid
 
-from . import db
+from . import db, templates
 
 RUN_STATES = ("active", "paused", "cancelled", "done", "failed")
 TASK_STATES = ("pending", "dispatched", "running", "done", "failed", "skipped", "cancelled")
@@ -179,6 +179,33 @@ def dispatch(run_id: str, resolve_agent, max_queue: int = 50) -> dict:
             attempt = int(task["attempt"] or 0) + 1
             key = f"run:{run_id}:{task['key']}:{attempt}"
             prompt = task.get("prompt") or task["key"]
+            context_spec = task.get("context") or {}
+            if isinstance(context_spec, str):
+                context_spec = json.loads(context_spec or "{}")
+            if context_spec:
+                project = db.get_project(run["project_id"]) or {}
+                ctx_id = None
+                try:
+                    entry_path = context_spec.get("entry") or ""
+                    contracts = [c for c in (context_spec.get("contracts") or []) if c]
+                    if entry_path:
+                        ctx = packets.create_context(
+                            project, context_spec.get("goal") or "", entry_path, contracts,
+                            int(context_spec.get("budget_tokens") or 2000))
+                        ctx_id = ctx["packet_id"]
+                    elif context_spec.get("paths"):
+                        ctx = packets.start(project, list(context_spec["paths"]),
+                                            int(context_spec.get("budget_tokens") or 2000) * 4)
+                        ctx_id = ctx["packet_id"]
+                except Exception as exc:  # noqa: BLE001
+                    event(conn, run_id, task["id"], "context_failed",
+                          {"reason": str(exc)[:200]})
+                if ctx_id:
+                    conn.run(db._qualify(
+                        "update aihub.run_tasks set context_id = :c where id = :i"),
+                        c=ctx_id, i=task["id"])
+                    prompt = prompt + chr(10) + chr(10) + "Вход роли: пакет " + ctx_id + "."
+
             sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
             job, used = db.create_job(bridge_agent, prompt, sha, 900, key, max_queue,
                                       None, None)
@@ -226,6 +253,14 @@ def on_task_result(job_id: str, ok: bool, error: str | None = None) -> dict | No
         if not task:
             return None
         state = "done" if ok else "failed"
+        error = error
+        job = db.get_job(job_id) or {}
+        output = job.get("result_output") or ""
+        role = task.get("role") or ""
+        if ok and role in templates.ROLES:
+            valid, _parsed, reason = templates.validate_output(role, output)
+            if not valid:
+                state, error = "failed", reason
         conn.run(db._qualify(
             "update aihub.run_tasks set state = :s, error = :e, updated_at = now(),"
             " finished_at = now() where id = :i"), s=state, e=error, i=task["id"])

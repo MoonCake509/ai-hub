@@ -12,3 +12,27 @@
 @media(max-width:600px){.top{height:auto;min-height:60px;padding:12px;flex-wrap:wrap;gap:9px}.brand{font-size:17px}.tabs{order:3;width:100%;height:auto}.tab{flex:1;font-size:11px}.token-button{margin-left:auto}.workspace-shell{display:flex;flex-direction:column}.workspace-sidebar{border-right:0;border-bottom:1px solid var(--line);padding:13px;gap:14px;max-height:320px}.workspace-sidebar section{flex:none}.sidebar-chats{min-height:0}.convs-list{display:flex;flex-wrap:wrap}.convs-list .conv{width:auto;max-width:220px}.projects-list{display:flex;flex-wrap:wrap}.projects-list .proj{width:auto}.sidebar-files .atts-list{display:flex;flex-wrap:wrap}.sidebar-bottom{display:none}.workspace-header{padding:17px}.workspace-header h1{font-size:19px}.workspace-header button{font-size:10px}.chat-toolbar{padding:12px 17px}.workspace-main{min-height:520px}.chat-log{padding:12px 17px;max-height:60dvh}.welcome h2{font-size:21px}.composer-area{padding:10px 13px}.composer-footer{padding:9px 11px}.composer-role{font-size:10px}.composer-help{font-size:9px}.workspace-team{display:block;padding:18px}.roles-list{grid-template-columns:repeat(2,minmax(0,1fr));margin-bottom:20px}.role-editor{border-top:1px solid var(--line);padding-top:18px}.workspace-team>.section-heading{margin-bottom:12px}.quota-summary{margin-top:20px}.layout{grid-template-columns:1fr}.recipient-label{font-size:0}.recipient-label select{font-size:11px}.settings-dialog{padding:20px}.meta{grid-template-columns:1fr}}
 .attachment-image{display:grid;grid-template-columns:auto minmax(0,1fr);align-items:start}.attachment-preview{grid-column:2;display:block;max-width:100%;max-height:180px;object-fit:contain;object-position:left top;border:1px solid var(--line);border-radius:6px;background:#0e131b}.attachment-image .preview-status,.attachment-image .attachment-dimensions{grid-column:2;overflow-wrap:anywhere}.preview-status{color:var(--faint)}.chat-toolbar{flex-wrap:wrap}.chat-route-hint{flex-basis:100%;margin:0 0 0 auto;max-width:75%;text-align:right;color:var(--muted);font-size:10px;line-height:1.4}.clear-context{padding:3px 7px;font-size:10px;color:var(--muted);background:#1b2531;border-color:#394a5c}.role-editor #role-capability{line-height:1.45}
 @media(max-width:600px){.chat-route-hint{max-width:100%;text-align:left;margin:0}.attachment-preview{max-height:140px}}
+/* UX-01: контекст перенесён под чат; страница прокручивается, панели sticky */
+.workspace-shell{height:auto;min-height:calc(100dvh - 64px);align-items:start}
+.workspace-sidebar{position:sticky;top:64px;height:calc(100dvh - 64px);min-height:0;overflow-y:auto}
+.workspace-team{position:sticky;top:64px;height:calc(100dvh - 64px);overflow-y:auto}
+.workspace-main{min-height:calc(100dvh - 64px)}
+.chat-log{flex:0 1 auto;min-height:240px;max-height:min(56dvh,640px);overflow-y:auto}
+.composer-area{flex:0 0 auto}
+.chat-context{flex:0 0 auto;margin:18px 28px 28px;padding:18px 20px;border:1px solid var(--line);border-radius:var(--radius);background:var(--panel)}
+.chat-context:focus-visible,.chat-context:focus{outline:2px solid var(--accent);outline-offset:2px}
+.context-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;margin-bottom:10px}
+.context-head h2{font-size:15px;margin:2px 0 0}
+.context-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.context-summary{font-size:11px;color:var(--muted);margin:0 0 10px}
+.context-filter{display:flex;align-items:center;gap:8px;font-size:11px;color:var(--faint);margin-bottom:10px;max-width:340px}
+.context-filter input{flex:1;min-width:0}
+.chat-context .atts-list{display:grid;gap:6px}
+.attachment.is-selected{background:#1d2b33;border-radius:8px}
+.context-tag{display:inline-flex;align-items:center;gap:6px;max-width:280px}
+.context-tag-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:180px}
+.context-tag-meta{color:#7fa6b0;font-size:9px;white-space:nowrap}
+.context-link{font-size:10px;color:var(--accent);align-self:center;padding:3px 4px;border-radius:5px;text-decoration:none}
+.context-link:hover{background:#1d2b33}
+@media(max-width:900px){.workspace-sidebar,.workspace-team{position:static;height:auto;max-height:none}.chat-context{margin:14px 12px 20px;padding:14px}}
+@media(max-width:600px){.chat-context{margin:12px 8px 18px}.context-filter{max-width:100%}}

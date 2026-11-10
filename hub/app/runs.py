@@ -260,7 +260,14 @@ def on_task_result(job_id: str, ok: bool, error: str | None = None) -> dict | No
         if ok and role in templates.ROLES:
             valid, _parsed, reason = templates.validate_output(role, output)
             if not valid:
-                state, error = "failed", reason
+                run_row = run_state(task["run_id"])
+                decision = retry_decision(role, int((run_row or {}).get("cycles") or 0),
+                                          (run_row or {}).get("policy") or {})
+                if decision["action"] == "retry_coder":
+                    _restart_from_coder(conn, task, decision)
+                    return {"run_id": task["run_id"], "task": task["key"],
+                            "state": "retry", "reason": decision["reason"]}
+                state, error = "failed", decision["reason"]
         conn.run(db._qualify(
             "update aihub.run_tasks set state = :s, error = :e, updated_at = now(),"
             " finished_at = now() where id = :i"), s=state, e=error, i=task["id"])
@@ -279,6 +286,32 @@ def on_task_result(job_id: str, ok: bool, error: str | None = None) -> dict | No
                 " where id = :i"), i=task["run_id"])
             event(conn, task["run_id"], None, "run_failed", {})
     return {"run_id": task["run_id"], "task": task["key"], "state": state}
+
+
+def _restart_from_coder(conn, task: dict, decision: dict) -> None:
+    """Возврат к кодеру: задача кодера снова pending, последующие сбрасываются."""
+    tasks = db._rows(conn, db._qualify(
+        "select id, key, state from aihub.run_tasks where run_id = :r"), r=task["run_id"])
+    coder = next((t for t in tasks if t["key"] == "code"), None)
+    if coder:
+        conn.run(db._qualify(
+            "update aihub.run_tasks set state = 'pending', error = null, updated_at = now()"
+            " where id = :i"), i=coder["id"])
+        event(conn, task["run_id"], coder["id"], "task_requeued",
+              {"reason": decision["reason"], "cycle": decision.get("next_cycle")})
+    for row in tasks:
+        if row["key"] in ("test", "review", "archive") and row["state"] == "pending":
+            continue
+        if row["key"] in ("test", "review", "archive") and row["state"] in ("done", "failed"):
+            conn.run(db._qualify(
+                "update aihub.run_tasks set state = 'pending', error = null, updated_at = now()"
+                " where id = :i"), i=row["id"])
+    conn.run(db._qualify(
+        "update aihub.runs set cycles = cycles + 1, updated_at = now() where id = :i"),
+        i=task["run_id"])
+    conn.run(db._qualify(
+        "update aihub.run_tasks set state = 'pending', error = null, updated_at = now()"
+        " where id = :i"), i=task["id"])
 
 
 def poll_active(resolve_agent, limit: int = 20) -> int:
@@ -310,3 +343,31 @@ def poll_active(resolve_agent, limit: int = 20) -> int:
         except RunError:
             continue
     return moved
+
+
+def run_state(run_id: str) -> dict | None:
+    """Политика и счётчик циклов запуска — для правил перехода."""
+    with db._lock:
+        conn = db.connect()
+        row = db._one(conn, db._qualify(
+            "select id, state, cycles, policy from aihub.runs where id = :i"), i=run_id)
+    if not row:
+        return None
+    out = dict(row)
+    if isinstance(out.get("policy"), str):
+        out["policy"] = json.loads(out["policy"] or "{}")
+    return out
+
+
+def retry_decision(role: str, cycles: int, policy: dict | None) -> dict:
+    """FLOW-03: вернуть кодеру, пока не исчерпан лимит циклов. Решение без LLM."""
+    policy = policy or {}
+    limit = int(policy.get("max_cycles") or 0)
+    if role not in ("tester", "reviewer"):
+        return {"action": "fail", "reason": f"роль {role or 'неизвестная'} не возвращает задачу кодеру"}
+    if limit <= 0:
+        return {"action": "fail", "reason": "политика запуска не разрешает циклы исправлений"}
+    if cycles >= limit:
+        return {"action": "fail", "reason": f"лимит циклов исчерпан: {cycles} из {limit}; нужна эскалация"}
+    return {"action": "retry_coder", "reason": f"цикл {cycles + 1} из {limit}",
+            "next_cycle": cycles + 1}

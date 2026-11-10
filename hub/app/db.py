@@ -237,11 +237,13 @@ DDL = [
         template_id text not null default 'default',
         template_version int not null default 1,
         policy jsonb not null default '{}',
+        cycles int not null default 0,
         state text not null default 'active',
         created_at timestamptz not null default now(),
         updated_at timestamptz not null default now(),
         finished_at timestamptz
     )""",
+    "alter table aihub.runs add column if not exists cycles int not null default 0",
     "create index if not exists runs_state on aihub.runs(state, updated_at)",
     """create table if not exists aihub.run_tasks (
         id text primary key,

@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('docker_runner', ROOT/'tools/docker_check_runner.py')
@@ -87,6 +88,34 @@ print(json.dumps(dict(host_file=Path(%r).exists(),secret=os.environ.get('AIHUB_R
         code, result = invoke(['python','hello.py'],mutate=lambda r:r['snapshot'].update(path=str(base)))
         assert code != 0 and result.get('error'), result
         results['outside_managed_root_rejected'] = True
+        request = {'protocol':1,'request_id':'fault-fixture',
+                   'snapshot':{'path':str(snapshot),'read_only':True,
+                               'tree_digest':host.tree_digest(str(snapshot))},
+                   'command':['python','hello.py'],'timeout_s':10,'limits':limits}
+        real_popen = subprocess.Popen
+        def fail_attach(argv,*args,**kwargs):
+            if len(argv)>1 and argv[1]=='start':
+                raise OSError('synthetic attach spawn failure')
+            return real_popen(argv,*args,**kwargs)
+        with patch.object(runner.subprocess,'Popen',side_effect=fail_attach):
+            try:
+                runner.execute(config,request)
+                raise AssertionError('spawn failure was not blocked')
+            except OSError:
+                pass
+        real_run = subprocess.run
+        def fail_after_create(argv,*args,**kwargs):
+            result = real_run(argv,*args,**kwargs)
+            if len(argv)>1 and argv[1]=='create':
+                raise subprocess.TimeoutExpired(argv,20)
+            return result
+        with patch.object(runner.subprocess,'run',side_effect=fail_after_create):
+            try:
+                runner.execute(config,request)
+                raise AssertionError('create timeout was not blocked')
+            except subprocess.TimeoutExpired:
+                pass
+        results['create_and_attach_faults_cleanup'] = True
         # An explicit operator mapping of the same Windows drive into WSL, not a
         # fallback to another host. This fixture lives on the actual R: mount.
         mapped_parent = ROOT/'tmp'

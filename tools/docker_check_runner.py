@@ -193,6 +193,15 @@ def execute(config, request):
     finally:
         if process is not None and process.poll() is None:
             process.kill()
+        if not cleanup_confirmed:
+            # Also cover create timeouts / a failed attach-client spawn. A
+            # creation timeout never starts the check, but may leave a stopped
+            # container if the daemon completed the create after client exit.
+            try:
+                subprocess.run([docker, 'rm', '-f', name], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
+            except (OSError, subprocess.SubprocessError):
+                pass  # Caller receives blocked/error, never an attested PASS.
 
 
 def main():

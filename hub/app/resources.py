@@ -118,8 +118,13 @@ def acquire(conn, key: str, holder: str, job_id: str, ttl_s: int = DEFAULT_TTL_S
                     lease_until = excluded.lease_until,
                     released_at = null,
                     meta = excluded.meta
-                where aihub.resource_leases.lease_until < now()
-                   or aihub.resource_leases.job_id = :job
+                where (aihub.resource_leases.lease_until < now()
+                   or aihub.resource_leases.job_id = :job)
+               and not exists (
+                   select 1 from aihub.jobs live
+                    where live.id = aihub.resource_leases.job_id
+                      and live.status in ('running', 'unknown', 'cancel_requested')
+               )
                returning key, generation, lease_until, holder, job_id"""),
         k=key, kind=kind, host=host_id, holder=holder, job=job_id,
         ttl=str(int(ttl_s)), meta=json.dumps(meta or {}, ensure_ascii=False),
@@ -136,6 +141,17 @@ def holder_of(conn, key: str) -> dict | None:
         "select key, kind, host_id, holder, job_id, generation, lease_until, released_at"
         " from aihub.resource_leases where key = :k and lease_until > now()"), k=key)
     return dict(row) if row else None
+
+
+def renew_for_job(conn, job_id: str, generation: int | None, ttl_s: int) -> dict | None:
+    """Renew a checkout only while this exact generation still owns an unexpired lease."""
+    return db._one(conn, db._qualify(
+        "update aihub.resource_leases set lease_until = now() + (:ttl || ' seconds')::interval"
+        " where job_id = :job and (CAST(:generation AS integer) is null or generation = CAST(:generation AS integer))"
+        " and lease_until > now()"
+        " returning key, generation, lease_until, job_id"),
+        ttl=str(int(ttl_s)), job=job_id,
+        generation=int(generation) if generation is not None else None)
 
 
 def release_for_job(conn, job_id: str) -> int:
@@ -170,7 +186,9 @@ def sweep() -> int:
         row = db._one(conn, db._qualify(
             "with freed as (update aihub.resource_leases"
             " set released_at = coalesce(released_at, now()), job_id = null, holder = null"
-            " where lease_until < now() and job_id is not null returning key)"
+            " where lease_until < now() and job_id is not null"
+            " and not exists (select 1 from aihub.jobs j where j.id = aihub.resource_leases.job_id"
+            " and j.status in ('running', 'unknown', 'cancel_requested')) returning key)"
             " select count(*) as n from freed"))
         return int(row["n"] if row else 0)
 

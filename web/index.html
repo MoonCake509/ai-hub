@@ -1,6 +1,6 @@
 <!doctype html>
 <html lang="ru">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#10141c"><title>AI Hub — проекты, команда и качество</title><link rel="stylesheet" href="styles.css?v=27"><link rel="stylesheet" href="quality.css?v=2"></head>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#10141c"><title>AI Hub — проекты, команда и качество</title><link rel="stylesheet" href="styles.css?v=28"><link rel="stylesheet" href="quality.css?v=3"></head>
 <body>
 <header class="top">
   <a class="brand" href="/ui/" aria-label="AI Hub — рабочее пространство"><span class="brand-mark">AI</span><span>Hub<span class="ver" id="version"></span><span class="ver" id="build"></span></span></a>
@@ -86,30 +86,47 @@
       <div class="more-wrap"><button id="more" type="button" hidden>Показать ещё</button></div>
     </div>
   </section>
+  <section class="panel recon-panel" aria-labelledby="recon-title">
+    <div class="panel-head"><div><div class="eyebrow">CORE-03</div><h2 id="recon-title">Исключения и сверка</h2></div><div class="recon-toolbar">
+      <label>Решение<select id="recon-decision-state"><option value="unresolved">Открытые</option><option value="accepted_historical">Принятые как исторические</option><option value="rejected">Отклонённые</option><option value="all">Все</option></select></label>
+      <label>Статус задания<select id="recon-job-status"><option value="all">Все</option><option value="unknown">Неизвестно</option><option value="cancel_requested">Отмена запрошена</option><option value="running">В работе</option><option value="succeeded">Успешно</option><option value="failed">Ошибка</option><option value="cancelled">Отменено</option></select></label>
+      <button type="button" class="ghost small" id="recon-refresh">Обновить</button>
+    </div></div>
+    <p class="hint" id="recon-status" role="status" aria-live="polite">Загрузка исключений…</p>
+    <div class="recon-list" id="recon-list"></div><div class="more-wrap"><button type="button" id="recon-more" hidden>Показать ещё</button></div>
+    <section class="recon-detail" id="recon-detail" hidden aria-live="polite"></section>
+  </section>
 </main>
 
 <main id="view-quality" class="quality-view" hidden>
   <header class="quality-header">
-    <div><div class="eyebrow">КАЧЕСТВО КАНАЛОВ</div><h1>Проверка выбранного маршрута</h1><p id="q-suite-description" class="hint">Загружаю версионированный набор проверок…</p></div>
+    <div><div class="eyebrow">КАЧЕСТВО КАНАЛОВ</div><h1>Проверка выбранного канала</h1><p class="hint">Короткая проверка запускается сразу. Расширенные проверки находятся в раскрытом разделе.</p></div>
     <button type="button" class="ghost small" id="q-refresh">Обновить данные</button>
   </header>
   <div id="q-error" class="quality-error" role="alert" hidden></div>
   <section class="quality-start panel">
-    <div><div class="eyebrow">ОДИН РУЧНОЙ ЗАПУСК</div><h2>Маршрут и объём проверки</h2><p class="hint">Каждая проверка создаёт отдельную задачу в обычной очереди. Автоматических повторов нет.</p></div>
-    <div class="quality-version-note"><strong>OCR вручную</strong><br>Текущий набор проверок текстовый: он не отправляет изображения и не запускает OCR. Для ручной проверки прикрепите изображение в рабочем пространстве и выберите маршрут, который поддерживает изображения. Такие каналы остаются доступны для управления ниже.</div>
+    <div><div class="eyebrow">БЫСТРАЯ ПРОВЕРКА</div><h2>Проверить выбранный канал</h2><p class="hint">До трёх коротких проб с общим пределом 45 секунд. Незапущенные пробы останутся пропущенными.</p></div>
+    <div class="quality-version-note"><strong>Выбор канала</strong><br>Выберите агента, провайдера и модель. Для текстового канала выполняется до трёх проверок; для изображения — одна OCR-проба.</div>
     <form id="q-start-form" class="quality-controls">
       <label>Агент<select id="q-agent" required><option value="">Выберите агента</option></select></label>
       <label>Провайдер<select id="q-provider" required disabled><option value="">Выберите провайдера</option></select></label>
       <label>Модель<select id="q-model" required disabled><option value="">Выберите модель</option></select></label>
-      <label>Количество задач<select id="q-case-count"><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4" selected>4</option></select></label>
-      <label>Лимит времени на задачу, с<input id="q-timeout" type="number" min="10" max="180" value="60" required></label>
-      <button type="submit" class="primary" id="q-start">Запустить проверку</button>
       <input id="q-channel" type="hidden" value="">
+      <button type="submit" class="primary quality-quick-action" id="q-quick" data-mode="quick">Запустить быструю проверку · до 45 с</button>
+      <details class="quality-advanced" id="q-advanced">
+        <summary>Расширенная проверка</summary>
+        <p id="q-suite-description" class="hint">Загружаю версионированный набор проверок…</p>
+        <div class="quality-advanced-controls">
+          <label>Количество задач<select id="q-case-count"><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4" selected>4</option></select></label>
+          <label>Лимит времени на задачу, с<input id="q-timeout" type="number" min="10" max="180" value="60"></label>
+          <button type="submit" class="ghost" id="q-start" data-mode="extended">Запустить расширенную проверку</button>
+        </div>
+        <p id="q-scope-note" class="quality-scope-note">Результат относится только к включённым базовым проверкам и не является общей оценкой модели.</p>
+        <div id="q-suite-cases" class="quality-cases"></div>
+      </details>
     </form>
     <p id="q-selection-status" class="quality-selection-status" role="status">Последовательно выберите агента, провайдера и модель.</p>
-    <p id="q-start-status" class="msg" role="status"></p>
-    <p id="q-scope-note" class="quality-scope-note">100% означает, что пройдены все запущенные проверки. Это результат базового набора, не общая оценка модели.</p>
-    <div id="q-suite-cases" class="quality-cases"></div>
+    <p id="q-start-status" class="msg" role="status" aria-live="polite"></p>
   </section>
   <section class="quality-columns">
     <section class="panel quality-channels">
@@ -124,6 +141,7 @@
       <section id="q-run-detail" class="quality-run-detail" hidden></section>
     </section>
   </section>
+
 </main>
 
 <aside class="detail" id="detail" hidden>
@@ -155,5 +173,5 @@
 <dialog id="project-dialog" class="settings-dialog"><form id="project-settings-form"><div class="dialog-heading"><h2 id="project-dialog-title">Настройки проекта</h2><button type="button" id="project-dialog-close" class="icon-button" aria-label="Закрыть настройки">×</button></div><label>Название<input id="project-name" required maxlength="120" placeholder="Название проекта"></label><label>Устройство<select id="project-host"><option value="laptop">Ноутбук</option><option value="server">Сервер</option></select></label><label>Рабочая папка на этом устройстве<input id="project-workdir" placeholder="C:\Projects\my-project" autocomplete="off"></label><p class="hint">Агент работает в этой папке. Серверный путь не подставляется на ноутбуке.</p><p id="project-dialog-error" class="err" role="alert"></p><button type="submit" class="primary">Сохранить проект</button></form></dialog>
 <div id="toast" class="toast" role="status" hidden></div>
 <div class="gate" id="gate" hidden><form class="gate-box" id="token-form"><div class="brand-mark">AI</div><h2>Подключиться к AI Hub</h2><p>Введите токен доступа к вашему хабу.</p><label class="sr-only" for="token-input">Токен доступа</label><input id="token-input" type="password" placeholder="HUB_TOKEN" autocomplete="off"><div class="row"><button class="primary" id="token-save" type="button">Подключиться</button><button class="ghost" id="token-cancel" type="button">Отмена</button><button class="ghost" id="token-diag" type="button">Диагностика</button></div><pre id="diag" class="diag" hidden></pre><p class="msg" id="token-status"></p><p class="err" id="token-err" role="alert"></p></form></div>
-<script src="app.js?v=27"></script><script src="quality.js?v=2"></script>
+<script src="app.js?v=28"></script><script src="quality.js?v=3"></script>
 </body></html>

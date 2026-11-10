@@ -351,7 +351,7 @@ def check_plan(project_id: str, names: list[str]) -> dict:
         if not isinstance(cmd, list) or not cmd or not all(isinstance(x, str) for x in cmd):
             raise OpError("bad_check_plan", f"проверка {name}: cmd должен быть списком строк")
         resolved.append({"name": name, "cmd": cmd[:20],
-                         "timeout_s": _int(item.get("timeout_s", 120), 1, 1800, "timeout_s")})
+                         "timeout_s": _int(item.get("timeout_s", 120), 1, 300, "timeout_s")})
     return {"checks": resolved}
 
 
@@ -364,6 +364,13 @@ def create_op_job(op: str, args: dict, host_id: str, project_id: str | None = No
         raise OpError("bad_host", "host_id обязателен")
     caps = host_capabilities(host)
     supported = caps.get("workspace_ops") or []
+    if op == "apply_patch" and (caps.get("workspace_fencing") != 1
+                                or caps.get("workspace_effect_journal") != 1):
+        raise OpError("writer_unsupported", "workspace writer lacks fencing/effect journal support")
+    if op == "run_checks" and op not in supported:
+        raise OpError("runner_unavailable", "host has no configured isolated check runner")
+    if op == "run_checks" and caps.get("isolated_runner_protocol") != 1:
+        raise OpError("runner_unavailable", "host has no configured isolated check runner")
     if op not in supported:
         raise OpError("unsupported_op",
                       f"host {host} не объявил операцию {op} (capabilities: {supported or 'нет'})")
@@ -374,7 +381,8 @@ def create_op_job(op: str, args: dict, host_id: str, project_id: str | None = No
         raise OpError("root_not_allowed", "корень вне разрешённых каталогов проектов этого host")
     if op == "run_checks":
         clean["plan"] = check_plan(project_id or "", clean["checks"])
-    digest = _sha({"op": op, "root": ckey(clean["root"]), "args": clean})
+    digest = _sha({"op": op, "root": ckey(clean["root"]), "args": clean,
+                   "host_id": host, "project_id": project_id})
     # Idempotency key обязателен для модифицирующих операций. Для чтения ключ по
     # умолчанию не подставляется: иначе повторный read возвращал бы прежний
     # результат вместо текущего содержимого файла.
@@ -400,10 +408,15 @@ def create_op_job(op: str, args: dict, host_id: str, project_id: str | None = No
         "op": op,
         "args": clean,
     }
-    job, created = db.create_job(
-        "workspace", json.dumps(envelope, ensure_ascii=False), digest,
-        int(timeout_s or (1800 if op == "run_checks" else 300)),
-        key or None, workspace=snapshot, kind="workspace")
+    try:
+        job, created = db.create_job(
+            "workspace", json.dumps(envelope, ensure_ascii=False), digest,
+            int(timeout_s or (1800 if op == "run_checks" else 300)),
+            key or None, workspace=snapshot, kind="workspace")
+    except ValueError as exc:
+        if str(exc) == "idempotency_key_conflict":
+            raise OpError("idempotency_conflict", "idempotency key already belongs to another target") from None
+        raise
     if created and key:
         db.record_workspace_receipt(key, op, host, job["id"], digest, "pending")
     return {"job": job, "created": created, "receipt": db.workspace_receipt(key),

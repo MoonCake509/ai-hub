@@ -3,7 +3,7 @@
 
 const API = window.location.pathname.startsWith('/ui') ? '' : '';
 const TOKEN_KEY = 'aihub_token';
-const BUILD = 'ui24';
+const BUILD = 'ui25-core03';
 function storeGet(k) { try { return localStorage.getItem(k) || ''; } catch (e) { return ''; } }
 function storeSet(k, v) { try { localStorage.setItem(k, v); return true; } catch (e) { return false; } }
 function storeDel(k) { try { localStorage.removeItem(k); } catch (e) { /* заблокировано */ } }
@@ -11,6 +11,7 @@ let token = storeGet(TOKEN_KEY);
 let currentJob = null;
 let currentStatus = '';
 let agents = [];
+let agentsLoading = false;
 let agentNames = new Map();
 let runProfileGen = 0;
 let pollTimers = [];
@@ -97,6 +98,21 @@ async function api(path, opts = {}) {
   }
   return data;
 }
+
+// CORE-03: the original job outcome remains separate from any human historical decision.
+const Recon={decisionState:'unresolved',jobStatus:'all',cursor:null,items:[],generation:0,busy:false,reloadWanted:false,selected:null,detailGeneration:0,decisionBusy:false,notice:''};
+const RECON_ACTION={unresolved:'не принято',accepted_historical:'принят как исторический артефакт',rejected:'отклонён',accept_historical:'Принять как исторический артефакт',reject:'Отклонить'};
+const RECON_JOB_STATUS={unknown:'неизвестно',cancel_requested:'отмена запрошена',succeeded:'успешно',failed:'ошибка',running:'в работе',queued:'в очереди',cancelled:'отменено',timeout:'таймаут'};
+function reconDate(value){if(!value)return '—';const date=new Date(value);return Number.isNaN(date.getTime())?String(value):date.toLocaleString()}
+function reconValue(value){if(value===null||value===undefined||value==='')return '—';return typeof value==='object'?JSON.stringify(value):String(value)}
+function reconIsLate(item){return String(item.case_id||'').startsWith('late:')||/late/i.test(String(item.kind||''))||!!item.late_result_id}
+function reconField(parent,label,value,warning=false){const row=el('div','recon-field'+(warning?' recon-warning':''));row.append(el('span','recon-label',label),el('span','recon-value',reconValue(value)));parent.append(row);return row}
+function reconRenderList(append=false){const box=$('#recon-list');if(!append)box.replaceChildren();for(const item of Recon.items){const caseId=String(item.case_id||'');const button=el('button','recon-case'+(Recon.selected?.case_id===caseId?' active':''));button.type='button';button.dataset.caseId=caseId;button.append(el('strong','recon-case-title',(reconIsLate(item)?'Поздний результат':'Неизвестное исполнение')+' · '+(item.job_id||caseId)));const states=el('span','recon-case-states');states.append(el('span','badge '+(item.job_status||'unknown'),'Задание: '+(RECON_JOB_STATUS[item.job_status]||item.job_status||'—')),el('span','badge recon-decision-'+(item.decision_state||'unresolved'),'Сверка: '+(RECON_ACTION[item.decision_state]||item.decision_state||'открыта')));button.append(states,el('span','recon-case-meta',(item.operation?.operation||item.operation?.kind||item.operation||'операция')+' · '+reconDate(item.received_at||item.created_at)));button.onclick=()=>reconOpenCase(caseId);box.append(button)}$('#recon-more').hidden=!Recon.cursor}
+function reconRenderDetail(item){const box=$('#recon-detail');box.replaceChildren();box.hidden=false;if(Recon.notice){const notice=el('p','msg ok recon-notice',Recon.notice);notice.setAttribute('role','status');box.append(notice)}const head=el('div','recon-detail-head');head.append(el('h3','',(reconIsLate(item)?'Поздний артефакт':'Сверка задания')+' · '+(item.job_id||item.case_id)));const close=el('button','ghost small','Закрыть');close.type='button';close.onclick=()=>{box.hidden=true;Recon.selected=null;reconRenderList()};head.append(close);box.append(head);const states=el('div','recon-state-grid');reconField(states,'Исходный статус задания',RECON_JOB_STATUS[item.job_status]||item.job_status);reconField(states,'Состояние исполнения',item.execution_state);reconField(states,'Решение сверки',RECON_ACTION[item.decision_state]||item.decision_state||'не принято');reconField(states,'Статус попытки',item.attempt_status);reconField(states,'Попытка',item.attempt_no);reconField(states,'Ревизия',item.revision);box.append(states);const evidence=item.evidence||{};const facts=el('section','recon-evidence');facts.append(el('h4','','Связь и доказательства'));reconField(facts,'Задание',evidence.job_id||item.job_id);reconField(facts,'Попытка',evidence.attempt_id||item.attempt_id);reconField(facts,'Операция',evidence.operation||item.operation?.operation||item.operation?.kind);reconField(facts,'Ключ операции',evidence.operation_key||item.operation?.operation_key);reconField(facts,'Кандидат',evidence.candidate_digest||item.candidate_digest);reconField(facts,'Дерево',evidence.tree_digest);reconField(facts,'Preimage',evidence.preimage_digest);reconField(facts,'Происхождение',evidence.provenance);if(item.artifact_summary)reconField(facts,'Краткое описание артефакта',item.artifact_summary);if(item.disabled_reason)reconField(facts,'Причина недоступности принятия',item.disabled_reason,true);box.append(facts);const actions=Array.isArray(item.allowed_actions)?item.allowed_actions:[];if(actions.includes('accept_historical')||actions.includes('reject')){const form=el('form','recon-decision');form.append(el('h4','','Решение оператора'));form.append(el('p','hint','Принятие отмечает только исторический артефакт. Оно не меняет статус задания, попытки или текущего кандидата.'));const label=el('label','recon-reason-label','Обязательное основание');const reason=el('textarea','');reason.required=true;reason.minLength=10;reason.maxLength=1000;reason.rows=3;reason.placeholder='Опишите, что именно проверено';reason.setAttribute('aria-label','Обязательное основание решения');label.append(reason);form.append(label);const buttons=el('div','row');for(const action of ['accept_historical','reject'])if(actions.includes(action)){const button=el('button',action==='accept_historical'?'primary':'ghost',action==='accept_historical'?'Принять как исторический артефакт':'Отклонить');button.type='submit';button.dataset.action=action;buttons.append(button)}form.append(buttons);const message=el('p','msg recon-decision-msg');message.setAttribute('role','status');form.append(message);form.onsubmit=event=>{event.preventDefault();if(!event.submitter||Recon.decisionBusy)return;reconDecide(item,event.submitter.dataset.action,reason.value,form)};box.append(form)}else{reconField(box,'Действия','Решение недоступно по имеющимся доказательствам.');if(item.disabled_reason)reconField(box,'Причина',item.disabled_reason,true)}const history=el('section','recon-audit');history.append(el('h4','','История решений'));const decisions=item.audit||[];if(!decisions.length)history.append(el('p','hint','Решений пока нет.'));for(const decision of decisions){const entry=el('article','recon-audit-entry');entry.append(el('strong','',RECON_ACTION[decision.action]||decision.action),el('span','recon-audit-meta',reconDate(decision.created_at)+' · '+reconValue(decision.actor)+' · ревизия '+reconValue(decision.revision)));entry.append(el('p','',reconValue(decision.reason)));history.append(entry)}box.append(history)}
+async function reconLoad(append=false){if(Recon.busy){if(!append){Recon.generation++;Recon.reloadWanted=true}return}Recon.busy=true;const generation=++Recon.generation;const status=$('#recon-status');if(!append){Recon.cursor=null;Recon.items=[];status.textContent='Загружаю исключения…'}try{const params=new URLSearchParams({decision_state:Recon.decisionState,job_status:Recon.jobStatus,limit:'50'});if(append&&Recon.cursor)params.set('cursor',Recon.cursor);const data=await api('/workspace/reconciliation/cases?'+params.toString());if(generation!==Recon.generation)return;const page=data.items||[];if(append){const known=new Set(Recon.items.map(item=>item.case_id));for(const item of page)if(!known.has(item.case_id))Recon.items.push(item)}else Recon.items=page;Recon.cursor=data.next_cursor||null;status.textContent=Recon.items.length?'Показано '+Recon.items.length+' исключений':'Исключений нет';reconRenderList(!append);if(Recon.selected)reconOpenCase(Recon.selected.case_id,true)}catch(error){if(generation===Recon.generation){status.textContent='Не удалось загрузить исключения: '+error.message;status.className='quality-error recon-error';status.setAttribute('role','alert');$('#recon-refresh').textContent='Повторить';$('#recon-more').hidden=true}}finally{Recon.busy=false;if(Recon.reloadWanted){Recon.reloadWanted=false;reconLoad(false)}}}
+async function reconOpenCase(caseId,preserveNotice=false){if(!preserveNotice)Recon.notice='';const generation=++Recon.detailGeneration;try{const item=await api('/workspace/reconciliation/cases/'+encodeURIComponent(caseId));if(generation!==Recon.detailGeneration)return;Recon.selected=item;reconRenderList();reconRenderDetail(item)}catch(error){if(generation===Recon.detailGeneration&&error.message!=='unauthorized')$('#recon-status').textContent='Не удалось открыть сверку: '+error.message}}
+async function reconDecide(item,action,reason,form){if(Recon.decisionBusy)return;const clean=String(reason||'').trim();if(clean.length<10||clean.length>1000){form.querySelector('.recon-decision-msg').textContent='Укажите проверяемое основание длиной от 10 до 1000 символов.';return}Recon.decisionBusy=true;form.querySelectorAll('button').forEach(button=>button.disabled=true);const message=form.querySelector('.recon-decision-msg');message.textContent='Сохраняю решение…';try{await api('/workspace/reconciliation/cases/'+encodeURIComponent(item.case_id)+'/decision',{method:'POST',body:JSON.stringify({action,expected_revision:item.revision,reason:clean})});Recon.notice='Решение сохранено в истории. Исходный статус задания не изменён.';await reconOpenCase(item.case_id,true);await reconLoad(false)}catch(error){if(/409|revision|conflict|stale/i.test(error.message)){Recon.notice='Ревизия изменилась. Показана актуальная карточка и история; проверьте их перед новым решением.';await reconOpenCase(item.case_id,true)}else {Recon.notice='';message.textContent='Решение не подтверждено: '+error.message}}finally{Recon.decisionBusy=false;form.querySelectorAll('button').forEach(button=>button.disabled=false)}}
+function wireReconciliation(){const decision=$('#recon-decision-state'),job=$('#recon-job-status'),refresh=$('#recon-refresh'),more=$('#recon-more');if(decision)decision.onchange=()=>{Recon.decisionState=decision.value;Recon.selected=null;Recon.notice='';$('#recon-detail').hidden=true;reconLoad(false)};if(job)job.onchange=()=>{Recon.jobStatus=job.value;Recon.selected=null;Recon.notice='';$('#recon-detail').hidden=true;reconLoad(false)};if(refresh)refresh.onclick=()=>reconLoad(false);if(more)more.onclick=()=>reconLoad(true)}
 
 // ---------- токен ----------
 function node(id) { return document.getElementById(id); }
@@ -231,7 +247,17 @@ async function health() {
 }
 
 // ---------- агенты ----------
-function obsAge(iso) {
+function obsAge(iso, ageSeconds) {
+  const serverAge = Number(ageSeconds);
+  if (Number.isFinite(serverAge) && ageSeconds !== null && ageSeconds !== undefined) {
+    const s = Math.max(0, Math.round(serverAge));
+    if (s < 60) return s + ' с назад';
+    const m = Math.floor(s / 60);
+    if (m < 60) return m + ' мин назад';
+    const h = Math.floor(m / 60);
+    if (h < 48) return h + ' ч назад';
+    return Math.floor(h / 24) + ' дн назад';
+  }
   if (!iso) return '';
   const t = new Date(iso).getTime();
   if (!Number.isFinite(t)) return '';
@@ -290,7 +316,7 @@ function obsPanel(a) {
     line.append(el('span', 'obs-kind', OBS_KIND_RU[kind]));
     line.append(el('span', 'obs-state ' + state, OBS_STATE_RU[state] || state));
     const meta = [];
-    meta.push(o && o.checked_at ? obsAge(o.checked_at) : 'наблюдений нет');
+    meta.push(o && o.checked_at ? obsAge(o.checked_at, o.age_s) : 'наблюдений нет');
     if (o && o.checked_at) meta.push(obsTtl(o));
     if (o && o.source) meta.push('источник: ' + o.source);
     line.append(el('span', 'obs-meta', meta.join(' · ')));
@@ -322,17 +348,24 @@ function obsBadge(a, row) {
 }
 
 async function loadAgents() {
-  const data = await api('/agents');
-  agents = data.agents || [];
+  if (agentsLoading) return;
+  agentsLoading = true;
   const list = $('#agents-list');
   const select = $('#run-agent');
-  list.innerHTML = '';
+  const selectedAgent = select.value;
+  const activeAgent = list.querySelector('.agent.active')?.dataset.id || '';
+  const expanded = new Set(Array.from(list.querySelectorAll('.agent')).filter(row => row.querySelector('.obs-panel')).map(row => row.dataset.id));
+  try {
+  const data = await api('/agents');
+  agents = data.agents || [];
+  list.replaceChildren();
   select.innerHTML = '';
   $('#agents-count').textContent = agents.length + ' в реестре';
 
   for (const a of agents) {
     const row = el('div', 'agent');
     row.dataset.id = a.id;
+    if (a.id === activeAgent) row.classList.add('active');
     row.append(el('span', 'id', a.id));
     row.append(obsBadge(a, row));
     row.append(el('span', 'transport', a.transport || ''));
@@ -342,6 +375,7 @@ async function loadAgents() {
       select.value = a.id;
       if (!$('#run-prompt').value) $('#run-prompt').focus();
     };
+    if (expanded.has(a.id)) row.append(obsPanel(a));
     list.append(row);
 
     const opt = el('option', '', a.id + (a.effective_state === 'ok' ? '' : ' · ' + (OBS_EFFECTIVE_RU[a.effective_state] || a.effective_state || 'нет данных')));
@@ -354,10 +388,10 @@ async function loadAgents() {
     agentNames.set(a.id, a.name || a.id);
     if (a.bridge_agent) agentNames.set(a.bridge_agent, a.name || a.bridge_agent);
   }
-  if (agents.length) {
-    select.value = agents[0].id;
-    await loadAgentProfiles(agents[0].id);
-  }
+  const wanted = agents.some(a => a.id === selectedAgent) ? selectedAgent : (agents[0]?.id || '');
+  select.value = wanted;
+  if (wanted && wanted !== selectedAgent) await loadAgentProfiles(wanted);
+  } finally { agentsLoading = false; }
 }
 
 // Профили и модели агента: заполняем селекты из реестра.
@@ -714,12 +748,12 @@ const ROLE_META = {
   reviewer: ['Ревьюер','R','Проверка результата и замечания'],
   archivist: ['Архивариус','D','Документация и сохранение решений'],
 };
-const WS={projects:[],project:null,convs:[],conv:null,roles:{},atts:[],messages:[],selectedAtts:new Set(),attFilter:'',roleId:'architect',profiles:new Map(),generation:0,editorGen:0,editorProfilesLoading:false,pollTimer:null,pending:null,dirty:false,sending:false,view:'workspace',newProject:false,previewUrls:new Map(),previewLoads:new Map(),previewGeneration:0,activeImageByConversation:new Map(),convFilter:'',convLimit:24,convSignature:'',convShownId:'',msgSignature:'',convCursor:'',convHasMore:false,convTotal:0,convLoading:false,convSeq:0,convFilterTimer:null};
+const WS={projects:[],project:null,convs:[],conv:null,roles:{},atts:[],messages:[],selectedAtts:new Set(),attFilter:'',roleId:'architect',profiles:new Map(),generation:0,editorGen:0,editorProfilesLoading:false,pollTimer:null,pending:null,dirty:false,sending:false,view:'workspace',newProject:false,projectSaving:false,previewUrls:new Map(),previewLoads:new Map(),previewGeneration:0,activeImageByConversation:new Map(),convFilter:'',convLimit:24,convSignature:'',convShownId:'',msgSignature:'',convCursor:'',convHasMore:false,convTotal:0,convLoading:false,convSeq:0,convFilterTimer:null};
 
 function toast(message,error=false){const box=$('#toast');box.textContent=message;box.classList.toggle('error',error);box.hidden=false;clearTimeout(toast.timer);toast.timer=setTimeout(()=>box.hidden=true,5500)}
 function workspaceError(error){const text=String(error?.message||error);if(text==='unauthorized')return;$('#workspace-error-text').textContent=text.includes('404')||text==='Not Found'?'Сервер ещё не обновлён: API проектов недоступен. Обновите backend вместе с интерфейсом.':text;$('#workspace-error').hidden=false}
 function action(fn){return async(...args)=>{try{return await fn(...args)}catch(error){workspaceError(error);toast(error.message||String(error),true)}}}
-function switchView(name){WS.view=name;document.querySelectorAll('.tab').forEach(b=>{b.classList.toggle('active',b.dataset.view===name);b.setAttribute('aria-pressed',String(b.dataset.view===name))});$('#view-workspace').hidden=name!=='workspace';$('#view-ops').hidden=name!=='ops';$('#detail').hidden=true;currentJob=null;if(name==='workspace'&&token)wsRefreshAll().catch(workspaceError);if(name==='ops'&&token)loadJobs()}
+function switchView(name){WS.view=name;document.querySelectorAll('.tab').forEach(b=>{b.classList.toggle('active',b.dataset.view===name);b.setAttribute('aria-pressed',String(b.dataset.view===name))});$('#view-workspace').hidden=name!=='workspace';$('#view-ops').hidden=name!=='ops';$('#detail').hidden=true;currentJob=null;if(name==='workspace'&&token)wsRefreshAll().catch(workspaceError);if(name==='ops'&&token){loadJobs();loadAgents().catch(error=>{if(error.message!=='unauthorized')$('#health-text').textContent='ошибка наблюдений: '+error.message});reconLoad(false)}}
 function putOptions(select,items,value){select.replaceChildren();for(const item of items){const option=el('option','',item.name||item.id);option.value=item.id;select.append(option)}if(items.some(x=>x.id===value))select.value=value;else if(items.length)select.value=items[0].id}
 function roleInfo(id){return ROLE_META[id]||[id,'?','']}
 function selectedAssignment(){return WS.roles[WS.roleId]||{role_id:WS.roleId,agent_id:'codex',profile:'',model:'',instructions:''}}
@@ -727,7 +761,7 @@ function setDraftDirty(){WS.dirty=true;$('#role-save-status').textContent=WS.edi
 function conversationStorageKey(){return 'aihub.conv.'+(WS.project?.id||'')}
 
 async function wsRefreshAll(){
- const gen=++WS.generation;$('#workspace-error').hidden=true;
+ const gen=++WS.generation;WS.convCursor='';WS.convHasMore=false;WS.convTotal=0;WS.convSeq++;$('#workspace-error').hidden=true;
  const data=await api('/projects');if(gen!==WS.generation)return;
  WS.projects=data.projects||[];const saved=storeGet('aihub.project');const previous=WS.project?.id;
  WS.project=WS.projects.find(p=>p.id===saved)||WS.projects[0]||null;
@@ -760,7 +794,8 @@ function wsConversationParams(reset){
 async function wsLoadConversations(options){
  const settings=options||{},reset=!!settings.reset,projectId=WS.project?.id;
  if(!projectId)return;
- const seq=++WS.convSeq;WS.convLoading=true;
+ if(reset){WS.convCursor='';WS.convHasMore=false;WS.convLoading=true;wsRenderConversations()}
+ const seq=++WS.convSeq;WS.convLoading=true;wsRenderConversations();
  try{
   const data=await api('/projects/'+projectId+'/conversations?'+wsConversationParams(reset).toString());
   if(seq!==WS.convSeq||WS.project?.id!==projectId)return;
@@ -772,8 +807,9 @@ async function wsLoadConversations(options){
   WS.convTotal=Number.isFinite(Number(data.total))?Number(data.total):WS.convs.length;
   wsRenderConversations()
  }catch(error){if(seq===WS.convSeq&&!settings.quiet)workspaceError(error)}
- finally{if(seq===WS.convSeq)WS.convLoading=false}
+ finally{if(seq===WS.convSeq){WS.convLoading=false;wsRenderConversations()}}
 }
+function wsLoadMoreConversations(){if(WS.convLoading)return Promise.resolve();return wsLoadConversations({})}
 function wsConversationSummary(loaded,total,filtered){
  if(!total)return 'чатов пока нет';
  if(filtered)return 'найдено '+wsChatCount(loaded)+(total>loaded?' из '+wsChatCount(total):'');
@@ -808,7 +844,7 @@ function wsRenderConversations(){
  if(current&&typeof current.scrollIntoView==='function')current.scrollIntoView({block:'nearest'});
 }
 async function wsOpenConversation(conversation){WS.conv=conversation;storeSet(conversationStorageKey(),conversation.id);WS.messages=[];WS.pending=null;if(conversation.role_id&&ROLE_META[conversation.role_id])WS.roleId=conversation.role_id;wsRenderConversations();renderRoles();await wsEditRole(WS.roleId);await wsLoadMessages();$('#chat-input').focus()}
-async function wsNewConversation(){if(!WS.project)throw Error('Сначала создайте или выберите проект.');const button=$('#conv-new');button.disabled=true;try{const conversation=await api('/projects/'+WS.project.id+'/conversations',{method:'POST',body:JSON.stringify({role_id:WS.roleId,title:'Новый чат'})});WS.convs.unshift(conversation);WS.convFilter='';delete WS.convSignature;const filterBox=$('#conv-filter');if(filterBox)filterBox.value='';await wsOpenConversation(conversation);wsRenderConversations();toast('Новый чат создан')}finally{button.disabled=false}}
+async function wsNewConversation(){if(!WS.project)throw Error('Сначала создайте или выберите проект.');const projectId=WS.project.id,button=$('#conv-new');button.disabled=true;try{const conversation=await api('/projects/'+projectId+'/conversations',{method:'POST',body:JSON.stringify({role_id:WS.roleId,title:'Новый чат'})});if(WS.project?.id!==projectId)return;WS.convFilter='';const filterBox=$('#conv-filter');if(filterBox)filterBox.value='';WS.convCursor='';WS.convHasMore=false;WS.convTotal=0;delete WS.convSignature;await wsLoadConversations({reset:true});if(WS.project?.id!==projectId)return;WS.conv=conversation;WS.convs=[conversation,...WS.convs.filter(item=>item.id!==conversation.id)];storeSet(conversationStorageKey(),conversation.id);WS.messages=[];WS.pending=null;if(conversation.role_id&&ROLE_META[conversation.role_id])WS.roleId=conversation.role_id;wsRenderConversations();renderRoles();await wsEditRole(WS.roleId);await wsLoadMessages();wsStartPolling();$('#chat-input').focus();toast('Новый чат создан')}finally{button.disabled=false}}
 
 function wsIsImageAttachment(attachment){return attachment?.kind==='image'||/^image\/(png|jpeg)$/i.test(attachment?.mime||'')}
 function wsRevokePreview(id){const url=WS.previewUrls.get(id);if(url){URL.revokeObjectURL(url);WS.previewUrls.delete(id)}}
@@ -995,7 +1031,7 @@ async function wsSend(text){
 function wsStartPolling(){clearInterval(WS.pollTimer);WS.pollTimer=setInterval(()=>{if(token&&!document.hidden&&WS.view==='workspace'&&WS.conv)wsLoadMessages().catch(error=>{if(error.message!=='unauthorized')$('#chat-msg').textContent='Не удалось обновить ответ: '+error.message})},2500)}
 
 function wsProjectDialog(create=false){WS.newProject=create;$('#project-dialog-title').textContent=create?'Новый проект':'Настройки проекта';$('#project-name').value=create?'':WS.project?.name||'';$('#project-host').value=create?'laptop':WS.project?.host_id||'laptop';$('#project-workdir').value=create?'':WS.project?.workdir||'';$('#project-dialog-error').textContent='';$('#project-dialog').showModal();$('#project-name').focus()}
-async function wsSaveProject(event){event.preventDefault();const payload={name:$('#project-name').value.trim(),host_id:$('#project-host').value,workdir:$('#project-workdir').value.trim()};if(!payload.name)return;try{const project=await api(WS.newProject?'/projects':'/projects/'+WS.project.id,{method:WS.newProject?'POST':'PATCH',body:JSON.stringify(payload)});storeSet('aihub.project',project.id);$('#project-dialog').close();WS.conv=null;await wsRefreshAll();toast('Проект сохранён')}catch(error){$('#project-dialog-error').textContent=error.message}}
+async function wsSaveProject(event){event.preventDefault();if(WS.projectSaving)return;const payload={name:$('#project-name').value.trim(),host_id:$('#project-host').value,workdir:$('#project-workdir').value.trim()};if(!payload.name)return;const button=$('#project-settings-form').querySelector('button[type=submit]'),originalText=button.textContent;WS.projectSaving=true;button.disabled=true;button.textContent='Сохраняю…';try{const project=await api(WS.newProject?'/projects':'/projects/'+WS.project.id,{method:WS.newProject?'POST':'PATCH',body:JSON.stringify(payload)});storeSet('aihub.project',project.id);$('#project-dialog').close();WS.conv=null;await wsRefreshAll();toast('Проект сохранён')}catch(error){$('#project-dialog-error').textContent=error.message}finally{WS.projectSaving=false;button.disabled=false;button.textContent=originalText}}
 function wsWire(){
  document.querySelectorAll('.tab').forEach(tab=>tab.addEventListener('click',()=>switchView(tab.dataset.view)));
  $('#workspace-retry').onclick=action(wsRefreshAll);$('#conv-new').onclick=action(wsNewConversation);$('#project-new').onclick=()=>wsProjectDialog(true);$('#project-settings').onclick=()=>wsProjectDialog(!WS.project);$('#project-dialog-close').onclick=()=>$('#project-dialog').close();$('#project-settings-form').onsubmit=wsSaveProject;
@@ -1003,18 +1039,18 @@ function wsWire(){
  $('#att-file').onchange=action(async event=>{const files=Array.from(event.target.files||[]);try{await wsUpload(files)}finally{event.target.value=''}});
  const filterBox=$('#att-filter');if(filterBox)filterBox.oninput=event=>{WS.attFilter=event.target.value||'';wsRenderAttachments()};
  const clearButton=$('#att-clear');if(clearButton)clearButton.onclick=()=>{WS.selectedAtts.clear();wsRenderAttachments()};
- const convFilter=$('#conv-filter');if(convFilter)convFilter.oninput=event=>{WS.convFilter=event.target.value||'';clearTimeout(WS.convFilterTimer);WS.convFilterTimer=setTimeout(()=>{wsLoadConversations({reset:true}).catch(workspaceError)},260)};const convMore=$('#conv-more');if(convMore)convMore.onclick=()=>{if(WS.convLoading)return;wsLoadConversations({}).catch(workspaceError)};
+ const convFilter=$('#conv-filter');if(convFilter)convFilter.oninput=event=>{WS.convFilter=event.target.value||'';WS.convSeq++;WS.convCursor='';WS.convHasMore=false;WS.convLoading=true;WS.convs=[];delete WS.convSignature;wsRenderConversations();clearTimeout(WS.convFilterTimer);WS.convFilterTimer=setTimeout(()=>{wsLoadConversations({reset:true}).catch(workspaceError)},260)};const convMore=$('#conv-more');if(convMore)convMore.onclick=()=>wsLoadMoreConversations().catch(workspaceError);
  $('#chat-form').onsubmit=async event=>{event.preventDefault();const input=$('#chat-input'),draft=input.value,text=draft.trim(),submittedProjectId=WS.project?.id,submittedConversationId=WS.conv?.id;if(!text||WS.sending)return;WS.sending=true;wsUpdateRecipient();$('#chat-msg').className='msg';$('#chat-msg').textContent='Передаю задачу…';try{const response=await wsSend(text),stillInSubmittedChat=WS.project?.id===submittedProjectId&&(!submittedConversationId||WS.conv?.id===submittedConversationId);if(stillInSubmittedChat&&input.value===draft)input.value='';if(stillInSubmittedChat){const warnings=response?.context_warnings||[];if(warnings.length){$('#chat-msg').className='msg warn-text';$('#chat-msg').textContent='Задача принята. Контекст: '+warnings.join(' ')}else{$('#chat-msg').className='msg ok';$('#chat-msg').textContent='Задача принята. Ответ появится в этом чате.'}}}catch(error){if(WS.project?.id===submittedProjectId&&(!submittedConversationId||WS.conv?.id===submittedConversationId)){$('#chat-msg').className='msg error';$('#chat-msg').textContent=error.message;workspaceError(error)}}finally{WS.sending=false;wsUpdateRecipient()}};
  $('#chat-input').onkeydown=event=>{if(event.key==='Enter'&&(event.ctrlKey||event.metaKey)){event.preventDefault();$('#chat-form').requestSubmit()}};$('#token-form').onsubmit=event=>{event.preventDefault();saveToken().catch(workspaceError)};
 }
 
 function stopPolling(){pollTimers.forEach(clearInterval);pollTimers=[];clearInterval(WS.pollTimer)}
-function startPolling(){pollTimers.forEach(clearInterval);pollTimers=[setInterval(()=>health(),15000),setInterval(()=>{if(token&&!document.hidden&&WS.view==='ops')loadJobs()},5000)];wsStartPolling()}
+function startPolling(){pollTimers.forEach(clearInterval);pollTimers=[setInterval(()=>health(),15000),setInterval(()=>{if(token&&!document.hidden&&WS.view==='ops')loadJobs()},5000),setInterval(()=>{if(token&&!document.hidden&&WS.view==='ops')loadAgents().catch(error=>{if(error.message!=='unauthorized')$('#health-text').textContent='ошибка наблюдений: '+error.message})},30000)];wsStartPolling()}
 
 async function boot(){
  await loadAgents();await Promise.allSettled([health(),loadJobs()]);
  try{await wsRefreshAll()}catch(error){workspaceError(error)}
  startPolling();
 }
-wireGate();wsWire();$('#build').textContent=BUILD;
+wireGate();wsWire();wireReconciliation();$('#build').textContent=BUILD;
 if(token)boot().catch(workspaceError);else openGate('');

@@ -13,9 +13,11 @@
 
 from __future__ import annotations
 
+import getpass
 import json
 import msvcrt
 import os
+import platform
 import subprocess
 import sys
 import threading
@@ -155,7 +157,98 @@ def acquire_single_instance() -> bool:
     return True
 
 
+PROTOCOL = 2
+ADAPTER_VERSION = "2.1"
+HEARTBEAT_S = int(os.environ.get("WORKER_HEARTBEAT_S", "60"))
+_VERSION_CACHE: dict[str, str | None] = {}
+
+
+def _cli_version(agent_id: str, path: str) -> str | None:
+    if agent_id in _VERSION_CACHE:
+        return _VERSION_CACHE[agent_id]
+    value = None
+    if path:
+        if path.lower().endswith(".cmd") or path.lower().endswith(".bat"):
+            argv = [os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe"), "/c", path, "--version"]
+        elif path.lower().endswith(".js"):
+            argv = [r"C:\Program Files\nodejs\node.exe", path, "--version"]
+        else:
+            argv = [path, "--version"]
+        try:
+            proc = subprocess.run(argv, capture_output=True, stdin=subprocess.DEVNULL, timeout=10)
+            text = (proc.stdout or b"").decode("utf-8", "replace") if proc.returncode == 0 else ""
+            for line in text.splitlines():
+                line = line.strip()
+                if line:
+                    value = line[:120]
+                    break
+        except Exception:  # noqa: BLE001
+            value = None
+    _VERSION_CACHE[agent_id] = value
+    return value
+
+
+def worker_heartbeat_payload() -> dict:
+    served = []
+    for agent_id, spec in AGENTS.items():
+        item = {"id": agent_id, "capabilities": {"workdir": True}}
+        path = spec.get("path")
+        if path:
+            item["cli_path"] = path
+            try:
+                st = os.stat(path)
+                item["cli_size"] = st.st_size
+                item["cli_mtime"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(st.st_mtime))
+            except OSError:
+                pass
+            version = _cli_version(agent_id, path)
+            if version:
+                item["cli_version"] = version
+            ready = os.path.exists(path)
+            item["ready"] = ready
+            if not ready:
+                item["problem"] = "CLI не найден по зарегистрированному пути"
+        served.append(item)
+    return {
+        "worker_id": WORKER,
+        "host": platform.node(),
+        "os_user": getpass.getuser(),
+        "pid": os.getpid(),
+        "protocol": PROTOCOL,
+        "adapter_version": ADAPTER_VERSION,
+        "agents": served,
+        "capabilities": {"workdir": True, "attachments": True, "outbox": "file"},
+        "identity": {"worker_home": HERE, "python": platform.python_version(), "service": "laptop-worker_v2"},
+    }
+
+
+def send_worker_heartbeat(base: str) -> dict:
+    payload = worker_heartbeat_payload()
+    try:
+        code, resp = http("POST", base + "/bridge/worker/heartbeat", payload, timeout=30)
+    except Exception as exc:  # noqa: BLE001
+        log(f"worker heartbeat error: {exc}")
+        return {"ok": False, "error": str(exc)}
+    if code != 200 or not resp.get("ok"):
+        log(f"worker heartbeat rejected http={code} {str(resp)[:200]}")
+        return {"ok": False, "http": code, "detail": resp}
+    return {"ok": True, "http": code, "agents": resp.get("agents"), "worker_id": resp.get("worker_id")}
+
+
+def worker_heartbeat_loop(base: str, stop: threading.Event) -> None:
+    while not stop.wait(HEARTBEAT_S):
+        send_worker_heartbeat(base)
+
+
 def main() -> int:
+    if "--heartbeat-once" in sys.argv:
+        base = hub_url()
+        if not base:
+            print(json.dumps({"ok": False, "error": "hub.txt пуст"}, ensure_ascii=False))
+            return 2
+        result = send_worker_heartbeat(base)
+        print(json.dumps(result, ensure_ascii=False))
+        return 0 if result.get("ok") else 1
     if not acquire_single_instance():
         log("poller: уже работает другой экземпляр — второй не запускаю")
         print("worker already running", file=sys.stderr)
@@ -165,6 +258,8 @@ def main() -> int:
         print("hub.txt пуст — укажи адрес хаба, например http://192.168.31.95:8000", file=sys.stderr)
         return 2
     log(f"poller start hub={base} worker={WORKER} token={'set' if TOKEN else 'none'}")
+    threading.Thread(target=worker_heartbeat_loop, args=(base, threading.Event()), daemon=True).start()
+    send_worker_heartbeat(base)
     print(f"aihub agent polling {base} as {WORKER}")
     drain_outbox()
 

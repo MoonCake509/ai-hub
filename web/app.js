@@ -252,12 +252,27 @@ function obsTtl(o) {
   return 'TTL ' + Math.round(s / 86400) + ' дн';
 }
 
+const OBS_DETAIL_RU = {
+  worker_id: 'исполнитель',
+  host: 'хост',
+  os_user: 'пользователь ОС',
+  pid: 'PID',
+  protocol: 'протокол',
+  adapter_version: 'адаптер',
+  cli_path: 'CLI',
+  cli_version: 'версия CLI',
+  cli_size: 'размер CLI',
+  cli_mtime: 'CLI изменён',
+  endpoint: 'адрес',
+};
+
 function obsDetailLine(detail) {
   const parts = [];
   for (const [k, v] of Object.entries(detail || {})) {
-    if (Array.isArray(v)) { if (v.length) parts.push(k + ': ' + v.join('/')); continue; }
+    const label = OBS_DETAIL_RU[k] || k;
+    if (Array.isArray(v)) { if (v.length) parts.push(label + ': ' + v.join('/')); continue; }
     if (v === null || v === undefined || v === '') continue;
-    parts.push(k + ': ' + v);
+    parts.push(label + ': ' + v);
   }
   return parts.join(' · ');
 }

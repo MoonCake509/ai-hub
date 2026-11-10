@@ -267,11 +267,58 @@ def test_diag01_observations():
     sql(cleanup)
 
 
+def test_diag03_workers():
+    """DIAG-03: heartbeat воркера — кто исполняет, что умеет, насколько свежо."""
+    wid = "ct-worker-1"
+    cleanup = ("delete from aihub.agent_observations where source like 'worker:ct-worker-%';"
+               "delete from aihub.workers where worker_id like 'ct-worker-%'")
+    sql(cleanup)
+    body = {
+        "worker_id": wid, "host": "CT-HOST", "os_user": "ct-user", "pid": 999,
+        "protocol": 2, "adapter_version": "2.1",
+        "capabilities": {"attachments": True, "token": "CT-SECRET"},
+        "identity": {"python": "3.12", "password": "CT-SECRET"},
+        "agents": [
+            {"id": "codex", "cli_path": "C:/ct/codex.exe", "cli_version": "codex 9.9", "ready": True},
+            {"id": "openclaw", "cli_path": "C:/ct/openclaw.cmd", "ready": False,
+             "problem": "порт исполнителя 8787 не отвечает"},
+        ],
+    }
+    code, d = api("POST", "/bridge/worker/heartbeat", body)
+    check("DIAG-03: heartbeat принят и покрыл двух агентов", code == 200 and d.get("agents") == 2, str(code) + " " + str(d))
+    check("DIAG-03: heartbeat отвергает чужую версию протокола",
+          api("POST", "/bridge/worker/heartbeat", dict(body, protocol=99))[0] == 409)
+    code, w = api("GET", "/workers")
+    mine = [x for x in (w.get("workers") or []) if x.get("worker_id") == wid]
+    check("DIAG-03: /workers показывает исполнителя", len(mine) == 1, str(w.get("count")))
+    me = mine[0] if mine else {}
+    check("DIAG-03: исполнитель с версией, пользователем и PID",
+          me.get("state") == "ok" and me.get("protocol") == 2 and me.get("os_user") == "ct-user" and me.get("pid") == 999,
+          str(me)[:200])
+    check("DIAG-03: секреты не сохранены и не отданы", "CT-SECRET" not in json.dumps(w), "leak")
+    code, a = api("GET", "/agents/codex")
+    av = (a.get("observations") or {}).get("availability") or {}
+    check("DIAG-03: кодек доступен с путём CLI и хостом",
+          av.get("state") == "ok" and (av.get("detail") or {}).get("cli_path") == "C:/ct/codex.exe"
+          and (av.get("detail") or {}).get("host") == "CT-HOST", str(av)[:250])
+    code, a = api("GET", "/agents/openclaw-laptop")
+    av2 = (a.get("observations") or {}).get("availability") or {}
+    check("DIAG-03: псевдоним openclaw → карточка openclaw-laptop",
+          av2.get("source") == "worker:" + wid, str(av2.get("source")))
+    check("DIAG-03: неготовый исполнитель даёт degraded, а не ok",
+          av2.get("state") == "degraded" and "8787" in (av2.get("reason") or ""), str(av2.get("state")) + " " + str(av2.get("reason")))
+    sql("update aihub.workers set hb_at = now() - interval '10 minutes' where worker_id = '" + wid + "'")
+    code, w = api("GET", "/workers")
+    mine = [x for x in (w.get("workers") or []) if x.get("worker_id") == wid]
+    check("DIAG-03: остановленный воркер становится stale", bool(mine) and mine[0].get("state") == "stale", str(mine)[:150])
+    sql(cleanup)
+
+
 if __name__ == "__main__":
     TOKEN = open(TOKEN_FILE, encoding="utf-8").read().strip()
     for fn in (test_idem_conflict, test_timeout_bounds, test_prompt_limit,
                test_duplicate_result, test_late_result, test_concurrent_queue,
-               test_diag01_observations):
+               test_diag01_observations, test_diag03_workers):
         print("==", fn.__name__)
         try:
             fn()

@@ -23,7 +23,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import chat_context, db, observations, probes, quality, quality_db
+from . import chat_context, db, observations, probes, quality, quality_db, workers
 from .image_validation import validate_image
 
 VERSION = "0.3.0"
@@ -41,9 +41,15 @@ MIN_TIMEOUT_S = int(os.environ.get("MIN_TIMEOUT_S", "10"))
 MAX_TIMEOUT_S = int(os.environ.get("MAX_TIMEOUT_S", "7200"))
 
 
+# Период уборки аренд привязан к их длительности: при LEASE_SECONDS=3 минутный
+# тик оставлял истёкшую аренду в running почти минуту, и поздний результат
+# принимался как актуальный. Верхняя граница — минута.
+SWEEP_INTERVAL_S = max(2, min(60, int(os.environ.get("LEASE_SECONDS", "300")) // 2))
+
+
 async def _sweeper() -> None:
     while True:
-        await asyncio.sleep(60)
+        await asyncio.sleep(SWEEP_INTERVAL_S)
         try:
             expired = await asyncio.to_thread(db.expire_leases)
             if expired:
@@ -57,6 +63,7 @@ async def lifespan(app: FastAPI):
     await asyncio.to_thread(db.init)
     await asyncio.to_thread(quality_db.init)
     await asyncio.to_thread(observations.init)
+    await asyncio.to_thread(workers.init)
     try:
         written = await asyncio.to_thread(
             observations.record_registry, load_agents().get("agents", []), None, VERSION)
@@ -1215,6 +1222,25 @@ async def cancel(job_id: str) -> dict:
         raise HTTPException(status_code=404, detail="job not found")
     await asyncio.to_thread(quality.refresh_job, job_id)
     return {"job_id": job_id, "status": status}
+
+
+@app.post("/bridge/worker/heartbeat", dependencies=[Depends(require_token)])
+async def worker_heartbeat(request: Request) -> dict:
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail="heartbeat must be a JSON object") from None
+    try:
+        cards = load_agents().get("agents", [])
+        return await asyncio.to_thread(workers.heartbeat, body, None, cards)
+    except workers.ProtocolError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+
+
+@app.get("/workers", dependencies=[Depends(require_token)])
+async def workers_list() -> dict:
+    items = await asyncio.to_thread(workers.list_workers)
+    return {"count": len(items), "workers": items}
 
 
 @app.get("/bridge/jobs", dependencies=[Depends(require_token)])

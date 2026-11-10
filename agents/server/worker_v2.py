@@ -7,10 +7,13 @@ GUI-приложение в контейнере не запустить. Ход
 
 from __future__ import annotations
 
+import getpass
 import json
 import msvcrt
 import os
+import platform
 import re
+import socket
 import subprocess
 import sys
 import tempfile
@@ -339,6 +342,123 @@ def execute_job(spec: dict, prompt: str, timeout: int, job: dict) -> dict:
     return spec["runner"](prompt, timeout)
 
 
+PROTOCOL = 2
+ADAPTER_VERSION = "2.1"
+HEARTBEAT_S = int(os.environ.get("WORKER_HEARTBEAT_S", "60"))
+
+# Что именно запускает воркер: путь и версия CLI, а не только имя агента.
+WORKER_CLI = {
+    "qwen-server": {"path": QWEN_JS, "version_argv": [NODE, QWEN_JS, "--version"]},
+    "openclaw-server": {"path": OPENCLAW_CMD, "version_argv": [COMSPEC, "/c", OPENCLAW_CMD, "--version"]},
+    "hermes-server": {"path": HERMES_EXE, "version_argv": [HERMES_EXE, "--version"]},
+    "llm-server": {"path": None, "endpoint": "http://127.0.0.1:11434"},
+    "xiaomi-ocr-server": {"path": None, "endpoint": "http://127.0.0.1:8787"},
+}
+
+# Живой порт исполнителя: CLI может лежать на месте, а окно/сервис быть закрытым.
+WORKER_PORT = {
+    "qwen-server": ("127.0.0.1", int(os.environ.get("QWEN_CDP_PORT", "9333"))),
+    "llm-server": ("127.0.0.1", 11434),
+    "xiaomi-ocr-server": ("127.0.0.1", 8787),
+}
+
+
+def _tcp_ok(host: str, port: int, timeout: float = 1.0) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+_VERSION_CACHE: dict[str, str | None] = {}
+
+
+def _cli_version(key: str, argv: list[str]) -> str | None:
+    if key in _VERSION_CACHE:
+        return _VERSION_CACHE[key]
+    value = None
+    try:
+        proc = subprocess.run(argv, capture_output=True, stdin=subprocess.DEVNULL,
+                              timeout=10, creationflags=CREATE_NO_WINDOW)
+        text = (proc.stdout or b"").decode("utf-8", "replace") if proc.returncode == 0 else ""
+        for line in text.splitlines():
+            line = line.strip()
+            if line:
+                value = line[:120]
+                break
+    except Exception:  # noqa: BLE001
+        value = None
+    _VERSION_CACHE[key] = value
+    return value
+
+
+def worker_heartbeat_payload() -> dict:
+    served = []
+    for agent_id, spec in AGENTS.items():
+        info = WORKER_CLI.get(agent_id) or {}
+        item = {"id": agent_id, "capabilities": {
+            "workdir": bool(spec.get("job_args")),
+            "attachments": agent_id in ("llm-server", "xiaomi-ocr-server"),
+        }}
+        cli_path = info.get("path")
+        if cli_path:
+            item["cli_path"] = cli_path
+            try:
+                st = os.stat(cli_path)
+                item["cli_size"] = st.st_size
+                item["cli_mtime"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(st.st_mtime))
+            except OSError:
+                item["cli_path"] = cli_path
+            argv = info.get("version_argv")
+            if argv:
+                version = _cli_version(agent_id, argv)
+                if version:
+                    item["cli_version"] = version
+        if info.get("endpoint"):
+            item["capabilities"]["endpoint"] = info["endpoint"]
+        port = WORKER_PORT.get(agent_id)
+        if port:
+            alive = _tcp_ok(*port)
+            item["ready"] = alive
+            if not alive:
+                item["problem"] = f"порт исполнителя {port[0]}:{port[1]} не отвечает"
+        elif cli_path:
+            ready = os.path.exists(cli_path)
+            item["ready"] = ready
+            if not ready:
+                item["problem"] = "CLI не найден по зарегистрированному пути"
+        served.append(item)
+    return {
+        "worker_id": WORKER,
+        "host": platform.node(),
+        "os_user": getpass.getuser(),
+        "pid": os.getpid(),
+        "protocol": PROTOCOL,
+        "adapter_version": ADAPTER_VERSION,
+        "agents": served,
+        "capabilities": {"workdir": True, "attachments": True, "outbox": "file"},
+        "identity": {"worker_home": STATE_DIR, "python": platform.python_version(),
+                     "service": os.environ.get("AIHUB_WORKER_SERVICE") or "worker_v2"},
+    }
+
+
+def send_worker_heartbeat() -> dict:
+    payload = worker_heartbeat_payload()
+    try:
+        code, resp = http("POST", "/bridge/worker/heartbeat", payload, timeout=30)
+    except Exception as exc:  # noqa: BLE001
+        log(f"worker heartbeat error: {exc}")
+        return {"ok": False, "error": str(exc)}
+    if code != 200 or not resp.get("ok"):
+        log(f"worker heartbeat rejected http={code} {str(resp)[:200]}")
+        return {"ok": False, "http": code, "detail": resp}
+    return {"ok": True, "http": code, "agents": resp.get("agents"), "worker_id": resp.get("worker_id")}
+
+
+def worker_heartbeat_loop(stop: threading.Event) -> None:
+    while not stop.wait(HEARTBEAT_S):
+        send_worker_heartbeat()
+
+
 def heartbeat_loop(attempt_id: str, lease: int, stop: threading.Event) -> None:
     interval = max(20, lease // 3)
     while not stop.wait(interval):
@@ -375,11 +495,18 @@ def acquire_single_instance() -> bool:
 
 
 def main() -> int:
+    if "--heartbeat-once" in sys.argv:
+        result = send_worker_heartbeat()
+        print(json.dumps(result, ensure_ascii=False))
+        return 0 if result.get("ok") else 1
     if not acquire_single_instance():
         log("worker: уже работает другой экземпляр — второй не запускаю")
         print("worker already running", file=sys.stderr)
         return 3
     log(f"worker start hub={HUB} worker={WORKER} token={'set' if TOKEN else 'none'}")
+    hb_stop = threading.Event()
+    threading.Thread(target=worker_heartbeat_loop, args=(hb_stop,), daemon=True).start()
+    send_worker_heartbeat()
     print(f"aihub-server-worker polling {HUB} as {WORKER}")
     drain_outbox()
     while True:

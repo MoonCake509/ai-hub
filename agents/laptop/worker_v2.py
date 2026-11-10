@@ -29,7 +29,7 @@ import urllib.request
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-from bridge import AGENTS, TOKEN, log  # noqa: E402
+from bridge import AGENTS, TOKEN, _agent_path, log  # noqa: E402
 
 HUB_FILE = os.path.join(HERE, "hub.txt")
 OUTBOX = os.path.join(HERE, "outbox")
@@ -192,7 +192,9 @@ def worker_heartbeat_payload() -> dict:
     served = []
     for agent_id, spec in AGENTS.items():
         item = {"id": agent_id, "capabilities": {"workdir": True}}
-        path = spec.get("path")
+        # Путь берём тем же резолвером, которым запускается CLI: закреплённый в
+        # реестре путь устаревает после обновления Codex.
+        path = _agent_path(agent_id, spec)
         if path:
             item["cli_path"] = path
             try:

@@ -90,12 +90,22 @@ def gate_candidate(run: dict) -> str:
     return digest
 
 
+def _norm_digest(value) -> str:
+    """Digest в ответе агента: допускаем префикс алгоритма и регистр.
+
+    Сравнивать `sha256:<hex>` с `<hex>` как разные значения — значит отбраковывать
+    верный отчёт тестировщика только за форму записи.
+    """
+    text = str(value or "").strip().lower()
+    return text[7:] if text.startswith("sha256:") else text
+
+
 def gate_tester_output(parsed: dict, *, candidate_digest: str) -> None:
     """Ворота тестировщика: его JSON обязан ссылаться на тот же кандидат."""
     if not isinstance(parsed, dict):
         raise GateError("bad_output", "выход тестировщика не является объектом")
     claimed = parsed.get("candidate_digest")
-    if claimed != candidate_digest:
+    if _norm_digest(claimed) != _norm_digest(candidate_digest):
         raise GateError("candidate_mismatch",
                         f"тестировщик ссылается на кандидата {claimed!r}, ожидался {candidate_digest!r}")
 
@@ -105,7 +115,7 @@ def gate_reviewer_output(parsed: dict, *, candidate_digest: str) -> None:
     if not isinstance(parsed, dict):
         raise GateError("bad_output", "выход ревьюера не является объектом")
     claimed = parsed.get("candidate_digest")
-    if claimed != candidate_digest:
+    if _norm_digest(claimed) != _norm_digest(candidate_digest):
         raise GateError("candidate_mismatch",
                         f"ревью относится к кандидату {claimed!r}, ожидался {candidate_digest!r}")
     if parsed.get("verdict") != "approve":

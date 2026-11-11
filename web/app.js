@@ -700,7 +700,7 @@ async function runPreflight() {
     const box = $('#flow-assignments');
     box.replaceChildren();
     box.append(el('strong', '', 'Назначения (снимок на момент создания)'));
-    for (const role of ['planner', 'coder', 'tester', 'reviewer', 'archivist']) {
+    for (const role of Object.keys(ROLE_META)) {
       const card = cards.find(c => c.role_id === role) || {};
       const agentId = card.agent_id || 'codex';
       const known = registry.has(agentId);

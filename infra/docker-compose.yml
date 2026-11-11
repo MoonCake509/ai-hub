@@ -72,7 +72,8 @@ services:
       BRIDGE_URL: ${BRIDGE_URL}
       BRIDGE_TOKEN: ${BRIDGE_TOKEN}
     volumes:
-      - ../config/agents.yaml:/app/config/agents.yaml:ro
+      # Каталог целиком: хаб читает и agents.yaml, и hub.yaml (корень проектов).
+      - ../config:/app/config:ro
       - ../web:/app/web:ro
       - ../hub/app:/app/app:ro
       - ./certs:/certs:ro

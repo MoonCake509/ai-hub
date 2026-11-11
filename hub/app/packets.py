@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import fnmatch
 import base64
+import threading
 import hashlib
 import json
 import os
@@ -556,7 +557,9 @@ def poll_active(limit: int = 20) -> int:
                 continue
             _store_built(row["id"], built, contents)
         elif op == "materialize":
-            _continue_materialize(row["id"], job)
+            # Материализация выполняется синхронно в _materialize_sync: тик не
+            # должен принимать результат порции параллельно с её сверкой.
+            pass
         elif op == "snapshot":
             result = job.get("result") or {}
             mark_materialized(row["id"], result.get("snapshot_id") or "", result.get("tree_digest"))
@@ -603,32 +606,129 @@ def start_materialize(packet_id: str) -> dict:
             raise PacketError("denied_path", f"выбранный путь запрещён политикой: {item['path']}")
         if not item.get("sha256"):
             raise PacketError("no_hash", f"в манифесте ревизии нет sha256: {item['path']}")
-    manifest = {"materialize": {"revision": revision, "total": len(selected),
-                                "verified": [], "pending": [i["path"] for i in selected]}}
-    with db._lock:
-        conn = db.connect()
-        db._one(conn, db._qualify(
-            "update aihub.context_packets set manifest = manifest || :m::jsonb, updated_at = now()"
-            " where id = :i returning id"),
-            m=json.dumps(manifest, ensure_ascii=False), i=packet_id)
-    if not selected:
-        mark_materialized(packet_id, f"hub://packets/{packet_id}@{revision}",
-                          packet.get("digest"))
-        return {"packet_id": packet_id, "state": "materialized", "revision": revision,
-                "files": 0}
-    job = workspace.create_op_job(
-        "read_files",
-        {"root": project.get("workdir") or "",
-         "files": [{"path": i["path"]} for i in selected[:MATERIALIZE_CHUNK]]},
-        project.get("host_id") or "", project["id"])
-    with db._lock:
-        conn = db.connect()
-        db._one(conn, db._qualify(
-            "update aihub.context_packets set state = 'materializing', provider_job_id = :j,"
-            " provider_op = 'materialize', updated_at = now() where id = :i returning id"),
-            j=job["job"]["id"], i=packet_id)
-    return {"packet_id": packet_id, "state": "materializing", "job_id": job["job"]["id"],
-            "revision": revision, "files": len(selected)}
+    # Сверка порций ждёт заданий воркера, поэтому идёт в отдельном потоке:
+    # синхронный вызов из обработчика заблокировал бы выдачу заданий.
+    def _run() -> None:
+        try:
+            _materialize_sync(packet_id, project, revision, items, selected)
+        except Exception as exc:  # noqa: BLE001 — пакет не должен зависнуть в materializing
+            fail(packet_id, f"материализация прервана: {exc}")
+
+    threading.Thread(target=_run, name=f"packet-{packet_id[:8]}", daemon=True).start()
+    return {"packet_id": packet_id, "state": "materializing", "revision": revision,
+            "files": len(selected)}
+
+
+def _materialize_sync(packet_id: str, project: dict, revision: int,
+                      items: list[dict], selected: list[dict]) -> dict:
+    """Прочитать выбранные файлы порциями и сверить каждую с манифестом.
+
+    Материализация идёт в одном месте: следующая порция запрашивается только
+    после сверки предыдущей, поэтому поздний результат старого задания не может
+    быть принят за новую порцию. Любое расхождение — conflict, а не «почти
+    materialized».
+    """
+    import hashlib as _hashlib
+    import time as _time
+    from . import workspace
+
+    by_path = {i["path"]: i for i in selected}
+    pending = [i["path"] for i in selected]
+    verified: list[str] = []
+    contents: list[tuple[str, dict, str]] = []
+    attempts = 0
+    while pending:
+        chunk = [by_path[p] for p in pending[:MATERIALIZE_CHUNK]]
+        job = workspace.create_op_job(
+            "read_files",
+            {"root": project.get("workdir") or "",
+             "files": [{"path": i["path"]} for i in chunk]},
+            project.get("host_id") or "", project["id"])
+        job_id = job["job"]["id"]
+        with db._lock:
+            conn = db.connect()
+            db._one(conn, db._qualify(
+                "update aihub.context_packets set state = 'materializing', provider_job_id = :j,"
+                " provider_op = 'materialize', updated_at = now() where id = :i returning id"),
+                j=job_id, i=packet_id)
+        final = None
+        deadline = _time.monotonic() + 300
+        while _time.monotonic() < deadline:
+            final = workspace.job_result(job_id) or {}
+            if final.get("status") in ("succeeded", "failed", "cancelled"):
+                break
+            _time.sleep(0.4)
+        attempts += 1
+        returned = {e.get("path"): e for e in ((final or {}).get("result") or {}).get("files") or []}
+        reason = None
+        if (final or {}).get("status") != "succeeded":
+            reason = f"чтение снимка не выполнено: {(final or {}).get('error') or 'job failed'}"
+        else:
+            for item in chunk:
+                entry = returned.get(item["path"])
+                if entry is None:
+                    reason = f"хост не вернул выбранный файл: {item['path']}"
+                    break
+                if entry.get("sha256") != item.get("sha256") or int(entry.get("size") or -1) != int(item.get("size") or -2):
+                    reason = f"содержимое не прошло SHA-256: {item['path']}"
+                    break
+                try:
+                    raw = (entry.get("text") if isinstance(entry.get("text"), str)
+                           else base64.b64decode(entry.get("content_b64") or "", validate=True).decode("utf-8"))
+                except (ValueError, UnicodeDecodeError, TypeError):
+                    reason = f"содержимое не является UTF-8: {item['path']}"
+                    break
+                contents.append((item["path"], item, raw))
+                pending.remove(item["path"])
+                if item["path"] not in verified:
+                    verified.append(item["path"])
+        if reason is not None:
+            with db._lock:
+                conn = db.connect()
+                db._one(conn, db._qualify(
+                    "update aihub.context_packets set state = 'conflict',"
+                    " manifest = manifest || :m::jsonb, updated_at = now() where id = :i returning id"),
+                    m=json.dumps({"materialize": {"error": reason, "revision": revision,
+                                                  "attempts": attempts}}, ensure_ascii=False),
+                    i=packet_id)
+            return {"packet_id": packet_id, "state": "conflict", "error": reason,
+                    "revision": revision, "verified": len(verified)}
+        progress = {"materialize": {"revision": revision, "total": len(selected),
+                                    "verified": verified, "pending": pending}}
+        with db._lock:
+            conn = db.connect()
+            db._one(conn, db._qualify(
+                "update aihub.context_packets set manifest = manifest || :m::jsonb,"
+                " updated_at = now() where id = :i returning id"),
+                m=json.dumps(progress, ensure_ascii=False), i=packet_id)
+    if contents:
+        with db._lock:
+            conn = db.connect()
+            for path, item, text in contents:
+                conn.run(db._qualify(
+                    "insert into aihub.context_packet_files(packet_id, revision, path, sha256, size, content)"
+                    " values (:p, :r, :path, :sha, :size, :content)"
+                    " on conflict (packet_id, revision, path) do update set"
+                    " sha256 = excluded.sha256, size = excluded.size, content = excluded.content"),
+                    p=packet_id, r=revision, path=path, sha=item["sha256"],
+                    size=int(item["size"]), content=text)
+    rev_digest = digest([{"path": i["path"], "size": i["size"],
+                          "sha256": i.get("sha256"), "selected": True}
+                         for i in items if i.get("selected")])
+    packet = _packet_row(packet_id) or {}
+    if not verify_materialized({"digest": packet.get("digest")}, rev_digest):
+        with db._lock:
+            conn = db.connect()
+            db._one(conn, db._qualify(
+                "update aihub.context_packets set state = 'conflict',"
+                " manifest = manifest || :m::jsonb, updated_at = now() where id = :i returning id"),
+                m=json.dumps({"materialize": {"error": "digest ревизии не совпал с digest пакета",
+                                              "revision": revision}}, ensure_ascii=False),
+                i=packet_id)
+        return {"packet_id": packet_id, "state": "conflict", "revision": revision}
+    mark_materialized(packet_id, f"hub://packets/{packet_id}@{revision}", rev_digest)
+    return {"packet_id": packet_id, "state": "materialized", "revision": revision,
+            "files": len(selected), "verified": len(verified)}
 
 
 def _continue_materialize(packet_id: str, job: dict) -> None:
@@ -636,6 +736,10 @@ def _continue_materialize(packet_id: str, job: dict) -> None:
     materialized, иначе conflict с причиной. Невыбранные файлы не запрашиваются."""
     from . import workspace
     packet = _packet_row(packet_id) or {}
+    # Результат устаревшей порции не должен сверяться с новой: поставленный
+    # provider_job_id — единственный актуальный запрос ревизии.
+    if job.get("id") and packet.get("provider_job_id") and job["id"] != packet["provider_job_id"]:
+        return
     project = db.get_project(packet.get("project_id") or "")
     if not project:
         fail(packet_id, "проект пакета не найден")
@@ -682,7 +786,10 @@ def _continue_materialize(packet_id: str, job: dict) -> None:
             verified.append(path)
     if reason is None:
         returned = {e.get("path") for e in ((job.get("result") or {}).get("files") or [])}
-        missing = [p for p in list(pending) if p in by_path and p not in returned]
+        # Сверяем только ту порцию, которую просили этим заданием: остальные
+        # выбранные файлы уходят следующим заданием, а не считаются пропавшими.
+        requested = list(state.get("requested") or pending)
+        missing = [p for p in requested if p in by_path and p not in returned]
         if missing:
             reason = f"хост не вернул выбранные файлы: {', '.join(missing[:3])}"
     if reason is not None:
@@ -720,6 +827,7 @@ def _continue_materialize(packet_id: str, job: dict) -> None:
                 " updated_at = now() where id = :i returning id"),
                 m=json.dumps(progress, ensure_ascii=False), i=packet_id)
         chunk = [by_path[p] for p in pending if p in by_path][:MATERIALIZE_CHUNK]
+        progress["materialize"]["requested"] = [i["path"] for i in chunk]
         next_job = workspace.create_op_job(
             "read_files",
             {"root": project.get("workdir") or "",

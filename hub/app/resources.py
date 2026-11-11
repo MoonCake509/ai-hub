@@ -186,9 +186,12 @@ def sweep() -> int:
         row = db._one(conn, db._qualify(
             "with freed as (update aihub.resource_leases"
             " set released_at = coalesce(released_at, now()), job_id = null, holder = null"
-            " where lease_until < now() and job_id is not null"
+            " where job_id is not null"
+            # Держит ресурс только живая аренда. Задание, которое хаб потерял при
+            # рестарте, уже не пишет в checkout: если оставить его блокировку,
+            # проект навсегда перестаёт получать новые задания.
             " and not exists (select 1 from aihub.jobs j where j.id = aihub.resource_leases.job_id"
-            " and j.status in ('running', 'unknown', 'cancel_requested')) returning key)"
+            " and j.status in ('running', 'cancel_requested') and j.lease_until > now()) returning key)"
             " select count(*) as n from freed"))
         return int(row["n"] if row else 0)
 

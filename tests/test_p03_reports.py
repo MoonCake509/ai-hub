@@ -18,16 +18,22 @@ RUN = {
     "project_id": "p-1",
     "state": "active",
     "template_id": "five-roles",
-    "branch": "task/demo",
-    "base_sha": "a" * 40,
-    "candidate_sha": "b" * 40,
+    "candidate_digest": "c" * 64,
+    "check_receipt": {
+        "ok": True,
+        "snapshot_id": "candidate-run-1",
+        "isolation": {"network": "none", "rootfs_read_only": True},
+        "checks": [{"name": "pytest", "passed": True, "exit_code": 0,
+                    "cmd": ["sh", "-c", "cd repo && python -m pytest -q"]}],
+    },
     "tasks": [
-        {"key": "plan", "title": "План", "role": "planner", "status": "done",
-         "candidate_sha": None, "receipt": {}},
-        {"key": "code", "title": "Правка", "role": "coder", "status": "running",
-         "candidate_sha": "b" * 40, "receipt": {}},
-        {"key": "test", "title": "Проверка", "role": "tester", "status": "queued",
-         "receipt": {"checks": [{"name": "pytest", "ok": True, "exit_code": 0}]}},
+        {"key": "plan", "role": "planner", "state": "done", "job_id": "1" * 12, "result": {}},
+        {"key": "code", "role": "coder", "state": "running", "job_id": "2" * 12,
+         "result": {"files": ["repo/app.py"]}},
+        {"key": "test", "role": "tester", "state": "queued", "job_id": "3" * 12,
+         "result": {"ok": True}},
+        {"key": "review", "role": "reviewer", "state": "done", "job_id": "4" * 12,
+         "result": {"verdict": "approve", "findings": [{"severity": "low", "issue": "cwd"}]}},
     ],
 }
 
@@ -36,17 +42,23 @@ def test_taskflow_has_facts():
     text = reports.build_taskflow(PROJECT, RUN)
     assert "TASKFLOW — Demo" in text
     assert "run-1" in text
-    assert "| Правка | coder | выполняется | bbbbbbbbbbbb | — |" in text
-    assert "| Проверка | tester | в очереди | — | 1/1 |" in text
-    assert "Шаг «Правка», роль coder" in text
+    assert "| code | coder | выполняется |" in text
+    assert "| test | tester | в очереди |" in text and "1/1" in text
+    assert "## Проверки изолированного runner'а" in text
+    assert "network=none" in text
+    assert "Вердикт: **approve**" in text
+    assert "Шаг «code», роль coder" in text
 
 
 def test_pr_draft_has_base_candidate_checks():
     drafts = reports.build_pr_drafts(PROJECT, RUN)
-    assert sorted(drafts) == ["ops/pr/code.md", "ops/pr/plan.md", "ops/pr/test.md"]
+    assert sorted(drafts) == ["ops/pr/code.md", "ops/pr/plan.md",
+                              "ops/pr/review.md", "ops/pr/test.md"]
     body = drafts["ops/pr/test.md"]
-    assert "aaaaaaaaaaaa" in body and "bbbbbbbbbbbb" in body.replace("b" * 12, "b" * 12)
+    assert "aaaaaaaaaaaa" in body and "cccccccccccc" in body
     assert "| pytest | ok | 0 |" in body
+    assert "repo/app.py" in drafts["ops/pr/code.md"]
+    assert "Вердикт: **approve**" in drafts["ops/pr/review.md"]
 
 
 def test_write_reports_ops_only_and_idempotent():

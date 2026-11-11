@@ -979,6 +979,17 @@ def expire_leases() -> int:
 # ============================================================
 
 ROLE_IDS = ("architect", "coder", "tester", "reviewer", "archivist")
+
+# В данных роль называется architect (исторически planner в шаблонах), в интерфейсе
+# и документах — «Архитектор». Подпись не меняет идентификаторы назначений.
+ROLE_LABELS = {
+    "architect": "Архитектор",
+    "planner": "Архитектор",
+    "coder": "Кодер",
+    "tester": "Тестер",
+    "reviewer": "Ревьюер",
+    "archivist": "Архивариус",
+}
 ROLE_ALIASES = {"planner": "architect"}
 
 ROLE_RU = {
@@ -1029,6 +1040,9 @@ def get_project(project_id: str) -> dict | None:
             return None
         proj["roles"] = _rows(conn, _qualify(
             "select * from aihub.roles where project_id = :p order by role_id"), p=project_id)
+        for role in proj["roles"]:
+            role["role_label"] = ROLE_LABELS.get(str(role.get("role_id") or ""),
+                                                 str(role.get("role_id") or ""))
         return proj
 
 

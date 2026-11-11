@@ -1,6 +1,6 @@
 name: aihub-test
-# Тестовый стенд AI Hub: ОТДЕЛЬНАЯ БД и роль с минимальными правами.
-# Стенд не видит и не может менять рабочие данные даже при баге подстановки схемы.
+# Тестовый стенд AI Hub: ОТДЕЛЬНАЯ копия исходников (R:\AI-Hub-stand), отдельная БД.
+# Bind-mount идёт в копию, а не в рабочий R:\AI-Hub: правка прода не подменяет код стенда.
 services:
   postgres-test:
     image: postgres:16-alpine
@@ -38,7 +38,9 @@ services:
       MAX_RESULT_CHARS: "100000"
     volumes:
       - ../hub/app:/app/app:ro
-      - ../config/agents.yaml:/app/config/agents.yaml:ro
+      - ../web:/app/web:ro
+      # Каталог целиком: хаб читает и agents.yaml, и hub.yaml (корень проектов).
+      - ../config:/app/config:ro
     ports:
       - "0.0.0.0:8100:8000"
     command: ["python", "-m", "app.serve"]

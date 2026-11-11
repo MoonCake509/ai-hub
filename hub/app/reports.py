@@ -40,40 +40,81 @@ def _short(sha: str | None) -> str:
     return text[:12] if text else "—"
 
 
+def _task_receipt(run: dict, task: dict) -> dict:
+    """Receipt проверок: у шага test он общий на прогон (receipt runner'а)."""
+    receipt = run.get("check_receipt") if str(task.get("key")) == "test" else None
+    if not isinstance(receipt, dict):
+        receipt = task.get("receipt") if isinstance(task.get("receipt"), dict) else {}
+    return receipt
+
+
+def _check_rows(receipt: dict) -> list[str]:
+    rows: list[str] = []
+    checks = receipt.get("checks") if isinstance(receipt, dict) else None
+    for check in checks if isinstance(checks, list) else []:
+        if not isinstance(check, dict):
+            continue
+        ok = check.get("passed", check.get("ok"))
+        cmd = check.get("cmd") or ""
+        if isinstance(cmd, list):
+            cmd = " ".join(str(x) for x in cmd)
+        rows.append(f"| {check.get('name') or '—'} | {'ok' if ok else 'fail'} | "
+                    f"{check.get('exit_code', '—')} | `{str(cmd)[:90]}` |")
+    return rows
+
+
 def build_taskflow(project: dict, run: dict) -> str:
     title = str(project.get("name") or "Project")
     tasks = run.get("tasks") or []
+    receipt = run.get("check_receipt") if isinstance(run.get("check_receipt"), dict) else {}
     lines = [
         f"# TASKFLOW — {title}",
         "",
         f"Прогон: `{run.get('id')}` · шаблон `{run.get('template_id')}` · состояние **{_label(run.get('state'))}**",
         "",
         f"Ветка: `{run.get('branch') or project.get('branch') or '—'}` · "
-        f"база `{_short(run.get('base_sha') or project.get('head_sha'))}` · "
-        f"кандидат `{_short(run.get('candidate_sha') or run.get('candidate_digest'))}`",
+        f"база `{_short(project.get('head_sha'))}` · "
+        f"кандидат `{_short(run.get('candidate_digest'))}`",
         "",
         "## Шаги",
         "",
-        "| Шаг | Роль | Статус | SHA | Проверки |",
+        "| Шаг | Роль | Статус | Задание | Проверки |",
         "| --- | --- | --- | --- | --- |",
     ]
     for task in tasks:
-        receipt = task.get("receipt") if isinstance(task.get("receipt"), dict) else {}
-        checks = receipt.get("checks") or receipt.get("ok")
-        if isinstance(checks, (list, tuple)):
-            checks_text = f"{sum(1 for c in checks if (c or {}).get('ok'))}/{len(checks)}"
-        elif checks is None:
-            checks_text = "—"
+        task_receipt = _task_receipt(run, task)
+        rows = _check_rows(task_receipt)
+        if rows:
+            ok = sum(1 for line in rows if "| ok |" in line)
+            checks_text = f"{ok}/{len(rows)}"
         else:
-            checks_text = "успех" if checks else "провал"
+            checks_text = "—"
         lines.append(
-            f"| {task.get('title') or task.get('key')} | {task.get('role')} | "
-            f"{_label(task.get('status'))} | {_short(task.get('candidate_sha') or task.get('job_sha'))} | {checks_text} |")
+            f"| {task.get('key')} | {task.get('role')} | {_label(task.get('state'))} | "
+            f"`{_short(task.get('job_id'))}` | {checks_text} |")
+    if receipt:
+        lines += ["", "## Проверки изолированного runner'а", ""]
+        lines += ["| Проверка | Итог | Код | Команда |", "| --- | --- | --- | --- |"]
+        lines += _check_rows(receipt)
+        isolation = receipt.get("isolation") if isinstance(receipt.get("isolation"), dict) else {}
+        if isolation:
+            flags = ", ".join(f"{k}={v}" for k, v in sorted(isolation.items()))
+            lines += ["", f"Изоляция: {flags}."]
+        if receipt.get("snapshot_id"):
+            lines += ["", f"Снимок: `{receipt.get('snapshot_id')}`."]
+    review = next((t for t in tasks if str(t.get("key")) == "review"), None)
+    if review and isinstance(review.get("result"), dict):
+        verdict = review["result"].get("verdict") or "—"
+        findings = review["result"].get("findings") or []
+        lines += ["", "## Решение ревьюера", "", f"Вердикт: **{verdict}** ({len(findings)} замечаний)."]
+        for item in findings[:10] if isinstance(findings, list) else []:
+            if isinstance(item, dict):
+                lines.append(f"- [{item.get('severity') or 'info'}] {str(item.get('issue'))[:200]}")
     lines += ["", "## Сейчас", ""]
-    current = next((t for t in tasks if t.get("status") in {"running", "queued"}), None)
+    current = next((t for t in tasks if t.get("state") in {"running", "dispatched", "waiting_context"}), None)
     if current:
-        lines.append(f"Шаг «{current.get('title') or current.get('key')}», роль {current.get('role')}, "
-                     f"статус {_label(current.get('status'))}.")
+        lines.append(f"Шаг «{current.get('key')}», роль {current.get('role')}, "
+                     f"статус {_label(current.get('state'))}.")
     elif run.get("state") in {"done", "succeeded", "accepted"}:
         lines.append("Работа завершена и принята.")
     else:
@@ -83,44 +124,50 @@ def build_taskflow(project: dict, run: dict) -> str:
 
 
 def build_pr_drafts(project: dict, run: dict) -> dict[str, str]:
-    """Один черновик на задачу: база, кандидат, проверки, ревью."""
+    """Один черновик на шаг: роль, задание, проверки, изменения, ревью."""
     drafts: dict[str, str] = {}
-    for task in run.get("tasks") or []:
+    tasks = run.get("tasks") or []
+    review = next((t for t in tasks if str(t.get("key")) == "review"), None)
+    for task in tasks:
         key = str(task.get("key") or "")
         if not key:
             continue
-        receipt = task.get("receipt") if isinstance(task.get("receipt"), dict) else {}
+        receipt = _task_receipt(run, task)
         result = task.get("result") if isinstance(task.get("result"), dict) else {}
-        checks = receipt.get("checks") or []
-        rows = []
-        for check in checks if isinstance(checks, list) else []:
-            if isinstance(check, dict):
-                rows.append(f"| {check.get('name') or check.get('command') or '—'} | "
-                            f"{'ok' if check.get('ok') else 'fail'} | {str(check.get('exit_code', ''))[:8]} |")
         body = [
-            f"# {task.get('title') or key}",
+            f"# {key}",
             "",
-            f"Прогон: `{run.get('id')}` · роль: {task.get('role')} · статус: {_label(task.get('status'))}",
+            f"Прогон: `{run.get('id')}` · роль: {task.get('role')} · статус: {_label(task.get('state'))}",
             "",
-            f"База: `{_short(run.get('base_sha') or project.get('head_sha'))}`  ",
-            f"Кандидат: `{_short(task.get('candidate_sha') or result.get('sha') or run.get('candidate_sha'))}`  ",
+            f"База: `{_short(project.get('head_sha'))}`  ",
+            f"Кандидат: `{_short(run.get('candidate_digest'))}`  ",
             f"Ветка: `{run.get('branch') or project.get('branch') or '—'}`",
             "",
             "## Проверки",
             "",
         ]
+        rows = _check_rows(receipt) or _check_rows(result)
         if rows:
-            body += ["| Проверка | Итог | Код |", "| --- | --- | --- |"] + rows
+            body += ["| Проверка | Итог | Код | Команда |", "| --- | --- | --- | --- |"] + rows
         else:
             body.append("Проверки не зафиксированы.")
         body += ["", "## Изменения", ""]
-        changed = result.get("changed_files") or receipt.get("write_set") or []
+        changed = result.get("files") or result.get("changed_files") or receipt.get("write_set") or []
         if isinstance(changed, list) and changed:
             body += [f"- `{item}`" for item in changed[:50]]
         else:
             body.append("Список файлов не зафиксирован.")
-        body += ["", "## Решение ревьюера", "",
-                 str(receipt.get("review") or result.get("review") or "Не зафиксировано."), ""]
+        body += ["", "## Решение ревьюера", ""]
+        if key == "review" and result.get("verdict"):
+            body.append(f"Вердикт: **{result['verdict']}**")
+            for item in (result.get("findings") or [])[:10]:
+                if isinstance(item, dict):
+                    body.append(f"- [{item.get('severity') or 'info'}] {str(item.get('issue'))[:300]}")
+        elif isinstance(review, dict) and isinstance(review.get("result"), dict):
+            body.append(f"Вердикт ревьюера по тому же кандидату: **{review['result'].get('verdict') or '—'}**")
+        else:
+            body.append("Ревью ещё не проводилось.")
+        body.append("")
         drafts[f"ops/pr/{key}.md"] = "\n".join(body)
     return drafts
 

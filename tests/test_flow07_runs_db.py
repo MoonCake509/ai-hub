@@ -404,7 +404,10 @@ class PipelineTest(DbTestCase):
         code_task = task_of(rid, "code")
         self.assertEqual(code_task["state"], "dispatched")
         retry_job = db.get_job(code_task["job_id"])
-        self.assertIn("другом снимке", retry_job["prompt"])
+        feedback = json.loads(retry_job["prompt"].splitlines()[-1])
+        self.assertEqual(feedback["role"], "tester")
+        self.assertIn(CANDIDATE, feedback["reason"])
+        self.assertIn("sha256:" + "d" * 64, feedback["reason"])
 
     def test_failing_receipt_returns_to_coder_without_tester(self):
         """Receipt с упавшей проверкой: кодеру, модель тестировщика не тратится."""

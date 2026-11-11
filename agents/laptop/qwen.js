@@ -33,6 +33,11 @@ async function connect(requireChat = false) {
     if (m.id && pending.has(m.id)) { pending.get(m.id)(m); pending.delete(m.id); }
   });
   await new Promise((res, rej) => { ws.addEventListener('open', res); ws.addEventListener('error', rej); });
+  const command = (method, params = {}) => new Promise(res => {
+    const myId = ++id;
+    pending.set(myId, m => res(m.error ? { error: m.error.message || String(m.error) } : { result: m.result }));
+    ws.send(JSON.stringify({ id: myId, method, params }));
+  });
   const evaluate = expr => new Promise(res => {
     const myId = ++id;
     pending.set(myId, m => {
@@ -43,6 +48,11 @@ async function connect(requireChat = false) {
     });
     ws.send(JSON.stringify({ id: myId, method: 'Runtime.evaluate', params: { expression: expr, returnByValue: true, awaitPromise: true, userGesture: true } }));
   });
+  // Окно в фоне перестаёт перерисовывать поток: живой DOM отдаёт обрезанный ответ,
+  // хотя модель уже договорила. Держим страницу видимой и активной на время прогона.
+  await command('Page.bringToFront');
+  await command('Emulation.setFocusEmulationEnabled', { enabled: true });
+  await command('Page.setWebLifecycleState', { state: 'active' });
   return { ws, evaluate };
 }
 
@@ -143,15 +153,24 @@ async function waitAnswer(evaluate, beforeText, timeoutMs = 240000) {
 
 function chatState(composerSelector) {
   const answers = document.querySelectorAll('.response-message-content.phase-answer');
+  const stop = [...document.querySelectorAll('button')].some(button =>
+    /^(stop|остановить)(?:\s|$)/i.test((button.getAttribute('aria-label') || '').trim()));
   return {
     count: answers.length,
     text: answers[answers.length - 1]?.innerText || '',
     model: document.querySelector('[aria-label="Select Model"]')?.innerText.trim() || '',
-    generating: Boolean(document.querySelector('.qwen-chat-message-awaiting-response'))
-      || [...document.querySelectorAll('button')].some(button =>
-        /^(stop|остановить)(?:\s|$)/i.test((button.getAttribute('aria-label') || '').trim())),
+    generating: Boolean(document.querySelector('.qwen-chat-message-awaiting-response')) || stop,
+    stop,
     draft: document.querySelector(composerSelector)?.value || '',
   };
+}
+
+// Маркер — единственное доказательство, что ответ дочитан до конца.
+function requireEndMarker(text, endMarker) {
+  const markerLine = text.lastIndexOf('\n' + endMarker);
+  if (markerLine < 0 || text.slice(markerLine + 1).trim() !== endMarker) {
+    throw new Error('Qwen Chat answer is incomplete: the response finished without the end marker');
+  }
 }
 
 async function readStructuredAnswer(expectedCount, expectedText, endMarker) {
@@ -193,7 +212,8 @@ async function readStructuredAnswer(expectedCount, expectedText, endMarker) {
   if (markerLine < 0 || output.slice(markerLine + 1).trim() !== endMarker) {
     throw new Error('Qwen Chat answer has no separate end marker');
   }
-  return output.slice(0, markerLine).replace(/\n+$/, '');
+  // Патч отдаём в LF и с завершающим переводом строки: без него git apply зовёт его битым.
+  return output.slice(0, markerLine).replace(/\r\n?/g, '\n').replace(/\n+$/, '') + '\n';
 }
 
 async function askStructured(evaluate, expectedModel, prompt) {
@@ -209,12 +229,37 @@ async function askStructured(evaluate, expectedModel, prompt) {
   if (!model || (expectedModel && model !== expectedModel.toLowerCase())) {
     throw new Error(`Qwen Chat model mismatch: expected ${expectedModel || 'a named model'}, selected ${before.model || '(unknown)'}`);
   }
-  if (before.draft || before.generating) throw new Error('Qwen Chat is busy or contains an unsent draft');
+  if (before.draft || before.stop) throw new Error('Qwen Chat is busy or contains an unsent draft');
   const endMarker = `AIHUB-END-${crypto.randomUUID().slice(0, 8)}`;
   const framedPrompt = `${prompt}\n\nAfter the complete answer, close any code fence and put this marker on its own final line: ${endMarker}`;
   const sent = await submit(evaluate, framedPrompt);
   if (!['CLICK', 'ENTER', 'ALREADY_EMPTY'].includes(sent)) throw new Error('Qwen Chat message was not submitted');
 
+  // Окно в фоне не дорисовывает поток: в живом DOM ответ обрывается на середине,
+  // а в истории чата он уже целый. Перечитываем историю, но требуем тот же маркер.
+  async function rereadFromHistory() {
+    await read(`(() => { setTimeout(() => location.reload(), 50); return 'RELOADING'; })()`);
+    let loaded = false;
+    let idle = 0;
+    for (let i = 0; i < 30; i++) {
+      await sleep(1000);
+      const s = await read(`(() => ({ ready: document.readyState === 'complete', count: document.querySelectorAll('.response-message-content.phase-answer').length }))()`);
+      if (s.count > before.count) { loaded = true; break; }
+      // Страница загрузилась, но нового ответа в истории нет — значит генерацию
+      // прервали (Stop) до того, как появился ответ. Ждать дальше незачем.
+      if (s.ready && ++idle >= 4) break;
+    }
+    if (!loaded) throw new Error('Qwen Chat answer is incomplete: the generation stopped before the answer was complete');
+    const state = await read(stateExpression);
+    if (!state.model || state.model.toLowerCase() !== model) {
+      throw new Error(`Qwen Chat model mismatch after reload: expected ${model}, selected ${state.model || '(unknown)'}`);
+    }
+    requireEndMarker(state.text, endMarker);
+    const output = await read(`(${readStructuredAnswer})(${state.count}, ${JSON.stringify(state.text)}, ${JSON.stringify(endMarker)})`);
+    return { output, model, model_label: state.model };
+  }
+
+  const sentAt = Date.now();
   let last = '';
   let stable = 0;
   for (;;) {
@@ -223,14 +268,21 @@ async function askStructured(evaluate, expectedModel, prompt) {
     if (state.model.toLowerCase() !== model) throw new Error('Qwen Chat model changed during the run');
     if (state.count > before.count + 1) throw new Error('Qwen Chat received another turn during the run');
     const finished = state.text.trimEnd().endsWith('\n' + endMarker);
-    if (state.count !== before.count + 1 || !finished || state.text !== last) {
+    if (state.text !== last) {
       last = state.text;
       stable = 0;
       continue;
     }
-    if (++stable >= 4) {
+    stable += 1;
+    if (finished && stable >= 4 && state.count === before.count + 1) {
       const output = await read(`(${readStructuredAnswer})(${state.count}, ${JSON.stringify(state.text)}, ${JSON.stringify(endMarker)})`);
       return { output, model, model_label: before.model };
+    }
+    // Ответ не растёт, «стоп» нет, маркера нет. Так выглядит и оборванная генерация,
+    // и ответ, который окно не дорисовало: и то и другое перечитываем из истории.
+    // Порог по времени — чтобы не принять за обрыв самое начало ответа.
+    if (!finished && !state.stop && stable >= 3 && Date.now() - sentAt > 20000) {
+      return await rereadFromHistory();
     }
   }
 }

@@ -216,6 +216,39 @@ async function readStructuredAnswer(expectedCount, expectedText, endMarker) {
   return output.slice(0, markerLine).replace(/\r\n?/g, '\n').replace(/\n+$/, '') + '\n';
 }
 
+// Переключение модели через интерфейс. Воркер не полагается на то, что приложение
+// запомнило прошлый выбор: кликает селектор, затем перечитывает название из триггера.
+async function switchModel(read, want) {
+  const wantText = want.toLowerCase();
+  const items = `[...document.querySelectorAll('.wms-list__name-text, [role="menuitem"], [role="option"], li')]`;
+  for (let round = 0; round < 4; round++) {
+    const current = (await read(`(document.querySelector('[aria-label="Select Model"]')?.innerText || '').trim()`)).toLowerCase();
+    if (current === wantText) return true;
+    for (let open = 0; open < 3; open++) {
+      const found = await read(`(() => {
+        const w = ${JSON.stringify(wantText)};
+        return ${items}.filter(e => { const t = (e.innerText || '').trim().toLowerCase(); return t === w || t.split('\\n')[0].trim().toLowerCase() === w; }).length;
+      })()`);
+      if (found) break;
+      await read(`(() => { const b = document.querySelector('[aria-label="Select Model"]'); if (b) b.click(); return 'OPEN'; })()`);
+      await sleep(1200);
+    }
+    const clicked = await read(`(() => {
+      const w = ${JSON.stringify(wantText)};
+      const list = ${items}
+        .filter(e => { const t = (e.innerText || '').trim().toLowerCase(); return t === w || t.split('\\n')[0].trim().toLowerCase() === w; })
+        .sort((a, b) => (a.innerText || '').length - (b.innerText || '').length);
+      if (!list.length) return 'NOT_FOUND';
+      (list[0].closest('li, [role="option"], [role="menuitem"]') || list[0]).click();
+      return 'CLICKED';
+    })()`);
+    if (clicked === 'NOT_FOUND') { await sleep(800); continue; }
+    await sleep(1500);
+  }
+  const final = (await read(`(document.querySelector('[aria-label="Select Model"]')?.innerText || '').trim()`)).toLowerCase();
+  return final === wantText;
+}
+
 async function askStructured(evaluate, expectedModel, prompt) {
   async function read(expression) {
     const result = await evaluate(expression);
@@ -224,7 +257,14 @@ async function askStructured(evaluate, expectedModel, prompt) {
   }
 
   const stateExpression = `(${chatState})(${JSON.stringify(COMPOSER)})`;
-  const before = await read(stateExpression);
+  let before = await read(stateExpression);
+  // Новый чат сбрасывает модель на дефолтную, поэтому модель выставляем сами,
+  // а не надеемся на состояние приложения.
+  if (expectedModel && before.model.toLowerCase() !== expectedModel.toLowerCase()) {
+    const switched = await switchModel(read, expectedModel);
+    if (!switched) throw new Error(`Qwen Chat could not select model ${expectedModel}: selected ${before.model || '(unknown)'}`);
+    before = await read(stateExpression);
+  }
   const model = before.model.toLowerCase();
   if (!model || (expectedModel && model !== expectedModel.toLowerCase())) {
     throw new Error(`Qwen Chat model mismatch: expected ${expectedModel || 'a named model'}, selected ${before.model || '(unknown)'}`);

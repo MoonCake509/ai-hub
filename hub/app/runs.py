@@ -733,7 +733,7 @@ def _cancel_pipeline_jobs(conn, run: dict) -> None:
         p=json.dumps(pipeline, ensure_ascii=False), i=run["id"])
 
 
-def on_task_result(job_id: str, ok: bool, error: str | None = None) -> dict | None:
+def _apply_task_result(job_id: str, ok: bool, error: str | None = None) -> dict | None:
     """Закрывает задачу по результату её job и двигает запуск дальше.
 
     CAS по состоянию задачи: повтор результата фиксируется в журнале, но
@@ -822,6 +822,25 @@ def on_task_result(job_id: str, ok: bool, error: str | None = None) -> dict | No
             _maybe_finish_run(conn, task["run_id"])
     return {"run_id": task["run_id"], "task": task["key"], "state": state}
 
+
+
+def on_task_result(job_id: str, ok: bool, error: str | None = None) -> dict | None:
+    """Результат задания → шаг прогона, затем обновление живых отчётов проекта.
+
+    Отчёты пишутся после фиксации состояния в БД и вне транзакции: сбой отчёта
+    не откатывает шаг, а сам шаг виден в журнале сразу.
+    """
+    result = _apply_task_result(job_id, ok, error)
+    if result:
+        try:
+            run = get_run(str(result.get("run_id") or ""))
+            project_id = (run or {}).get("project_id")
+            if project_id:
+                from . import reports as reports_ctrl
+                reports_ctrl.sync_quiet(str(project_id))
+        except Exception:  # noqa: BLE001
+            pass
+    return result
 
 def _restart_from_coder(conn, task: dict, decision: dict,
                         feedback: dict | None = None) -> None:

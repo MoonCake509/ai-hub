@@ -746,6 +746,7 @@ async def _prepare_project(project: dict, name: str, host_id: str, settings: dic
         "branch": branch,
         "author_name": str(settings.get("author_name") or "AI Hub"),
         "author_email": str(settings.get("author_email") or "aihub@local"),
+        "repo_subdir": project_template.REPO_SUBDIR,
         "template_version": project_template.TEMPLATE_VERSION,
         "template_files": project_template.starter_files(name[:200], workdir, branch, project_id),
     }
@@ -785,6 +786,20 @@ async def _prepare_project(project: dict, name: str, host_id: str, settings: dic
     project["prepare_job"] = job["job"]["id"]
     project["prepare_error"] = error
     return project
+
+
+@app.post("/projects/{project_id}/reports/sync", dependencies=[Depends(require_token)])
+def sync_project_reports(project_id: str, run_id: str | None = None) -> dict:
+    """Собрать ops/TASKFLOW.md и черновики PR по прогону и записать их на хост."""
+    from . import reports
+
+    try:
+        result = reports.sync_project(project_id, run_id)
+    except workspace.OpError as exc:
+        raise HTTPException(status_code=400, detail={"code": exc.code, "message": str(exc)}) from exc
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail=result.get("error") or "not found")
+    return result
 
 
 @app.post("/projects", dependencies=[Depends(require_token)])

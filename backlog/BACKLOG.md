@@ -15,13 +15,13 @@
 
 ### P-02 — Раскладка рабочей папки (документ, п. 2)
 
-**Статус:** backlog.
+**Статус:** реализовано 12.11.2026. Шаблон `TEMPLATE_VERSION=2`: `repo/` (README, AGENTS, docs/ARCHITECTURE, ROADMAP, BACKLOG, DEPENDENCIES, .env.example, .gitignore) и `ops/` (TASKFLOW, pr/, BACKUPS, END, INDEX, ENVIRONMENTS). Git-корень — `repo/`, `ops/` рядом с ним вне репозитория. Живая проверка: проект `16f42f0b3f0d4e98b16deb98536a322b`, папка `R:\Projects\layout-project-p02b-16f42f0b`, `git_root=...\repo`, `template_version=2`.
 
 `repo/` с README, AGENTS.md, docs/ARCHITECTURE, ROADMAP, BACKLOG, DEPENDENCIES, .env.example, .gitignore и `ops/` с TASKFLOW.md, pr/README.md, BACKUPS.md, END.md, INDEX.md, ENVIRONMENTS.md. Стартовые документы заполняются фактическими данными созданного проекта; неизвестное остаётся помеченным, а не выдумывается.
 
 ### P-03 — Передача работы между ролями (документ, п. 3)
 
-**Статус:** backlog.
+**Статус:** реализовано 12.11.2026. Воркер-операция `write_reports` (только `ops/`, повтор с тем же содержимым не перезаписывает), сборка `ops/TASKFLOW.md` и `ops/pr/<шаг>.md` из фактических задач прогона (`hub/app/reports.py`), автоматическое обновление после каждого события шага, ручной `POST /projects/{id}/reports/sync`. Живая проверка: задание `f5d8ff4d500743f185490949a1079d70` записало 4 файла, повтор — 0 записей и 4 пропуска.
 
 Проекция событий в `ops/TASKFLOW.md` по ID запуска и шага (повтор обновляет запись, а не добавляет новую), черновик PR с базовым и итоговым SHA, видимость провала проверки и цикла исправлений в карточке.
 

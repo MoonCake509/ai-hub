@@ -27,6 +27,7 @@ from . import db, workers, security_policy
 
 OPS = {
     "init_project": "рабочая папка проекта: шаблон, git init и первый коммит",
+    "write_reports": "живые отчёты проекта в ops/: журнал и черновики PR",
     "inspect": "канонический корень, git HEAD/status digest, возможности host",
     "snapshot": "управляемая копия и зафиксированное базовое состояние",
     "list_files": "ограниченный список путей с размерами и хешами",
@@ -41,7 +42,7 @@ OPS = {
 # управляемую область воркера и не должны блокировать кодеров.
 WRITES_ROOT = {"apply_patch"}
 # Операции, меняющие управляемое состояние: им нужен idempotency key по умолчанию.
-MUTATING = {"snapshot", "apply_patch", "package", "init_project"}
+MUTATING = {"snapshot", "apply_patch", "package", "init_project", "write_reports"}
 
 MAX_LIST = 200
 MAX_READ_FILES = 8
@@ -174,11 +175,35 @@ def validate(op: str, args: dict | None) -> dict:
     unknown = set(args) - {"root", "label", "glob", "limit", "offset", "files",
                            "changes", "checks", "snapshot_id", "include",
                            "base_tree_digest", "name", "branch", "author_name",
-                           "author_email", "template_version", "template_files"}
+                           "author_email", "template_version", "template_files",
+                           "repo_subdir", "reports"}
     if unknown:
         raise OpError("bad_arg", "лишние поля: " + ", ".join(sorted(unknown)))
     root = canon(_str(args.get("root"), "root", 400))
     clean: dict = {"root": root}
+
+    if op == "write_reports":
+        reports = args.get("reports")
+        if not isinstance(reports, list) or not reports:
+            raise OpError("bad_arg", "reports: нужен непустой список")
+        if len(reports) > 40:
+            raise OpError("bad_arg", "reports: не больше 40 файлов")
+        items = []
+        for item in reports:
+            if not isinstance(item, dict):
+                raise OpError("bad_arg", "reports[]: ожидался объект")
+            path = _str(item.get("path"), "path", 400)
+            if not path.startswith("ops/"):
+                raise OpError("denied_path", f"{path}: отчёты пишутся только в ops/")
+            reason = denied_reason(path)
+            if reason:
+                raise OpError("denied_path", f"{path}: {reason}")
+            content = item.get("content")
+            if not isinstance(content, str):
+                raise OpError("bad_arg", "reports[].content: ожидалась строка")
+            items.append({"path": path, "content": content})
+        clean["reports"] = items
+        return clean
 
     if op == "inspect":
         return clean
@@ -189,6 +214,7 @@ def validate(op: str, args: dict | None) -> dict:
             raise OpError("bad_arg", "name обязателен")
         clean["name"] = name
         clean["branch"] = _str(args.get("branch"), "branch", 100) or "main"
+        clean["repo_subdir"] = _str(args.get("repo_subdir"), "repo_subdir", 100) or "repo"
         clean["author_name"] = _str(args.get("author_name"), "author_name", 100) or "AI Hub"
         clean["author_email"] = _str(args.get("author_email"), "author_email", 200) or "aihub@local"
         clean["template_version"] = _str(args.get("template_version"), "template_version", 40) or "1"

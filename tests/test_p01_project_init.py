@@ -42,13 +42,15 @@ def git(root, *args):
 ARGS = {
     "name": "Demo",
     "branch": "main",
+    "repo_subdir": "repo",
     "author_name": "AI Hub",
     "author_email": "aihub@local",
     "template_version": "1",
     "template_files": {
-        "README.md": "# Demo\n",
-        "docs/NOTES.md": "заметки\n",
-        ".gitignore": ".env\n",
+        "repo/README.md": "# Demo\n",
+        "repo/docs/NOTES.md": "заметки\n",
+        "repo/.gitignore": ".env\n",
+        "ops/TASKFLOW.md": "# TASKFLOW\n",
     },
 }
 
@@ -58,26 +60,29 @@ def test_creates_tree_and_commit():
     result = host.op_init_project(root, dict(ARGS))
     assert result["created_dir"] is True
     assert result["committed"] is True
-    assert sorted(result["written"]) == [".gitignore", "README.md", "docs/NOTES.md"]
-    assert os.path.isfile(os.path.join(root, "docs", "NOTES.md"))
+    assert sorted(result["written"]) == ["ops/TASKFLOW.md", "repo/.gitignore", "repo/README.md", "repo/docs/NOTES.md"]
+    assert os.path.isfile(os.path.join(root, "repo", "docs", "NOTES.md"))
+    assert os.path.isfile(os.path.join(root, "ops", "TASKFLOW.md"))
+    git_root = result["git_root"]
+    assert os.path.isdir(os.path.join(git_root, ".git"))
     assert result["branch"] == "main"
-    code, head = git(root, "rev-parse", "HEAD")
+    code, head = git(git_root, "rev-parse", "HEAD")
     assert code == 0 and head == result["head_sha"]
-    code, log = git(root, "log", "--oneline")
+    code, log = git(git_root, "log", "--oneline")
     assert len(log.splitlines()) == 1, log
 
 
 def test_repeat_keeps_user_files_and_commit():
     root = os.path.join(BASE, "repeat-project-0002")
     first = host.op_init_project(root, dict(ARGS))
-    with open(os.path.join(root, "README.md"), "w", encoding="utf-8") as fh:
+    with open(os.path.join(root, "repo", "README.md"), "w", encoding="utf-8") as fh:
         fh.write("# изменено пользователем\n")
     second = host.op_init_project(root, dict(ARGS))
     assert second["written"] == []
-    assert sorted(second["skipped"]) == [".gitignore", "README.md", "docs/NOTES.md"]
+    assert sorted(second["skipped"]) == ["ops/TASKFLOW.md", "repo/.gitignore", "repo/README.md", "repo/docs/NOTES.md"]
     assert second["committed"] is False
     assert second["head_sha"] == first["head_sha"]
-    with open(os.path.join(root, "README.md"), encoding="utf-8") as fh:
+    with open(os.path.join(root, "repo", "README.md"), encoding="utf-8") as fh:
         assert fh.read().strip() == "# изменено пользователем"
 
 

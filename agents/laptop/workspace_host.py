@@ -33,8 +33,8 @@ import time
 import uuid
 import zipfile
 
-OPS = ["init_project", "inspect", "snapshot", "list_files", "read_files", "apply_patch",
-       "run_checks", "package"]
+OPS = ["init_project", "write_reports", "inspect", "snapshot", "list_files", "read_files",
+       "apply_patch", "run_checks", "package"]
 
 MAX_LIST = 200
 MAX_WALK = 20000
@@ -329,6 +329,11 @@ def op_init_project(root: str, args: dict) -> dict:
     author_name = str(args.get("author_name") or "AI Hub").strip()[:100]
     author_email = str(args.get("author_email") or "aihub@local").strip()[:200]
     template_version = str(args.get("template_version") or "1")[:40]
+    repo_subdir = str(args.get("repo_subdir") or "repo").strip()
+    if repo_subdir in {".", ""}:
+        repo_subdir = ""
+    elif "/" in repo_subdir or "\\" in repo_subdir or ".." in repo_subdir or ":" in repo_subdir:
+        raise OpFail("bad_request", "repo_subdir must be a single directory name")
 
     created_dir = not os.path.isdir(root)
     if created_dir:
@@ -353,29 +358,32 @@ def op_init_project(root: str, args: dict) -> dict:
             fh.write(content)
         written.append(rel_path)
 
-    if not os.path.isdir(os.path.join(root, ".git")):
-        code, out = _git(root, "init", "-q")
+    # Канонический Git-репозиторий живёт в подкаталоге: рядом с ним лежат ops/.
+    git_root = os.path.join(root, repo_subdir) if repo_subdir else root
+    os.makedirs(git_root, exist_ok=True)
+    if not os.path.isdir(os.path.join(git_root, ".git")):
+        code, out = _git(git_root, "init", "-q")
         if code != 0:
             raise OpFail("git_failed", f"git init failed: {out}")
-        _git(root, "symbolic-ref", "HEAD", f"refs/heads/{branch}")
+        _git(git_root, "symbolic-ref", "HEAD", f"refs/heads/{branch}")
 
-    code, _ = _git(root, "rev-parse", "--verify", "HEAD")
+    code, _ = _git(git_root, "rev-parse", "--verify", "HEAD")
     committed = code == 0
     if not committed:
-        _git(root, "add", "-A")
-        code, out = _git(root, "-c", f"user.name={author_name}",
+        _git(git_root, "add", "-A")
+        code, out = _git(git_root, "-c", f"user.name={author_name}",
                          "-c", f"user.email={author_email}",
                          "commit", "-q", "-m", "chore: initial commit", "--allow-empty")
         if code != 0:
             raise OpFail("git_failed", f"git commit failed: {out}")
 
-    code, head = _git(root, "rev-parse", "HEAD")
+    code, head = _git(git_root, "rev-parse", "HEAD")
     if code != 0 or not head:
         raise OpFail("git_failed", "cannot read HEAD after init")
-    code, branch_now = _git(root, "rev-parse", "--abbrev-ref", "HEAD")
+    code, branch_now = _git(git_root, "rev-parse", "--abbrev-ref", "HEAD")
     return {
         "root": root,
-        "git_root": root,
+        "git_root": git_root,
         "branch": branch_now if code == 0 and branch_now else branch,
         "head_sha": head,
         "template_version": template_version,
@@ -384,6 +392,54 @@ def op_init_project(root: str, args: dict) -> dict:
         "skipped": skipped,
         "committed": not committed,
     }
+
+
+REPORTS_MAX_FILES = 40
+REPORTS_MAX_BYTES = 512 * 1024
+
+
+def op_write_reports(root: str, args: dict) -> dict:
+    """Записать живые отчёты проекта (ops/): журнал и черновики PR.
+
+    Пишутся только пути внутри ops/; одинаковое содержимое не перезаписывается,
+    поэтому повтор события не меняет файл и не плодит версии.
+    """
+    reports = args.get("reports")
+    if not isinstance(reports, list) or not reports:
+        raise OpFail("bad_request", "reports must be a non-empty list")
+    if len(reports) > REPORTS_MAX_FILES:
+        raise OpFail("bad_request", "too many reports")
+    written, skipped, total = [], [], 0
+    for item in reports:
+        if not isinstance(item, dict):
+            raise OpFail("bad_request", "report item must be an object")
+        rel = _init_rel(str(item.get("path") or ""))
+        if not rel.startswith("ops/"):
+            raise OpFail("denied_path", f"reports are allowed only under ops/: {rel}")
+        content = item.get("content")
+        if not isinstance(content, str):
+            raise OpFail("bad_request", "report content must be a string")
+        total += len(content.encode("utf-8"))
+        if total > REPORTS_MAX_BYTES:
+            raise OpFail("bad_request", "reports are too large")
+        target = os.path.join(root, *rel.split("/"))
+        if os.path.isfile(target):
+            try:
+                with open(target, encoding="utf-8") as fh:
+                    if fh.read() == content:
+                        skipped.append(rel)
+                        continue
+            except OSError:
+                pass
+        parent = os.path.dirname(target)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        tmp = target + ".tmp"
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(content)
+        os.replace(tmp, target)
+        written.append(rel)
+    return {"root": root, "written": written, "skipped": skipped}
 
 
 def op_inspect(root: str, args: dict) -> dict:
@@ -1039,6 +1095,7 @@ def op_package(root: str, args: dict, job_id: str = "") -> dict:
 
 HANDLERS = {
     "init_project": op_init_project,
+    "write_reports": op_write_reports,
     "inspect": op_inspect,
     "snapshot": op_snapshot,
     "list_files": op_list_files,

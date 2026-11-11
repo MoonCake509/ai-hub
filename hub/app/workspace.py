@@ -22,7 +22,7 @@ import posixpath
 import re
 import time
 
-from . import db, workers
+from . import db, workers, security_policy
 
 OPS = {
     "inspect": "канонический корень, git HEAD/status digest, возможности host",
@@ -48,10 +48,10 @@ MAX_PATCH_FILES = 50
 MAX_PATCH_BYTES = 1024 * 1024
 MAX_CHECKS = 10
 
-DENY_DIRS = {".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv",
-             "outbox", "models", ".ssh", "appdata"}
-DENY_SUFFIX = (".pem", ".key", ".pfx", ".p12", ".dump", ".bak", ".kdbx")
-DENY_NAMES = {"token.txt", "credentials", ".netrc", "id_rsa", "id_ed25519"}
+# Deny-политика — единый источник с host worker: hub/app/security_policy.py.
+DENY_DIRS = security_policy.DENY_DIRS
+DENY_SUFFIX = security_policy.SECRET_SUFFIXES
+DENY_NAMES = security_policy.SECRET_NAMES
 
 
 class OpError(ValueError):
@@ -364,6 +364,12 @@ def create_op_job(op: str, args: dict, host_id: str, project_id: str | None = No
         raise OpError("bad_host", "host_id обязателен")
     caps = host_capabilities(host)
     supported = caps.get("workspace_ops") or []
+    # Единая deny-политика: воркер с устаревшим/подменённым списком исключений
+    # не получает операций, пока не обновится до серверной политики.
+    reported_policy = caps.get("security_policy")
+    if reported_policy and reported_policy != security_policy.policy_digest():
+        raise OpError("policy_mismatch",
+                      "deny-политика воркера расходится с серверной; обновите host worker")
     if op == "apply_patch" and (caps.get("workspace_fencing") != 1
                                 or caps.get("workspace_effect_journal") != 1):
         raise OpError("writer_unsupported", "workspace writer lacks fencing/effect journal support")

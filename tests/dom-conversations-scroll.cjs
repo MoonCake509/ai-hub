@@ -3,8 +3,8 @@ const vm = require('node:vm');
 const assert = require('node:assert/strict');
 const path = require('node:path');
 
-const app = fs.readFileSync(path.join(__dirname, '..', 'web', 'app.js'), 'utf8');
-const html = fs.readFileSync(path.join(__dirname, '..', 'web', 'index.html'), 'utf8');
+const app = fs.readFileSync(path.join(__dirname, '..', 'web', 'app.js'), 'utf8').replace(/\r\n/g, '\n');
+const html = fs.readFileSync(path.join(__dirname, '..', 'web', 'index.html'), 'utf8').replace(/\r\n/g, '\n');
 
 function slice(start, next) {
   const from = app.indexOf(start);

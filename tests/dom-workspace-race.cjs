@@ -54,7 +54,7 @@ async function testProjectSwitchDuringRoleSave(file) {
     action: fn => fn,
     setDraftDirty() {},
     wsUpdateRecipient() {},
-    wsRefreshAll: async () => {}, wsNewConversation: async () => {}, wsProjectDialog() {},
+    wsRefreshAll: async () => {}, wsNewConversation: async () => {}, wsProjectDialog() {}, runsWire() {},
     wsSaveProject: async () => {}, wsPopulateRoleProfiles: async () => {},
     wsUpload: async () => {}, saveToken: async () => {}, switchView() {}, workspaceError() {},
     wsRenderConversations() {}, wsRenderAttachments() {}, wsLoadMessages: async () => {}, wsStartPolling() {},

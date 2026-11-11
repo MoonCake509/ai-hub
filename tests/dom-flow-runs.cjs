@@ -19,7 +19,7 @@ function extract(source, start, end) {
 function fakeNode(tag = 'div', cls = '', text = '') {
   const node = { tag, className: cls, textContent: text == null ? '' : String(text), children: [], dataset: {}, style: {}, hidden: false, disabled: false, value: '', colSpan: 0,
     append(...items) { this.children.push(...items); },
-    focus() {}, reset() {}, replaceChildren(...items) { this.children = items; }, setAttribute() {},
+    focus() { this.focused = true; }, reset() {}, replaceChildren(...items) { this.children = items; }, setAttribute() {},
     querySelector() { return null; },
     find(test) { for (const child of this.children) { if (test(child)) return child; const found = child.find && child.find(test); if (found) return found; } return null; },
   };
@@ -59,7 +59,7 @@ const RUN_ROW = { id: 'abcd1234ef5678ab', template_id: 'five-roles', state: 'act
       result: { tasks: [{ key: 'k1' }] } },
     { key: 'code', role: 'coder', state: 'dispatched', attempt: 1, agent: 'codex',
       assignment: { agent_id: 'codex', model: 'm1' }, context_id: 'packet12345678', packet_revision: 1,
-      error: null, result: {} },
+      error: null, result: { summary: 'Итоговый результат ' + 'x'.repeat(500), files: ['src/main.js'] } },
     { key: 'test', role: 'tester', state: 'pending', attempt: 0, agent: 'codex',
       assignment: { agent_id: 'codex' }, context_id: null, error: null, result: {} },
   ],
@@ -111,6 +111,8 @@ async function testListRendersRowsAndOpensDetail() {
   assert.match(detailText, /Журнал событий/);
   assert.match(detailText, /кандидат зафиксирован/);
   assert.match(detailText, /m1/, 'assignment model shown for coder');
+  assert.ok(collectText(detail).some(text => text.includes('Итоговый результат') && text.length > 400),
+    'task result is readable in full instead of being silently truncated');
 }
 
 async function testDetailRestoresFromHashAfterReload() {
@@ -184,11 +186,80 @@ async function testCreateConflictShows409Message() {
   assert.equal($('#flow-create').hidden, false, 'form stays open on conflict');
 }
 
+async function testCreateSubmitIsSingleFlightBeforeProjectLookup() {
+  const { ctx, $ } = appContext();
+  let resolveProjects; const posts = [];
+  ctx.storeGet = () => '';
+  ctx.window = { location: { hash: '', pathname: '/ui' }, history: { replaceState() {} } };
+  ctx.api = async (path, options = {}) => {
+    if (path === '/projects') return new Promise(resolve => { resolveProjects = resolve; });
+    if (path === '/projects/project-1') return { id: 'project-1', roles: [], settings: {} };
+    if (path === '/runs' && options.method === 'POST') { posts.push(JSON.parse(options.body)); return { run_id: 'newrun1234' }; }
+    if (path === '/runs/newrun1234') return { id: 'newrun1234', state: 'active', tasks: [], events: [] };
+    if (path.startsWith('/runs?')) return { items: [], count: 0 };
+    return {};
+  };
+  vm.runInContext(runSource(), ctx);
+  $('#flow-goal').value = 'Цель без дублей';
+  const event = { preventDefault() {} };
+  const first = ctx.runSubmitCreate(event);
+  const second = ctx.runSubmitCreate(event);
+  assert.equal($('#flow-submit').disabled, true, 'submit disables synchronously before awaiting project lookup');
+  assert.equal($('#flow-submit').textContent, 'Создаю…');
+  await Promise.resolve();
+  resolveProjects({ projects: [{ id: 'project-1' }] });
+  await Promise.all([first, second]);
+  assert.equal(posts.length, 1, 'rapid double submit creates only one run');
+  assert.equal($('#flow-submit').disabled, false, 'submit is restored after completion');
+}
+
+async function testCreateRejectsWhitespaceGoalAndFractionalBudget() {
+  const { ctx, $ } = appContext();
+  let posts = 0;
+  ctx.api = async (path, options = {}) => {
+    if (path === '/runs' && options.method === 'POST') { posts++; return { run_id: 'unexpected' }; }
+    return {};
+  };
+  vm.runInContext(runSource(), ctx);
+  $('#flow-goal').value = '   ';
+  await ctx.runSubmitCreate({ preventDefault() {} });
+  assert.equal(posts, 0, 'whitespace-only goal is rejected in client-side validation');
+  assert.match($('#flow-preflight').textContent, /Укажите цель/);
+
+  $('#flow-goal').value = 'Valid goal';
+  $('#flow-max-dispatches').value = '2.5';
+  await ctx.runSubmitCreate({ preventDefault() {} });
+  assert.equal(posts, 0, 'fractional budget is not silently truncated');
+  assert.match($('#flow-preflight').textContent, /целое число/);
+  assert.equal($('#flow-max-dispatches').focused, true, 'invalid budget receives focus');
+}
+
+async function testOlderDetailResponseCannotReplaceCurrentRun() {
+  const { ctx, $ } = appContext({ window: { location: { hash: '', pathname: '/ui' }, history: { replaceState() {} } } });
+  const pending = new Map();
+  ctx.api = path => new Promise(resolve => pending.set(path, resolve));
+  vm.runInContext(runSource(), ctx);
+  vm.runInContext("currentRunId = 'runA';", ctx);
+  const older = ctx.renderRunDetail();
+  vm.runInContext("currentRunId = 'runB';", ctx);
+  const current = ctx.renderRunDetail();
+  pending.get('/runs/runB')({ id: 'runB', state: 'active', goal: 'Текущий запуск', tasks: [], events: [] });
+  await current;
+  pending.get('/runs/runA')({ id: 'runA', state: 'active', goal: 'Устаревший запуск', tasks: [], events: [] });
+  await older;
+  const detailText = collectText($('#run-detail')).join(' ');
+  assert.match(detailText, /Текущий запуск/);
+  assert.doesNotMatch(detailText, /Устаревший запуск/, 'late response for an earlier run is ignored');
+}
+
 (async () => {
   testControlsExistOnce();
   await testListRendersRowsAndOpensDetail();
   await testDetailRestoresFromHashAfterReload();
   await testCreateFormSubmitsGoalBudgetsAndRequestKey();
   await testCreateConflictShows409Message();
+  await testCreateSubmitIsSingleFlightBeforeProjectLookup();
+  await testCreateRejectsWhitespaceGoalAndFractionalBudget();
+  await testOlderDetailResponseCannotReplaceCurrentRun();
   console.log('FLOW-P1 runs panel DOM regressions passed.');
 })().catch(error => { console.error(error); process.exitCode = 1; });

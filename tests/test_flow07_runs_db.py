@@ -329,7 +329,7 @@ class PipelineTest(DbTestCase):
         FAKE.restore()
         super().tearDown()
 
-    def _run_checks_green(self):
+    def _run_checks_green(self, complete_test=True):
         """Все проверки зелёные: receipt принят, тестировщик выдаётся с receipt."""
         run = runs.create_run(self.project_id, plain_template(), {"max_cycles": 2})
         rid = run["run_id"]
@@ -364,9 +364,10 @@ class PipelineTest(DbTestCase):
         job = db.get_job(test_task["job_id"])
         self.assertIn("Receipt", job["prompt"])
         self.assertIn(CANDIDATE, job["prompt"])
-        complete_job(test_task["job_id"], TEST_OUT)
-        outcome = runs.on_task_result(test_task["job_id"], True)
-        self.assertEqual(outcome["state"], "done")
+        if complete_test:
+            complete_job(test_task["job_id"], TEST_OUT)
+            outcome = runs.on_task_result(test_task["job_id"], True)
+            self.assertEqual(outcome["state"], "done")
         return rid
 
     def test_full_pipeline_green(self):
@@ -388,7 +389,7 @@ class PipelineTest(DbTestCase):
         self.assertTrue(any(e["event"] == "run_done" for e in item["events"]))
 
     def test_tester_wrong_candidate_digest_returns_to_coder(self):
-        rid = self._run_checks_green()
+        rid = self._run_checks_green(complete_test=False)
         job_id = task_of(rid, "test")["job_id"]
         bad_test = TEST_OUT.replace(CANDIDATE, "sha256:" + "d" * 64)
         complete_job(job_id, bad_test)
@@ -397,8 +398,13 @@ class PipelineTest(DbTestCase):
         item = runs.get_run(rid)
         self.assertEqual(item["cycles"], 1)
         self.assertIsNone(item["candidate_digest"])
-        self.assertIsNone(item.get("check_receipt"))
-        self.assertEqual(next(t for t in item["tasks"] if t["key"] == "code")["state"], "pending")
+        self.assertEqual(item["check_receipt"], {})
+        retry = runs.dispatch(rid, resolve_agent)
+        self.assertEqual([d["task"] for d in retry["dispatched"]], ["code"])
+        code_task = task_of(rid, "code")
+        self.assertEqual(code_task["state"], "dispatched")
+        retry_job = db.get_job(code_task["job_id"])
+        self.assertIn("другом снимке", retry_job["prompt"])
 
     def test_failing_receipt_returns_to_coder_without_tester(self):
         """Receipt с упавшей проверкой: кодеру, модель тестировщика не тратится."""
@@ -423,7 +429,11 @@ class PipelineTest(DbTestCase):
         runs.poll_active(resolve_agent)
         item = runs.get_run(rid)
         self.assertEqual(item["cycles"], 1)
-        self.assertEqual(next(t for t in item["tasks"] if t["key"] == "code")["state"], "pending")
+        code_task = next(t for t in item["tasks"] if t["key"] == "code")
+        self.assertEqual(code_task["state"], "dispatched")
+        retry_job = db.get_job(code_task["job_id"])
+        self.assertIn('"role": "run_checks"', retry_job["prompt"])
+        self.assertIn('"exit_code": 1', retry_job["prompt"])
         # Тестировщик не выдавался: нет задания с receipt в prompt после сбоя.
         self.assertNotIn("test", [d["task"] for d in runs.dispatch(rid, resolve_agent)["dispatched"]])
 
@@ -435,19 +445,48 @@ class PacketIntegrityTest(DbTestCase):
         project = make_project()
         packet = packets.create(project["id"], list(requested), 100_000)
         entries = [
-            {"path": "src/app.py", "size": 12, "sha256": _sha("v1")},
-            {"path": "src/util.py", "size": 20, "sha256": _sha("u1")},
+            {"path": "src/app.py", "size": 8, "sha256": _sha("print(1)")},
+            {"path": "src/util.py", "size": 1, "sha256": _sha("x")},
             {"path": "auth.json", "size": 9, "sha256": _sha("secret")},
         ]
         sealed = packets.seal(packet["packet_id"], entries)
         return project, packet["packet_id"], sealed
 
+    def test_verified_context_bytes_are_delivered_within_packet_budget(self):
+        project = make_project()
+        run = runs.create_run(project["id"], plain_template(), {})
+        source = "def answer():\n    return 42\n"
+        entry = {"path": "src/main.py", "size": len(source.encode()),
+                 "sha256": _sha(source), "selected": True, "reason": "точка входа"}
+        built = {
+            "items": [entry], "digest": "ctx-digest", "used_tokens": 8,
+            "budget_tokens": 100,
+        }
+        packet = packets.create(project["id"], ["src/main.py"], 1000)
+        packets._store_built(packet["packet_id"], built, {"src/main.py": source})
+        with db._lock:
+            conn = db.connect()
+            conn.run(db._qualify(
+                "update aihub.run_tasks set context = :c::jsonb, context_id = :p"
+                " where run_id = :r and key = 'plan'"),
+                c=json.dumps({"entry": "src/main.py", "budget_tokens": 100}),
+                p=packet["packet_id"], r=run["run_id"])
+        result = runs.dispatch(run["run_id"], resolve_agent)
+        job = db.get_job(result["dispatched"][0]["job_id"])
+        marker = "Проверенное содержимое выбранных UTF-8 файлов (байты сверены с SHA-256; бюджет пакета соблюдён):\n"
+        payload = json.loads(job["prompt"].split(marker, 1)[1])
+        self.assertEqual(payload, [{"path": "src/main.py", "sha256": _sha(source),
+                                    "content": source}])
+        stored = packets.verified_contents(packet["packet_id"], 1)
+        self.assertEqual([(x["path"], x["content"]) for x in stored],
+                         [("src/main.py", source)])
+
     def test_seal_recheck_conflict_new_revision_keeps_history(self):
         _, pid, first = self._sealed()
         self.assertEqual(first["revision"], 1)
         entries = [
-            {"path": "src/app.py", "size": 12, "sha256": _sha("v1")},
-            {"path": "src/util.py", "size": 20, "sha256": _sha("u1")},
+            {"path": "src/app.py", "size": 8, "sha256": _sha("print(1)")},
+            {"path": "src/util.py", "size": 1, "sha256": _sha("x")},
             {"path": "auth.json", "size": 9, "sha256": _sha("secret")},
         ]
         same = packets.seal(pid, entries, recheck=True)
@@ -463,7 +502,7 @@ class PacketIntegrityTest(DbTestCase):
         # Ревизия 1 в истории нетронута.
         history_v1 = packets.revision_items(pid, 1)
         app_v1 = next(i for i in history_v1 if i["path"] == "src/app.py")
-        self.assertEqual(app_v1["sha256"], _sha("v1"))
+        self.assertEqual(app_v1["sha256"], _sha("print(1)"))
         # А текущий указатель — новое содержимое.
         current = packets.get(pid)
         app_now = next(i for i in current["items"] if i["path"] == "src/app.py")
@@ -484,8 +523,8 @@ class PacketIntegrityTest(DbTestCase):
             job_id = started["job_id"]
             # Хост вернул ровно выбранные файлы с верными хешами.
             FAKE.set_result(job_id, {"files": [
-                {"path": "src/app.py", "size": 12, "sha256": _sha("v1"), "text": "print(1)"},
-                {"path": "src/util.py", "size": 20, "sha256": _sha("u1"), "text": "x"},
+                {"path": "src/app.py", "size": 8, "sha256": _sha("print(1)"), "text": "print(1)"},
+                {"path": "src/util.py", "size": 1, "sha256": _sha("x"), "text": "x"},
             ]})
             packets.poll_active()
             packet = packets.get(pid)
@@ -501,8 +540,8 @@ class PacketIntegrityTest(DbTestCase):
             _, pid, _ = self._sealed()
             started = packets.start_materialize(pid)
             FAKE.set_result(started["job_id"], {"files": [
-                {"path": "src/app.py", "size": 12, "sha256": _sha("SPOOFED"), "text": "evil"},
-                {"path": "src/util.py", "size": 20, "sha256": _sha("u1"), "text": "x"},
+                {"path": "src/app.py", "size": 8, "sha256": _sha("SPOOFED"), "text": "evil"},
+                {"path": "src/util.py", "size": 1, "sha256": _sha("x"), "text": "x"},
             ]})
             packets.poll_active()
             self.assertEqual(packets.get(pid)["state"], "conflict")
@@ -514,8 +553,8 @@ class PacketIntegrityTest(DbTestCase):
             _, pid2, _ = self._sealed()
             started2 = packets.start_materialize(pid2)
             FAKE.set_result(started2["job_id"], {"files": [
-                {"path": "src/app.py", "size": 12, "sha256": _sha("v1"), "text": "print(1)"},
-                {"path": "src/util.py", "size": 20, "sha256": _sha("u1"), "text": "x"},
+                {"path": "src/app.py", "size": 8, "sha256": _sha("print(1)"), "text": "print(1)"},
+                {"path": "src/util.py", "size": 1, "sha256": _sha("x"), "text": "x"},
                 {"path": "other/foreign.txt", "size": 3, "sha256": _sha("f"), "text": "no"},
             ]})
             packets.poll_active()
@@ -529,7 +568,7 @@ class PacketIntegrityTest(DbTestCase):
         """Ревизия с выбранным auth.json не материализуется: denied_path."""
         project = make_project()
         packet = packets.create(project["id"], ["src/*"], 100_000)
-        entries = [{"path": "src/app.py", "size": 12, "sha256": _sha("v1")}]
+        entries = [{"path": "src/app.py", "size": 8, "sha256": _sha("print(1)")}]
         packets.seal(packet["packet_id"], entries)
         row = packets.get(packet["packet_id"])
         items = row["items"] + [{"path": "auth.json", "size": 9,

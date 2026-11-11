@@ -30,7 +30,7 @@ async function main() {
     agents: [{ id: 'codex', model_selection: true }, { id: 'xiaomi', name: 'Xiaomi', model_selection: true }],
     action: fn => (...args) => fn(...args), workspaceError: error => { $('#workspace-error-text').textContent = error.message; $('#workspace-error').hidden = false; },
     toast() {}, selectedAssignment: () => context.WS.roles.architect, roleInfo: () => ['Архитектор', 'A', ''], agentName: id => id,
-    wsRefreshAll() {}, wsNewConversation() {}, wsProjectDialog() {}, wsSaveProject() {}, wsUpload() {}, saveToken() {}, switchView() {},
+    wsRefreshAll() {}, wsNewConversation() {}, wsProjectDialog() {}, wsSaveProject() {}, wsUpload() {}, saveToken() {}, switchView() {}, runsWire() {},
     wsGetProfiles: async agentId => agentId === 'xiaomi' ? profileLoad.promise : profileData,
     putOptions(select, rows, value) { select.replaceChildren(); for (const row of rows) { const option = { value: row.id }; select.append(option); } select.value = rows.some(row => row.id === value) ? value : rows[0]?.id || ''; },
     el: (tag, cls, text) => ({ value: '', textContent: text || '' }), wsUpdateRoleCapability: () => 'capability',
@@ -43,7 +43,7 @@ async function main() {
   vm.createContext(context);
   vm.runInContext(from('function setDraftDirty()', '\nfunction conversationStorageKey') +
     from('function wsSetRoleProfilesLoading(', '\nasync function wsSaveRole') +
-    from('async function wsSaveRole(', '\n\nasync function wsSend') +
+    from('async function wsSaveRole(', '\nasync function wsSend') +
     from('function wsWire(){', '\nfunction stopPolling'), context);
   context.wsWire();
 

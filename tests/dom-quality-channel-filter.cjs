@@ -28,11 +28,11 @@ async function main() {
   };
   const context = {
     document: { getElementById: get, createElement: tag => new Element(tag), querySelectorAll: () => [] },
-    window: { crypto: { randomUUID: () => 'test-key' } },
+    window: { crypto: { randomUUID: () => 'test-key' } }, crypto: { randomUUID: () => 'test-key' },
     localStorage: { getItem: () => auth },
     setInterval() {}, MutationObserver: undefined,
     fetch: async (path, options = {}) => {
-      requests.push({ path, method: options.method || 'GET' });
+      requests.push({ path, method: options.method || 'GET', body: options.body });
       const data = payloads[path] || {};
       return { status: 200, ok: true, text: async () => JSON.stringify(data) };
     },
@@ -51,16 +51,23 @@ async function main() {
   get('q-agent').onchange();
   get('q-provider').value = 'local';
   get('q-provider').onchange();
-  assert.deepEqual(get('q-model').options.map(option => option.value), ['', 'text-v1'], 'text benchmark choices omit the image-required model');
+  assert.deepEqual(get('q-model').options.map(option => option.value), ['', 'text-v1', 'ocr-v1'], 'OCR model remains selectable for quick image checks');
 
-  get('q-channel').value = 'ocr';
+  get('q-model').value = 'ocr-v1';
+  get('q-model').onchange();
   get('q-case-count').value = '1';
   get('q-timeout').value = '60';
   assert.equal(get('q-start').disabled, true, 'image-required channel cannot enable the text benchmark start button');
-  await get('q-start-form').onsubmit({ preventDefault() {} });
-  assert.match(get('q-error').textContent, /не поддерживаются текущим текстовым набором/, 'manual OCR limitation is explained at selection validation');
-  assert.equal(requests.some(request => request.path === '/quality/runs' && request.method === 'POST'), false, 'image-required channel cannot start a text suite run');
-  console.log('Quality channel DOM regression passed: image routes remain manageable and are excluded from text benchmark selection.');
+  assert.equal(get('q-quick').disabled, false, 'image-required channel remains eligible for the bounded quick OCR probe');
+  await get('q-start-form').onsubmit({ submitter: { dataset: { mode: 'extended' } }, preventDefault() {} });
+  assert.match(get('q-error').textContent, /быструю OCR-пробу/, 'image route explains why extended text suite is unavailable');
+  assert.equal(requests.some(request => request.path === '/quality/runs' && request.method === 'POST'), false, 'extended text suite rejects image-required channel');
+  await get('q-start-form').onsubmit({ submitter: { dataset: { mode: 'quick' } }, preventDefault() {} });
+  const quick = requests.find(request => request.path === '/quality/runs' && request.method === 'POST');
+  assert.ok(quick, 'quick OCR probe can be submitted for the selected image route');
+  assert.equal(JSON.parse(quick.body).mode, 'quick');
+  assert.equal(JSON.parse(quick.body).model, 'ocr-v1');
+  console.log('Quality channel DOM regression passed: OCR channels support quick probes and are rejected by extended text suites.');
 }
 
 main().catch(error => { console.error(error); process.exitCode = 1; });

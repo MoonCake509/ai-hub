@@ -136,7 +136,7 @@ def snapshot_assignments(project: dict, steps: list[dict]) -> dict:
     assignments = {}
     for step in steps:
         role = step.get("role") or ""
-        card = cards.get(role) or {}
+        card = cards.get(role) or cards.get(db.ROLE_ALIASES.get(role, role)) or {}
         assignments[step["key"]] = {
             "role": role,
             "agent_id": (card.get("agent_id") or "").strip() or (step.get("agent") or ""),
@@ -298,7 +298,8 @@ def get_run(run_id: str) -> dict | None:
         for key in ("created_at", "updated_at", "finished_at"):
             if item.get(key) is not None:
                 item[key] = item[key].isoformat()
-        for key in ("depends_on", "context", "assignment", "result", "receipt"):
+        for key in ("depends_on", "context", "assignment", "result", "receipt",
+                    "retry_feedback"):
             if key in item:
                 item[key] = _as_json(item.get(key), [] if key == "depends_on" else {})
         out["tasks"].append(item)
@@ -401,6 +402,21 @@ def _gate_context(conn, run: dict, task: dict) -> tuple[str | None, dict | None]
         if not packet:
             return "пакет контекста не найден", None
         if packet["state"] == "sealed":
+            selected = [item for item in (packet.get("items") or []) if item.get("selected")]
+            saved = packets.verified_contents(packet["id"], int(packet.get("revision") or 1))
+            if selected and not saved:
+                try:
+                    packets.start_materialize(packet["id"])
+                except Exception as exc:  # noqa: BLE001
+                    return f"контекст не материализован: {exc}"[:300], None
+                conn.run(db._qualify(
+                    "update aihub.run_tasks set state = 'waiting_context', updated_at = now()"
+                    " where id = :i and state = 'pending'"), i=task["id"])
+                event(conn, run["id"], task["id"], "task_waiting_context",
+                      {"packet_id": packet["id"], "reason": "materializing"})
+                return "контекст ещё собирается", None
+            return None, packet
+        if packet["state"] == "materialized":
             return None, packet
         if packet["state"] in ("failed", "conflict"):
             reason = (packet.get("manifest") or {}).get("error") or f"пакет в состоянии {packet['state']}"
@@ -504,10 +520,19 @@ def dispatch(run_id: str, resolve_agent, max_queue: int = 50) -> dict:
                 prompt = task.get("prompt") or task["key"]
                 sections = [prompt, _task_inputs(conn, run, task)]
                 if packet:
+                    context_files = packets.verified_contents(
+                        packet["id"], int(packet.get("revision") or 1))
                     sections.append(
                         "Пакет контекста: " + packet["id"] + " (ревизия "
                         + str(packet.get("revision")) + ", digest " + str(packet.get("digest"))[:20]
                         + "…)\nВыбранные файлы:\n" + "\n".join(_packet_manifest_lines(packet)))
+                    if context_files:
+                        sections.append(
+                            "Проверенное содержимое выбранных UTF-8 файлов (байты сверены с SHA-256;"
+                            " бюджет пакета соблюдён):\n" + json.dumps(
+                                [{"path": item["path"], "sha256": item["sha256"],
+                                  "content": item["content"]} for item in context_files],
+                                ensure_ascii=False))
                     conn.run(db._qualify(
                         "update aihub.run_tasks set packet_revision = :rev where id = :i"),
                         rev=int(packet.get("revision") or 1), i=task["id"])
@@ -518,6 +543,10 @@ def dispatch(run_id: str, resolve_agent, max_queue: int = 50) -> dict:
                     sections.append("Кандидат: " + str(run.get("candidate_digest")))
                 if (task.get("role") or "") == "reviewer" and run.get("candidate_digest"):
                     sections.append("Проверяемый кандидат: " + str(run.get("candidate_digest")))
+                retry_feedback = _as_json(task.get("retry_feedback"), {}) or {}
+                if (task.get("role") or "") == "coder" and retry_feedback:
+                    sections.append("Обратная связь после неудачной проверки/ревью (учти при исправлении):\n"
+                                    + json.dumps(retry_feedback, ensure_ascii=False)[:12000])
                 prompt = "\n\n".join(s for s in sections if s)
                 attempt = int(task["attempt"] or 0) + 1
                 key = f"run:{run_id}:{task['key']}:{attempt}"
@@ -542,7 +571,8 @@ def dispatch(run_id: str, resolve_agent, max_queue: int = 50) -> dict:
                     workspace=workspace_snapshot)
                 conn.run(db._qualify(
                     "update aihub.run_tasks set state = 'dispatched', attempt = :a, job_id = :j,"
-                    " assignment = :asn::jsonb, updated_at = now() where id = :i"),
+                    " assignment = :asn::jsonb, retry_feedback = '{}'::jsonb,"
+                    " updated_at = now() where id = :i"),
                     a=attempt, j=job["id"],
                     asn=json.dumps(assignment | {"bridge_agent": bridge_agent},
                                    ensure_ascii=False),
@@ -649,10 +679,7 @@ def set_state(run_id: str, action: str, actor: str = "hub-token-holder") -> dict
                         " finished_at = now() where id = :i"), i=task["id"])
                     event(conn, run_id, task["id"], "task_cancelled", {"actor": actor})
                     if task.get("job_id"):
-                        try:
-                            status = db.cancel_job(task["job_id"])
-                        except Exception:  # noqa: BLE001
-                            status = "unknown"
+                        status = db.cancel_job(task["job_id"])
                         if status == "cancelled":
                             cancelled.append(task["job_id"])
                         elif status == "cancel_requested":
@@ -679,10 +706,7 @@ def _cancel_pipeline_jobs(conn, run: dict) -> None:
         job_id = pipeline.pop(field, None)
         if not job_id:
             continue
-        try:
-            db.cancel_job(job_id)
-        except Exception:  # noqa: BLE001
-            pass
+        db.cancel_job(job_id)
         event(conn, run["id"], None, "pipeline_job_cancelled", {"job_id": job_id})
     conn.run(db._qualify(
         "update aihub.runs set pipeline = :p::jsonb, candidate_digest = null,"
@@ -746,7 +770,10 @@ def on_task_result(job_id: str, ok: bool, error: str | None = None) -> dict | No
                     decision = retry_decision(role, int(run.get("cycles") or 0),
                                               _as_json(run.get("policy"), {}))
                     if decision["action"] == "retry_coder":
-                        _restart_from_coder(conn, task, decision)
+                        _restart_from_coder(conn, task, decision, {
+                            "role": role, "reason": reason or decision["reason"],
+                            "output": output[:6000],
+                        })
                         return {"run_id": task["run_id"], "task": task["key"],
                                 "state": "retry", "reason": decision["reason"]}
                     state, error = "failed", (reason or decision["reason"])
@@ -778,7 +805,8 @@ def on_task_result(job_id: str, ok: bool, error: str | None = None) -> dict | No
     return {"run_id": task["run_id"], "task": task["key"], "state": state}
 
 
-def _restart_from_coder(conn, task: dict, decision: dict) -> None:
+def _restart_from_coder(conn, task: dict, decision: dict,
+                        feedback: dict | None = None) -> None:
     """Возврат к кодеру: конвейер кандидата сбрасывается, последующие шаги в очередь.
 
     Старые тесты и ревью относятся к прежнему кандидату: digest кандидата,
@@ -794,8 +822,11 @@ def _restart_from_coder(conn, task: dict, decision: dict) -> None:
     coder = next((t for t in tasks if t["key"] == "code"), None)
     if coder:
         conn.run(db._qualify(
-            "update aihub.run_tasks set state = 'pending', error = null, updated_at = now()"
-            " where id = :i"), i=coder["id"])
+            "update aihub.run_tasks set state = 'pending', error = null, context_id = null,"
+            " retry_feedback = :f::jsonb, updated_at = now() where id = :i"),
+            i=coder["id"], f=json.dumps(feedback or {
+                "role": task.get("role") or "pipeline", "reason": decision["reason"]
+            }, ensure_ascii=False))
         event(conn, task["run_id"], coder["id"], "task_requeued",
               {"reason": decision["reason"], "cycle": decision.get("next_cycle")})
     for row in tasks:
@@ -869,11 +900,15 @@ def _advance_pipeline(conn, run: dict) -> None:
                 s=snapshot_id, d=digest_value, i=run["id"])
             event(conn, run["id"], None, "candidate_ready",
                   {"snapshot_id": snapshot_id, "candidate_digest": digest_value})
+            run["candidate_snapshot_id"] = snapshot_id
+            run["candidate_digest"] = digest_value
             save()
+            # Continue in this poll tick so the checks job is created as soon
+            # as the candidate snapshot is accepted.
         else:
             _infra_fail(conn, run, pipeline,
                         f"снимок кандидата завершился статусом {job.get('status')}", save)
-        return
+            return
 
     if run.get("candidate_digest") and not run.get("check_receipt") \
             and not pipeline.get("checks_job_id"):
@@ -921,7 +956,9 @@ def _advance_pipeline(conn, run: dict) -> None:
             flow_gates.validate_check_receipt(
                 receipt, snapshot_id=run.get("candidate_snapshot_id") or "")
         except flow_gates.GateError as exc:
-            _infra_fail(conn, run, pipeline, f"receipt проверок отклонён: {exc.message}", save)
+            _infra_fail(conn, run, pipeline, f"receipt проверок отклонён: {exc.message}", save,
+                        feedback={"role": "run_checks", "reason": exc.message,
+                                  "receipt": receipt})
             return
         conn.run(db._qualify(
             "update aihub.runs set check_receipt = :r::jsonb, updated_at = now() where id = :i"),
@@ -935,14 +972,18 @@ def _advance_pipeline(conn, run: dict) -> None:
             code_task = db._one(conn, db._qualify(
                 "select * from aihub.run_tasks where run_id = :r and key = 'code'"), r=run["id"])
             if code_task and decision["action"] == "retry_coder":
-                _restart_from_coder(conn, code_task, decision)
+                _restart_from_coder(conn, code_task, decision, {
+                    "role": "run_checks", "reason": "проверки кандидата не пройдены",
+                    "receipt": receipt,
+                })
             else:
                 _finish_run(conn, run["id"], "failed", "run_failed",
                             decision["reason"] if decision["action"] == "fail"
                             else "проверки кандидата не пройдены")
 
 
-def _infra_fail(conn, run: dict, pipeline: dict, reason: str, save) -> None:
+def _infra_fail(conn, run: dict, pipeline: dict, reason: str, save,
+                feedback: dict | None = None) -> None:
     """Инфраструктурный сбой конвейера: возврат кодеру или падение запуска."""
     save()
     event(conn, run["id"], None, "pipeline_failed", {"reason": reason})
@@ -954,7 +995,9 @@ def _infra_fail(conn, run: dict, pipeline: dict, reason: str, save) -> None:
     code_task = db._one(conn, db._qualify(
         "select * from aihub.run_tasks where run_id = :r and key = 'code'"), r=run["id"])
     if code_task and decision["action"] == "retry_coder":
-        _restart_from_coder(conn, code_task, decision)
+        _restart_from_coder(conn, code_task, decision, feedback or {
+            "role": "pipeline", "reason": reason,
+        })
     else:
         _finish_run(conn, run["id"], "failed", "run_failed", reason)
 

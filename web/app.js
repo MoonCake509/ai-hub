@@ -464,6 +464,8 @@ const RUN_EVENT_RU = {run_created:'процесс создан', task_dispatched
   run_cancel:'процесс отменён', run_pause:'пауза', run_resume:'продолжение',
   budget_exceeded:'бюджет исчерпан', run_created_existing:'повтор создания (тот же процесс)'};
 let currentRunId = '';
+let runDetailRequest = 0;
+let runCreatePending = false;
 try { const match = String(window.location.hash || '').match(/run=([0-9a-f]+)/); if (match) currentRunId = match[1]; } catch (e) { /* тесты без window */ }
 
 function runHashSet(runId) {
@@ -534,6 +536,7 @@ async function openRunDetail(runId) {
 
 function runCloseDetail() {
   currentRunId = '';
+  runDetailRequest++;
   runHashSet('');
   const box = $('#run-detail');
   if (box) { box.hidden = true; box.replaceChildren(); }
@@ -543,15 +546,19 @@ function runCloseDetail() {
 async function renderRunDetail() {
   const box = $('#run-detail');
   if (!box) return;
-  if (!currentRunId) { box.hidden = true; return; }
+  const runId = currentRunId;
+  const request = ++runDetailRequest;
+  if (!runId) { box.hidden = true; return; }
   let run;
   try {
-    run = await api('/runs/' + currentRunId);
+    run = await api('/runs/' + runId);
   } catch (error) {
+    if (request !== runDetailRequest || currentRunId !== runId) return;
     box.hidden = false;
     box.replaceChildren(el('p', 'hint', 'Не удалось загрузить запуск: ' + error.message));
     return;
   }
+  if (request !== runDetailRequest || currentRunId !== runId) return;
   box.hidden = false;
   box.replaceChildren();
   const head = el('div', 'run-head');
@@ -612,8 +619,10 @@ async function renderRunDetail() {
       const resultRow = el('tr', 'run-result-row');
       const cell = el('td');
       cell.colSpan = 6;
-      cell.append(el('div', 'muted', 'Результат: ' +
-        JSON.stringify(task.result).slice(0, 400)));
+      const resultDetails = el('details', 'run-result-details');
+      resultDetails.append(el('summary', '', 'Результат'),
+        el('pre', 'run-result-output', JSON.stringify(task.result, null, 2)));
+      cell.append(resultDetails);
       resultRow.append(cell);
       body.append(resultRow);
     }
@@ -718,32 +727,53 @@ async function runShowCreate() {
 async function runSubmitCreate(event) {
   event.preventDefault();
   const status = $('#flow-preflight');
-  const projectId = await runCurrentProject();
-  if (!projectId) { status.textContent = 'Нет проекта: создайте его во вкладке «Рабочее пространство».'; return; }
-  const num = (id) => {
-    const value = parseInt($(id).value, 10);
-    return Number.isFinite(value) && value > 0 ? value : null;
-  };
-  const policy = {max_cycles: Math.max(0, parseInt($('#flow-max-cycles').value, 10) || 0), budgets: {}};
-  for (const [id, key] of [['#flow-max-dispatches', 'max_dispatches'],
-                           ['#flow-max-calls', 'max_job_calls'],
-                           ['#flow-max-seconds', 'max_seconds']]) {
-    const value = num(id);
-    if (value) policy.budgets[key] = value;
-  }
-  const body = {
-    project_id: projectId,
-    template_id: 'five-roles',
-    goal: $('#flow-goal').value.trim(),
-    criteria: $('#flow-criteria').value.split(';').map(s => s.trim()).filter(Boolean),
-    entry: $('#flow-entry').value.trim(),
-    contracts: $('#flow-contracts').value.split(',').map(s => s.trim()).filter(Boolean),
-    policy,
-    request_key: newKey(),
-  };
   const submit = $('#flow-submit');
+  if (runCreatePending) return;
+  runCreatePending = true;
   submit.disabled = true;
+  submit.textContent = 'Создаю…';
   try {
+    const projectId = await runCurrentProject();
+    if (!projectId) { status.textContent = 'Нет проекта: создайте его во вкладке «Рабочее пространство».'; return; }
+    const goal = $('#flow-goal').value.trim();
+    if (!goal) { status.textContent = 'Укажите цель процесса.'; $('#flow-goal').focus(); return; }
+    const parseBudget = (id, label, min) => {
+      const raw = $(id).value.trim();
+      if (!raw) return {ok: true, value: null};
+      const value = Number(raw);
+      if (!Number.isSafeInteger(value) || value < min) {
+        status.textContent = label + ': введите целое число не меньше ' + min + '.';
+        $(id).focus();
+        return {ok: false, value: null};
+      }
+      return {ok: true, value};
+    };
+    const rawCycles = $('#flow-max-cycles').value.trim();
+    const cycles = rawCycles === '' ? 0 : Number(rawCycles);
+    if (!Number.isSafeInteger(cycles) || cycles < 0) {
+      status.textContent = 'Циклы исправлений: введите целое число не меньше 0.';
+      $('#flow-max-cycles').focus();
+      return;
+    }
+    const policy = {max_cycles: cycles, budgets: {}};
+    for (const [id, key, label] of [['#flow-max-dispatches', 'max_dispatches', 'Максимум шагов'],
+                                    ['#flow-max-calls', 'max_job_calls', 'Максимум вызовов'],
+                                    ['#flow-max-seconds', 'max_seconds', 'Лимит времени']]) {
+      const parsed = parseBudget(id, label, 1);
+      if (!parsed.ok) return;
+      if (parsed.value !== null) policy.budgets[key] = parsed.value;
+    }
+    const body = {
+      project_id: projectId,
+      template_id: 'five-roles',
+      goal,
+      criteria: $('#flow-criteria').value.split(';').map(s => s.trim()).filter(Boolean),
+      entry: $('#flow-entry').value.trim(),
+      contracts: $('#flow-contracts').value.split(',').map(s => s.trim()).filter(Boolean),
+      policy,
+      request_key: newKey(),
+    };
+    status.textContent = 'Создаю процесс…';
     const created = await api('/runs', {method: 'POST', body: JSON.stringify(body), timeout: 30000});
     $('#flow-create').hidden = true;
     $('#flow-create').reset ? $('#flow-create').reset() : null;
@@ -754,7 +784,9 @@ async function runSubmitCreate(event) {
       ? 'Конфликт: такой ключ создания уже занят другим содержимым (409).'
       : 'Не удалось создать процесс: ' + error.message;
   } finally {
+    runCreatePending = false;
     submit.disabled = false;
+    submit.textContent = 'Создать процесс';
   }
 }
 

@@ -89,5 +89,6 @@
 .run-steps th,.run-steps td{padding:5px 7px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
 .run-steps th{color:var(--faint);font-size:10px}
 .run-error{color:#efb3b9;font-size:10px;white-space:pre-wrap}
+.run-result-output{max-height:280px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;background:#111925;border-radius:7px;padding:10px;font-size:10px;margin:7px 0}
 .run-receipt{display:grid;gap:3px;padding:9px;border:1px solid #2c5744;border-radius:7px;background:#14231c;font-size:10px}
 .run-events{display:grid;gap:2px;max-height:220px;overflow:auto;font-size:10px;padding:8px;border:1px solid var(--line);border-radius:7px;background:#111925}

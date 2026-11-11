@@ -18,6 +18,7 @@ list_files), а не из предположений хаба.
 from __future__ import annotations
 
 import fnmatch
+import base64
 import hashlib
 import json
 import os
@@ -394,7 +395,7 @@ def _entries_from_listing(result: dict | None) -> list[dict]:
     return out
 
 
-def _store_built(packet_id: str, built: dict) -> None:
+def _store_built(packet_id: str, built: dict, contents: dict[str, str] | None = None) -> None:
     """Пишет собранный вход; изменившийся digest означает конфликт и новую ревизию."""
     previous = (_packet_row(packet_id) or {}).get("digest")
     state = "conflict" if previous and previous != built["digest"] else "sealed"
@@ -412,8 +413,36 @@ def _store_built(packet_id: str, built: dict) -> None:
             st=state, d=built["digest"], u=int(built["used_tokens"]),
             b=int(built["budget_tokens"]), i=packet_id,
             m=json.dumps(payload, ensure_ascii=False))
-        _save_revision(conn, packet_id, int(row["revision"]), built["digest"],
+        revision = int(row["revision"])
+        conn.run(db._qualify(
+            "delete from aihub.context_packet_files where packet_id = :p and revision = :r"),
+            p=packet_id, r=revision)
+        selected = {item["path"] for item in built["items"] if item.get("selected")}
+        for path in sorted(selected):
+            text = (contents or {}).get(path)
+            item = next(item for item in built["items"] if item["path"] == path)
+            if text is None:
+                raise PacketError("context_missing", f"нет проверенного содержимого: {path}")
+            raw = text.encode("utf-8")
+            if len(raw) != int(item["size"]) or hashlib.sha256(raw).hexdigest() != item["sha256"]:
+                raise PacketError("context_hash_mismatch", f"содержимое не прошло сверку: {path}")
+            conn.run(db._qualify(
+                "insert into aihub.context_packet_files(packet_id, revision, path, sha256, size, content)"
+                " values (:p, :r, :path, :sha, :size, :content)"),
+                p=packet_id, r=revision, path=path, sha=item["sha256"],
+                size=int(item["size"]), content=text)
+        _save_revision(conn, packet_id, revision, built["digest"],
                        built["items"])
+
+
+def verified_contents(packet_id: str, revision: int) -> list[dict]:
+    """Returns only the selected UTF-8 bytes verified for an immutable revision."""
+    with db._lock:
+        conn = db.connect()
+        return [dict(row) for row in db._rows(conn, db._qualify(
+            "select path, sha256, size, content from aihub.context_packet_files"
+            " where packet_id = :p and revision = :r order by path"),
+            p=packet_id, r=int(revision))]
 
 
 def _store_collected(packet_id: str, collected: list[dict]) -> None:
@@ -497,17 +526,35 @@ def poll_active(limit: int = 20) -> int:
             if isinstance(request, str):
                 request = json.loads(request)
             entries = (packet_row.get("manifest") or {}).get("collected") or []
-            contents = {f.get("path"): (f.get("text") or "")
-                        for f in ((job.get("result") or {}).get("files") or []) if f.get("path")}
+            returned = {f.get("path"): f for f in ((job.get("result") or {}).get("files") or [])
+                        if f.get("path")}
+            expected = {e["path"]: e for e in entries}
+            contents = {}
+            verified_entries = []
+            for path, file in returned.items():
+                listed = expected.get(path)
+                text = file.get("text")
+                if not listed or not isinstance(text, str):
+                    continue
+                raw = text.encode("utf-8")
+                actual_sha = hashlib.sha256(raw).hexdigest()
+                if (int(file.get("offset") or 0) != 0
+                        or int(file.get("length") or len(raw)) != len(raw)
+                        or len(raw) != int(listed.get("size") or 0)
+                        or actual_sha != (listed.get("sha256") or "")
+                        or file.get("sha256") != listed.get("sha256")):
+                    continue
+                contents[path] = text
+                verified_entries.append(listed)
             try:
-                built = context.build(entries, contents, request.get("goal") or "",
+                built = context.build(verified_entries, contents, request.get("goal") or "",
                                       request.get("entry") or "",
                                       request.get("contracts") or [],
                                       int(request.get("budget_tokens") or 0))
             except context.ContextError as exc:
                 fail(row["id"], exc.message)
                 continue
-            _store_built(row["id"], built)
+            _store_built(row["id"], built, contents)
         elif op == "materialize":
             _continue_materialize(row["id"], job)
         elif op == "snapshot":
@@ -543,6 +590,11 @@ def start_materialize(packet_id: str) -> dict:
         raise PacketError("bad_state", f"пакет в состоянии {packet['state']}, нужен sealed")
     revision, items = _revision_manifest(packet)
     selected = [i for i in items if i.get("selected")]
+    with db._lock:
+        conn = db.connect()
+        conn.run(db._qualify(
+            "delete from aihub.context_packet_files where packet_id = :p and revision = :r"),
+            p=packet_id, r=revision)
     project = db.get_project(packet["project_id"])
     if not project:
         raise PacketError("no_project", "проект пакета не найден")
@@ -594,6 +646,7 @@ def _continue_materialize(packet_id: str, job: dict) -> None:
     verified = list(state.get("verified") or [])
     pending = list(state.get("pending") or [])
     reason = None
+    chunk_contents = []
     for entry in ((job.get("result") or {}).get("files") or []):
         path = entry.get("path")
         want = by_path.get(path)
@@ -608,6 +661,21 @@ def _continue_materialize(packet_id: str, job: dict) -> None:
         if int(entry.get("size") or -1) != int(want.get("size") or -2):
             reason = f"размер не сошёлся для {path}"
             break
+        try:
+            if isinstance(entry.get("text"), str):
+                raw = entry["text"].encode("utf-8")
+                text = entry["text"]
+            else:
+                raw = base64.b64decode(entry.get("content_b64") or "", validate=True)
+                text = raw.decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            reason = f"содержимое не является UTF-8: {path}"
+            break
+        if (len(raw) != int(want.get("size") or 0)
+                or hashlib.sha256(raw).hexdigest() != want.get("sha256")):
+            reason = f"содержимое не прошло SHA-256: {path}"
+            break
+        chunk_contents.append((path, want, text))
         if path in pending:
             pending.remove(path)
         if path not in verified:
@@ -620,6 +688,9 @@ def _continue_materialize(packet_id: str, job: dict) -> None:
     if reason is not None:
         with db._lock:
             conn = db.connect()
+            conn.run(db._qualify(
+                "delete from aihub.context_packet_files where packet_id = :p and revision = :r"),
+                p=packet_id, r=revision)
             db._one(conn, db._qualify(
                 "update aihub.context_packets set state = 'conflict',"
                 " manifest = manifest || :m::jsonb, updated_at = now()"
@@ -627,6 +698,17 @@ def _continue_materialize(packet_id: str, job: dict) -> None:
                 m=json.dumps({"materialize": {"error": reason, "revision": revision}},
                              ensure_ascii=False), i=packet_id)
         return
+    if chunk_contents:
+        with db._lock:
+            conn = db.connect()
+            for path, item, text in chunk_contents:
+                conn.run(db._qualify(
+                    "insert into aihub.context_packet_files(packet_id, revision, path, sha256, size, content)"
+                    " values (:p, :r, :path, :sha, :size, :content)"
+                    " on conflict (packet_id, revision, path) do update set"
+                    " sha256 = excluded.sha256, size = excluded.size, content = excluded.content"),
+                    p=packet_id, r=revision, path=path, sha=item["sha256"],
+                    size=int(item["size"]), content=text)
     if pending:
         # Следующая порция выбранных файлов этой же ревизии.
         progress = {"materialize": {"revision": revision, "total": state.get("total"),

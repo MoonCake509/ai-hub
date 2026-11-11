@@ -6,8 +6,10 @@ host worker грузит его по пути; расхождение ломае
 """
 import hashlib
 import importlib.util
+import json
 import os
 import sys
+import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -36,6 +38,14 @@ class ParityTest(unittest.TestCase):
         self.assertEqual(set(host.DENY_DIRS), set(security_policy.DENY_DIRS))
         self.assertEqual(set(host.DENY_NAMES), set(security_policy.SECRET_NAMES))
         self.assertEqual(tuple(host.DENY_SUFFIX), tuple(security_policy.SECRET_SUFFIXES))
+
+    def test_inspect_manifest_materializes_policy_digest(self):
+        host = self._load_host_module()
+        with tempfile.TemporaryDirectory(prefix="host-policy-digest-") as root:
+            info = host.op_inspect(root, {})
+        self.assertEqual(info["security_policy"], security_policy.policy_digest())
+        self.assertIsInstance(info["security_policy"], dict)
+        json.dumps(info)
 
     def test_host_denied_matches_server(self):
         host = self._load_host_module()

@@ -14,7 +14,8 @@ import time
 import threading
 import zipfile
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "agents", "laptop"))
 import workspace_host as host  # noqa: E402
 
 PASSED, FAILED, DIRS = [], [], []
@@ -300,12 +301,13 @@ def test_patch_rechecks_external_preimage_before_effect():
 def test_interprocess_writer_lock():
     root = repo(with_git=False)
     ready = os.path.join(root, "ready")
+    host_dir = os.path.join(ROOT, "agents", "laptop")
     code = (
         "import os,sys,time; sys.path.insert(0,sys.argv[1]); import workspace_host as h; "
         "root=sys.argv[2]; ready=sys.argv[3]; "
         "ctx=h._writer_lock(root); ctx.__enter__(); open(ready,'w').close(); time.sleep(1); ctx.__exit__(None,None,None)"
     )
-    proc = subprocess.Popen([sys.executable, "-c", code, os.path.dirname(__file__), root, ready],
+    proc = subprocess.Popen([sys.executable, "-c", code, host_dir, root, ready],
                             env=os.environ.copy())
     try:
         deadline = time.time() + 5
@@ -317,8 +319,43 @@ def test_interprocess_writer_lock():
         proc.wait(timeout=5)
 
 
+def test_posix_writer_lock_timeout():
+    """POSIX flock waits are bounded and report writer_busy."""
+    if os.name == "nt":
+        return
+    root = repo(with_git=False)
+    ready = os.path.join(root, "ready-posix-lock")
+    host_dir = os.path.join(ROOT, "agents", "laptop")
+    code = (
+        "import os,sys,time; sys.path.insert(0,sys.argv[1]); import workspace_host as h; "
+        "ctx=h._writer_lock(sys.argv[2]); ctx.__enter__(); "
+        "open(sys.argv[3],'w').close(); time.sleep(2); ctx.__exit__(None,None,None)"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", code, host_dir, root, ready],
+        env=os.environ.copy())
+    try:
+        deadline = time.monotonic() + 5
+        while not os.path.exists(ready) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert os.path.exists(ready), "POSIX lock holder did not start"
+        started = time.monotonic()
+        expect("writer_busy", lambda: _take_lock_with_timeout(root, 0.15))
+        elapsed = time.monotonic() - started
+        assert elapsed < 0.75, f"lock timeout took {elapsed:.3f}s"
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+        proc.wait(timeout=5)
+
+
 def _take_short_lock(root):
     with host._writer_lock(root, timeout=0.1):
+        pass
+
+
+def _take_lock_with_timeout(root, timeout):
+    with host._writer_lock(root, timeout=timeout):
         pass
 
 

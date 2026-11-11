@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import errno
 import fnmatch
 import hashlib
 import json
@@ -62,6 +63,12 @@ def _load_canonical_policy() -> dict:
         "SECRET_SUFFIXES": (".pem", ".key", ".pfx", ".p12", ".dump", ".bak", ".kdbx"),
         "SECRET_NAMES": {"token.txt", "credentials", ".netrc", "id_rsa",
                          "id_ed25519", "auth.json"},
+        "SECRET_PATTERNS": (
+            ".env", ".env.*", "*.pem", "*.key", "*.pfx", "*.p12",
+            "id_rsa*", "id_ed25519*", "*credentials*", "*secret*",
+            ".npmrc", ".pypirc", ".netrc", ".git-credentials",
+            "*.kdbx", "*.ovpn", "auth.json", "cookies*.txt",
+        ),
     }
     import importlib.util
     here = os.path.dirname(os.path.abspath(__file__))
@@ -77,7 +84,7 @@ def _load_canonical_policy() -> dict:
                 "DENY_DIRS": set(module.DENY_DIRS),
                 "SECRET_SUFFIXES": tuple(module.SECRET_SUFFIXES),
                 "SECRET_NAMES": set(module.SECRET_NAMES),
-                "policy_digest": module.policy_digest,
+                "policy_digest": module.policy_digest(),
                 "denied_reason": module.denied_reason,
             }
         except Exception as exc:  # noqa: BLE001
@@ -91,7 +98,13 @@ def _load_canonical_policy() -> dict:
     return {"DENY_DIRS": set(fallback["DENY_DIRS"]),
             "SECRET_SUFFIXES": tuple(fallback["SECRET_SUFFIXES"]),
             "SECRET_NAMES": set(fallback["SECRET_NAMES"]),
-            "policy_digest": None,
+            "SECRET_PATTERNS": tuple(fallback["SECRET_PATTERNS"]),
+            "policy_digest": {
+                "deny_dirs": sorted(fallback["DENY_DIRS"]),
+                "secret_names": sorted(fallback["SECRET_NAMES"]),
+                "secret_suffixes": sorted(fallback["SECRET_SUFFIXES"]),
+                "secret_patterns": sorted(fallback["SECRET_PATTERNS"]),
+            },
             "denied_reason": None}
 
 
@@ -167,6 +180,12 @@ def denied(rel: str) -> str | None:
         return "секрет"
     if name.endswith(DENY_SUFFIX):
         return "секрет/дамп"
+    low_rel = (rel or "").lower()
+    for pattern in _POLICY.get("SECRET_PATTERNS", ()):
+        if fnmatch.fnmatch(name, pattern.lower()):
+            return "секрет (политика путей)"
+        if "*" in pattern and fnmatch.fnmatch(low_rel, pattern.lower()):
+            return "секрет (политика путей)"
     return None
 
 
@@ -488,8 +507,18 @@ def _writer_lock(root: str, timeout: float = 90):
                     time.sleep(0.1)
         else:
             import fcntl
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
-            acquired = True
+            deadline = time.monotonic() + max(0.0, timeout)
+            while True:
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                    break
+                except OSError as exc:
+                    if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                        raise
+                    if time.monotonic() >= deadline:
+                        raise OpFail("writer_busy", "another workspace writer holds this checkout")
+                    time.sleep(min(0.1, max(0.01, deadline - time.monotonic())))
         yield
     finally:
         if acquired:

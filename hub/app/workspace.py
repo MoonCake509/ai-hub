@@ -316,16 +316,34 @@ def registry_agents(host_id: str) -> dict:
 
 
 def host_capabilities(host_id: str) -> dict:
-    """Возможности живого воркера этого host из последнего heartbeat."""
+    """Возможности живого воркера этого host из последнего heartbeat.
+
+    На одном host может работать несколько воркеров: старый без проверок и
+    новый с изолированным исполнителем. Возможности нельзя брать у первого
+    попавшегося — иначе готовый исполнитель «не виден», и запуск отклоняется.
+    Сначала выбирается воркер, подтвердивший изолированный запуск и run_checks,
+    затем любой в состоянии ok.
+    """
     registry = set(registry_agents(host_id))
+    candidates = []
     for worker in workers.list_workers():
         served = set(worker.get("agents") or [])
         if served & registry:
             caps = dict(worker.get("capabilities") or {})
             caps["worker_id"] = worker.get("worker_id")
             caps["state"] = worker.get("state")
+            candidates.append(caps)
+    if not candidates:
+        return {}
+    for caps in candidates:
+        if (caps.get("isolated_runner_protocol") == 1
+                and "run_checks" in (caps.get("workspace_ops") or [])
+                and caps.get("state") == "ok"):
             return caps
-    return {}
+    for caps in candidates:
+        if caps.get("state") == "ok":
+            return caps
+    return candidates[0]
 
 
 def check_plan(project_id: str, names: list[str]) -> dict:

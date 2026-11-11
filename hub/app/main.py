@@ -1498,7 +1498,8 @@ async def run_create(request: Request) -> JSONResponse:
     if payload.get("template_id") == templates_ctrl.FIVE_ROLES_ID:
         payload["template"] = templates_ctrl.template(
             payload.get("entry") or "",
-            [c for c in (payload.get("contracts") or []) if isinstance(c, str)])
+            [c for c in (payload.get("contracts") or []) if isinstance(c, str)],
+            agent=(payload.get("agent") or "codex"))
     project_id = payload.get("project_id")
     if not project_id:
         raise HTTPException(status_code=400, detail="project_id is required")

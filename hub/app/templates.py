@@ -191,7 +191,8 @@ CONTEXT = {
 }
 
 
-def template(project_entry: str = "", contracts: list[str] | None = None) -> dict:
+def template(project_entry: str = "", contracts: list[str] | None = None,
+             agent: str = "codex") -> dict:
     """Шаблон запуска: цепочка ролей, схемы выходов и вход каждой роли."""
     steps = []
     for index, item in enumerate(CHAIN):
@@ -200,7 +201,7 @@ def template(project_entry: str = "", contracts: list[str] | None = None) -> dic
         steps.append({
             "key": item["key"],
             "role": item["role"],
-            "agent": "codex",
+            "agent": agent or "codex",
             "prompt": role["prompt"],
             "depends_on": list(item["depends_on"]),
             "output": role["output"],

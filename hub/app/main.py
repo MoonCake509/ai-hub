@@ -12,8 +12,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import ntpath
 import os
 import re
+import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -29,6 +32,7 @@ from . import reconciliation
 from . import capabilities
 from . import packets
 from . import runs as runs_ctrl
+from . import project_template
 from . import templates as templates_ctrl
 from . import protocol as bridge_protocol
 from . import resources
@@ -50,6 +54,8 @@ MAX_QUEUE = int(os.environ.get("MAX_QUEUE", "50"))
 MAX_RESULT_CHARS = int(os.environ.get("MAX_RESULT_CHARS", "100000"))
 MIN_TIMEOUT_S = int(os.environ.get("MIN_TIMEOUT_S", "10"))
 MAX_TIMEOUT_S = int(os.environ.get("MAX_TIMEOUT_S", "7200"))
+# Сколько ждём подготовку папки проекта, прежде чем отдать карточку со статусом «failed».
+PROJECT_INIT_WAIT_S = int(os.environ.get("PROJECT_INIT_WAIT_S", "90"))
 
 
 # Период уборки аренд привязан к их длительности: при LEASE_SECONDS=3 минутный
@@ -701,6 +707,86 @@ async def project(project_id: str) -> dict:
     return data
 
 
+def _project_dir_name(name: str, project_id: str) -> str:
+    """Имя папки: безопасная часть названия и короткий ID, чтобы одноимённые не слипались."""
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:40] or "project"
+    return f"{slug}-{project_id[:8]}"
+
+
+# Статусы, после которых задание воркера уже не изменится.
+JOB_TERMINAL = {"succeeded", "done", "failed", "cancelled", "unknown", "error"}
+JOB_SUCCESS = {"succeeded", "done"}
+
+
+def _wait_workspace_job(job_id: str, timeout_s: int) -> dict | None:
+    deadline = time.monotonic() + max(5, timeout_s)
+    while time.monotonic() < deadline:
+        result = workspace.job_result(job_id)
+        if result and result.get("status") in JOB_TERMINAL:
+            return result
+        time.sleep(0.5)
+    return workspace.job_result(job_id)
+
+
+async def _prepare_project(project: dict, name: str, host_id: str, settings: dict) -> dict:
+    """Поставить подготовку папки на хост и дождаться результата.
+
+    Повтор безопасен: воркер не перезаписывает существующие файлы и не делает
+    второй коммит, поэтому тот же вызов завершает прерванную подготовку.
+    """
+    project_id = str(project["id"])
+    workdir = str(project.get("workdir") or "").strip()
+    if not workdir:
+        workdir = ntpath.join(await asyncio.to_thread(workspace.projects_root),
+                              _project_dir_name(name, project_id))
+    branch = str(settings.get("branch") or "main")
+    args = {
+        "root": workdir,
+        "name": name[:200],
+        "branch": branch,
+        "author_name": str(settings.get("author_name") or "AI Hub"),
+        "author_email": str(settings.get("author_email") or "aihub@local"),
+        "template_version": project_template.TEMPLATE_VERSION,
+        "template_files": project_template.starter_files(name[:200], workdir, branch, project_id),
+    }
+    try:
+        job = await asyncio.to_thread(
+            workspace.create_op_job, "init_project", args, host_id, project_id,
+            f"init:{project_id}", 180)
+    except workspace.OpError as exc:
+        # Карточка остаётся, причина отказа — в ней: папку никто не создавал.
+        error = {"code": exc.code, "message": str(exc)}
+        await asyncio.to_thread(db.project_prepare_failed, project_id, error)
+        project = await asyncio.to_thread(db.get_project, project_id)
+        project["prepare_error"] = error
+        return project
+
+    result = await asyncio.to_thread(_wait_workspace_job, job["job"]["id"], PROJECT_INIT_WAIT_S)
+    data = (result or {}).get("result")
+    if (result or {}).get("status") in JOB_SUCCESS and isinstance(data, dict):
+        project = await asyncio.to_thread(
+            db.project_prepared, project_id,
+            repo_root=data.get("root") or workdir,
+            git_root=data.get("git_root") or workdir,
+            branch=data.get("branch") or branch,
+            head_sha=data.get("head_sha") or "",
+            template_version=data.get("template_version") or project_template.TEMPLATE_VERSION)
+        project["prepare_job"] = job["job"]["id"]
+        return project
+
+    error = {
+        "code": "prepare_failed",
+        "message": (result or {}).get("error") or "project preparation did not finish",
+        "status": (result or {}).get("status"),
+        "job_id": job["job"]["id"],
+    }
+    await asyncio.to_thread(db.project_prepare_failed, project_id, error)
+    project = await asyncio.to_thread(db.get_project, project_id)
+    project["prepare_job"] = job["job"]["id"]
+    project["prepare_error"] = error
+    return project
+
+
 @app.post("/projects", dependencies=[Depends(require_token)])
 async def project_create(request: Request) -> dict:
     payload = await request.json()
@@ -708,11 +794,28 @@ async def project_create(request: Request) -> dict:
     if not name:
         raise HTTPException(status_code=400, detail="name is required")
     host_id = (payload.get("host_id") or "laptop").strip()
-    workdir = (payload.get("workdir") or "").strip()
     settings = payload.get("settings") or {}
     if not isinstance(settings, dict):
         raise HTTPException(status_code=400, detail="settings must be an object")
-    return await asyncio.to_thread(db.create_project, name[:200], host_id[:100], workdir[:2000], settings)
+    key = (payload.get("idempotency_key") or "").strip()[:200]
+
+    if key:
+        existing = await asyncio.to_thread(db.project_by_request_key, key)
+        if existing:
+            if existing.get("status") == "failed":
+                # Повтор прерванной или неудачной подготовки: тот же проект и та же папка.
+                return await _prepare_project(existing, str(existing.get("name") or name),
+                                              str(existing.get("host_id") or host_id),
+                                              existing.get("settings") or settings)
+            return existing
+
+    project_id = uuid.uuid4().hex
+    root = await asyncio.to_thread(workspace.projects_root)
+    workdir = ntpath.join(root, _project_dir_name(name, project_id))
+    project = await asyncio.to_thread(
+        db.create_project, name[:200], host_id, workdir, settings,
+        status="preparing", request_key=key or None, project_id=project_id)
+    return await _prepare_project(project, name, host_id, settings)
 
 
 @app.patch("/projects/{project_id}", dependencies=[Depends(require_token)])

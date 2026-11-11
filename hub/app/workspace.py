@@ -18,6 +18,7 @@ import binascii
 import hashlib
 import json
 import ntpath
+import os
 import posixpath
 import re
 import time
@@ -25,6 +26,7 @@ import time
 from . import db, workers, security_policy
 
 OPS = {
+    "init_project": "рабочая папка проекта: шаблон, git init и первый коммит",
     "inspect": "канонический корень, git HEAD/status digest, возможности host",
     "snapshot": "управляемая копия и зафиксированное базовое состояние",
     "list_files": "ограниченный список путей с размерами и хешами",
@@ -39,7 +41,7 @@ OPS = {
 # управляемую область воркера и не должны блокировать кодеров.
 WRITES_ROOT = {"apply_patch"}
 # Операции, меняющие управляемое состояние: им нужен idempotency key по умолчанию.
-MUTATING = {"snapshot", "apply_patch", "package"}
+MUTATING = {"snapshot", "apply_patch", "package", "init_project"}
 
 MAX_LIST = 200
 MAX_READ_FILES = 8
@@ -171,13 +173,38 @@ def validate(op: str, args: dict | None) -> dict:
         raise OpError("bad_arg", "args должен быть объектом")
     unknown = set(args) - {"root", "label", "glob", "limit", "offset", "files",
                            "changes", "checks", "snapshot_id", "include",
-                           "base_tree_digest"}
+                           "base_tree_digest", "name", "branch", "author_name",
+                           "author_email", "template_version", "template_files"}
     if unknown:
         raise OpError("bad_arg", "лишние поля: " + ", ".join(sorted(unknown)))
     root = canon(_str(args.get("root"), "root", 400))
     clean: dict = {"root": root}
 
     if op == "inspect":
+        return clean
+
+    if op == "init_project":
+        name = _str(args.get("name"), "name", 200)
+        if not name:
+            raise OpError("bad_arg", "name обязателен")
+        clean["name"] = name
+        clean["branch"] = _str(args.get("branch"), "branch", 100) or "main"
+        clean["author_name"] = _str(args.get("author_name"), "author_name", 100) or "AI Hub"
+        clean["author_email"] = _str(args.get("author_email"), "author_email", 200) or "aihub@local"
+        clean["template_version"] = _str(args.get("template_version"), "template_version", 40) or "1"
+        template = args.get("template_files") or {}
+        if not isinstance(template, dict) or len(template) > 40:
+            raise OpError("bad_arg", "template_files: объект не больше 40 файлов")
+        files: dict[str, str] = {}
+        total = 0
+        for rel, content in template.items():
+            if not isinstance(content, str):
+                raise OpError("bad_arg", "template_files: содержимое должно быть строкой")
+            total += len(content.encode("utf-8"))
+            if total > 512 * 1024:
+                raise OpError("bad_arg", "template_files: больше 512 КБ")
+            files[_str(rel, "path", 400)] = content
+        clean["template_files"] = files
         return clean
 
     if op == "snapshot":
@@ -313,6 +340,27 @@ def registry_agents(host_id: str) -> dict:
     except Exception:  # noqa: BLE001
         items = []
     return {item.get("id"): item for item in items if item.get("host") == host_id}
+
+
+CONFIG_FILE = os.environ.get("HUB_CONFIG", "/app/config/hub.yaml")
+DEFAULT_PROJECTS_ROOT = r"R:\Projects"
+
+
+def projects_root() -> str:
+    """Корень рабочих папок новых проектов: переменная окружения, затем config/hub.yaml."""
+    env = (os.environ.get("HUB_PROJECTS_ROOT") or "").strip()
+    if env:
+        return env
+    try:
+        import yaml
+        with open(CONFIG_FILE, encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+        value = str(((data.get("projects") or {}) if isinstance(data, dict) else {}).get("root") or "").strip()
+        if value:
+            return value
+    except (OSError, ValueError):
+        pass
+    return DEFAULT_PROJECTS_ROOT
 
 
 def host_capabilities(host_id: str) -> dict:

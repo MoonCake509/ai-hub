@@ -352,7 +352,19 @@ DDL = [
     "alter table aihub.run_tasks add column if not exists receipt jsonb",
     "alter table aihub.run_tasks add column if not exists retry_feedback jsonb not null default '{}'",
     "alter table aihub.run_tasks add column if not exists packet_revision int",
-]
+        # P-01: создание рабочей папки проекта — статус подготовки и привязка Git.
+        "alter table aihub.projects add column if not exists status text not null default 'ready'",
+        "alter table aihub.projects add column if not exists repo_root text",
+        "alter table aihub.projects add column if not exists git_root text",
+        "alter table aihub.projects add column if not exists branch text",
+        "alter table aihub.projects add column if not exists head_sha text",
+        "alter table aihub.projects add column if not exists template_version text",
+        "alter table aihub.projects add column if not exists prepare_error jsonb",
+        "alter table aihub.projects add column if not exists prepared_at timestamptz",
+        "alter table aihub.projects add column if not exists request_key text",
+        "create unique index if not exists projects_request_key on aihub.projects(request_key)"
+        " where request_key is not null",
+    ]
 
 
 def _dsn() -> dict:
@@ -1018,17 +1030,19 @@ def get_project(project_id: str) -> dict | None:
 
 
 def create_project(name: str, host_id: str = "laptop", workdir: str = "",
-                   settings: dict | None = None) -> dict:
-    project_id = uuid.uuid4().hex
+                   settings: dict | None = None, *, status: str = "ready",
+                   request_key: str | None = None,
+                   project_id: str | None = None) -> dict:
+    project_id = project_id or uuid.uuid4().hex
     with _lock:
         conn = connect()
         conn.run("begin")
         try:
             conn.run(_qualify(
-                "insert into aihub.projects(id, name, host_id, workdir, settings)"
-                " values (:i, :n, :h, :w, :s::jsonb)"),
+                "insert into aihub.projects(id, name, host_id, workdir, settings, status, request_key)"
+                " values (:i, :n, :h, :w, :s::jsonb, :st, :rk)"),
                 i=project_id, n=name, h=host_id, w=workdir,
-                s=json.dumps(settings or {}, ensure_ascii=False))
+                s=json.dumps(settings or {}, ensure_ascii=False), st=status, rk=request_key)
             for rid in ROLE_IDS:
                 conn.run(_qualify(
                     "insert into aihub.roles(project_id, role_id, agent_id, profile, model, instructions)"
@@ -1037,6 +1051,44 @@ def create_project(name: str, host_id: str = "laptop", workdir: str = "",
         except Exception:
             conn.run("rollback")
             raise
+    project = get_project(project_id)
+    if project is None:
+        raise RuntimeError("project row disappeared after insert")
+    return project
+
+
+def project_by_request_key(key: str) -> dict | None:
+    if not key:
+        return None
+    with _lock:
+        conn = connect()
+        row = _one(conn, _qualify(
+            "select id from aihub.projects where request_key = :k"), k=key)
+    return get_project(row["id"]) if row else None
+
+
+def project_prepared(project_id: str, *, repo_root: str, git_root: str, branch: str,
+                     head_sha: str, template_version: str) -> dict | None:
+    """Проект готов: привязываем фактические пути, ветку и первый коммит."""
+    with _lock:
+        conn = connect()
+        conn.run(_qualify(
+            "update aihub.projects set status = 'ready', repo_root = :rr, git_root = :gr,"
+            " branch = :b, head_sha = :sha, template_version = :tv,"
+            " prepared_at = now(), prepare_error = null, workdir = :w where id = :p"),
+            rr=repo_root, gr=git_root, b=branch, sha=head_sha, tv=template_version,
+            w=repo_root, p=project_id)
+    return get_project(project_id)
+
+
+def project_prepare_failed(project_id: str, error: dict) -> dict | None:
+    """Подготовка не удалась: статус и причина остаются в карточке, папка не удаляется."""
+    with _lock:
+        conn = connect()
+        conn.run(_qualify(
+            "update aihub.projects set status = 'failed', prepare_error = :e::jsonb"
+            " where id = :p"),
+            e=json.dumps(error, ensure_ascii=False), p=project_id)
     return get_project(project_id)
 
 

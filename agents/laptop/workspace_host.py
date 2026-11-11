@@ -33,7 +33,7 @@ import time
 import uuid
 import zipfile
 
-OPS = ["inspect", "snapshot", "list_files", "read_files", "apply_patch",
+OPS = ["init_project", "inspect", "snapshot", "list_files", "read_files", "apply_patch",
        "run_checks", "package"]
 
 MAX_LIST = 200
@@ -302,6 +302,88 @@ def _tool_version(cmd: list[str]) -> str | None:
         return text.splitlines()[0][:120] if text else None
     except (OSError, subprocess.SubprocessError):
         return None
+
+
+INIT_MAX_FILES = 40
+INIT_MAX_BYTES = 512 * 1024
+
+
+def _init_rel(rel: str) -> str:
+    text = str(rel or "").replace("\\", "/").strip()
+    parts = [part for part in text.split("/") if part]
+    if not text or text.startswith("/") or ".." in parts or ":" in parts[0]:
+        raise OpFail("bad_path", f"invalid template path: {rel!r}")
+    return "/".join(parts)
+
+
+def op_init_project(root: str, args: dict) -> dict:
+    """Рабочая папка проекта: шаблон, git init и первый коммит.
+
+    Повтор на готовой папке ничего не перезаписывает: файлы пользователя
+    остаются как есть, второй коммит не создаётся.
+    """
+    template = args.get("template_files") or {}
+    if not isinstance(template, dict) or len(template) > INIT_MAX_FILES:
+        raise OpFail("bad_request", "invalid template file set")
+    branch = str(args.get("branch") or "main").strip()[:100] or "main"
+    author_name = str(args.get("author_name") or "AI Hub").strip()[:100]
+    author_email = str(args.get("author_email") or "aihub@local").strip()[:200]
+    template_version = str(args.get("template_version") or "1")[:40]
+
+    created_dir = not os.path.isdir(root)
+    if created_dir:
+        os.makedirs(root, exist_ok=True)
+
+    written, skipped, total = [], [], 0
+    for rel, content in template.items():
+        if not isinstance(content, str):
+            raise OpFail("bad_request", "template content must be a string")
+        total += len(content.encode("utf-8"))
+        if total > INIT_MAX_BYTES:
+            raise OpFail("bad_request", "template is too large")
+        rel_path = _init_rel(rel)
+        target = os.path.join(root, *rel_path.split("/"))
+        if os.path.exists(target):
+            skipped.append(rel_path)
+            continue
+        parent = os.path.dirname(target)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(target, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(content)
+        written.append(rel_path)
+
+    if not os.path.isdir(os.path.join(root, ".git")):
+        code, out = _git(root, "init", "-q")
+        if code != 0:
+            raise OpFail("git_failed", f"git init failed: {out}")
+        _git(root, "symbolic-ref", "HEAD", f"refs/heads/{branch}")
+
+    code, _ = _git(root, "rev-parse", "--verify", "HEAD")
+    committed = code == 0
+    if not committed:
+        _git(root, "add", "-A")
+        code, out = _git(root, "-c", f"user.name={author_name}",
+                         "-c", f"user.email={author_email}",
+                         "commit", "-q", "-m", "chore: initial commit", "--allow-empty")
+        if code != 0:
+            raise OpFail("git_failed", f"git commit failed: {out}")
+
+    code, head = _git(root, "rev-parse", "HEAD")
+    if code != 0 or not head:
+        raise OpFail("git_failed", "cannot read HEAD after init")
+    code, branch_now = _git(root, "rev-parse", "--abbrev-ref", "HEAD")
+    return {
+        "root": root,
+        "git_root": root,
+        "branch": branch_now if code == 0 and branch_now else branch,
+        "head_sha": head,
+        "template_version": template_version,
+        "created_dir": created_dir,
+        "written": written,
+        "skipped": skipped,
+        "committed": not committed,
+    }
 
 
 def op_inspect(root: str, args: dict) -> dict:
@@ -956,6 +1038,7 @@ def op_package(root: str, args: dict, job_id: str = "") -> dict:
 
 
 HANDLERS = {
+    "init_project": op_init_project,
     "inspect": op_inspect,
     "snapshot": op_snapshot,
     "list_files": op_list_files,

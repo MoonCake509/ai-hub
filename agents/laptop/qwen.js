@@ -210,7 +210,7 @@ async function askStructured(evaluate, expectedModel, prompt) {
     throw new Error(`Qwen Chat model mismatch: expected ${expectedModel || 'a named model'}, selected ${before.model || '(unknown)'}`);
   }
   if (before.draft || before.generating) throw new Error('Qwen Chat is busy or contains an unsent draft');
-  const endMarker = `AIHUB-END-${crypto.randomUUID()}`;
+  const endMarker = `AIHUB-END-${crypto.randomUUID().slice(0, 8)}`;
   const framedPrompt = `${prompt}\n\nAfter the complete answer, close any code fence and put this marker on its own final line: ${endMarker}`;
   const sent = await submit(evaluate, framedPrompt);
   if (!['CLICK', 'ENTER', 'ALREADY_EMPTY'].includes(sent)) throw new Error('Qwen Chat message was not submitted');

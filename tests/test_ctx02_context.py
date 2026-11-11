@@ -1,4 +1,5 @@
 """CTX-02: сборщик контекста — юнит без сети и хоста."""
+import hashlib
 import os
 import sys
 import unittest
@@ -8,12 +9,17 @@ sys.path.insert(0, os.path.dirname(HERE))
 
 from app import context  # noqa: E402
 
+
+def _sha(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 ENTRIES = [
-    {"path": "src/app.py", "size": 400},
-    {"path": "src/util.py", "size": 300},
-    {"path": "src/other.py", "size": 900},
-    {"path": "docs/api.yaml", "size": 8000},
-    {"path": "tests/test_app.py", "size": 200},
+    {"path": "src/app.py", "size": 400, "sha256": _sha("app")},
+    {"path": "src/util.py", "size": 300, "sha256": _sha("util")},
+    {"path": "src/other.py", "size": 900, "sha256": _sha("other")},
+    {"path": "docs/api.yaml", "size": 8000, "sha256": _sha("api")},
+    {"path": "tests/test_app.py", "size": 200, "sha256": _sha("test")},
 ]
 CONTENTS = {"src/app.py": "from . import util\nimport os\n"}
 
@@ -87,6 +93,38 @@ class BuildTest(unittest.TestCase):
         changed[0]["size"] = 401
         third = context.build(changed, CONTENTS, "fix app", "src/app.py", [], 5000)
         self.assertNotEqual(first["digest"], third["digest"])
+
+    def test_same_size_content_change_changes_digest(self):
+        """Аудит P1: x=1 -> x=2 без смены размера меняет digest пакета."""
+        base = [dict(e) for e in ENTRIES]
+        built_before = context.build(base, CONTENTS, "fix", "src/app.py", [], 5000)
+        tampered = [dict(e) for e in base]
+        tampered[1] = dict(tampered[1], sha256=_sha("UTIL-TAMPERED"))
+        built_after = context.build(tampered, CONTENTS, "fix", "src/app.py", [], 5000)
+        self.assertNotEqual(built_before["digest"], built_after["digest"])
+
+    def test_digest_includes_format_version(self):
+        built = context.build(ENTRIES, CONTENTS, "fix", "src/app.py", [], 5000)
+        self.assertEqual(built["format_version"], context.FORMAT_VERSION)
+        self.assertNotEqual(
+            built["digest"],
+            hashlib.sha256(
+                ("|".join(f"{i['path']}|{i['size']}" for i in built["items"]
+                          if i["selected"])).encode("utf-8")).hexdigest())
+
+    def test_selected_file_without_any_hash_is_error(self):
+        """Выбранный файл без sha хоста и без содержимого не идёт в пакет."""
+        entries = [dict(e) for e in ENTRIES]
+        entries[0] = {"path": "src/app.py", "size": 400}  # без sha и без текста
+        with self.assertRaises(context.ContextError) as ctx:
+            context.build(entries, {}, "fix", "src/app.py", [], 5000)
+        self.assertEqual(ctx.exception.code, "no_hash")
+
+    def test_hash_computed_from_contents_when_host_omits_it(self):
+        entries = [dict(e) for e in ENTRIES]
+        entries[0] = {"path": "src/app.py", "size": 400}
+        built = context.build(entries, CONTENTS, "fix", "src/app.py", ["docs/api.yaml"], 5000)
+        self.assertIn("src/app.py", built["selected"])
 
     def test_imports_are_prioritised(self):
         built = context.build(ENTRIES, CONTENTS, "", "src/app.py", [], 200)

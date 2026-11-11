@@ -1502,15 +1502,34 @@ async def run_create(request: Request) -> JSONResponse:
     project_id = payload.get("project_id")
     if not project_id:
         raise HTTPException(status_code=400, detail="project_id is required")
+    goal = payload.get("goal")
+    if goal is not None and not isinstance(goal, str):
+        raise HTTPException(status_code=400, detail="goal must be a string")
+    criteria = payload.get("criteria") or []
+    if not isinstance(criteria, list) or any(not isinstance(c, str) for c in criteria):
+        raise HTTPException(status_code=400, detail="criteria must be a list of strings")
+    request_key = payload.get("request_key")
+    if request_key is not None and (not isinstance(request_key, str) or not request_key.strip()):
+        raise HTTPException(status_code=400, detail="request_key must be a non-empty string")
     project = await asyncio.to_thread(db.get_project, project_id)
     if not project:
         raise HTTPException(status_code=404, detail="project not found")
     try:
-        result = await asyncio.to_thread(runs_ctrl.create_run, project_id,
-                                         payload.get("template") or {}, payload.get("policy") or {})
+        result = await asyncio.to_thread(
+            runs_ctrl.create_run, project_id, payload.get("template") or {},
+            payload.get("policy") or {}, goal=goal or "",
+            criteria=criteria, request_key=(request_key or "").strip() or None,
+            require_ready_host=True)
     except runs_ctrl.RunError as exc:
+        if exc.code == "not_found":
+            raise HTTPException(status_code=404, detail=exc.as_dict()) from None
+        if exc.code in {"idempotency_conflict", "runner_unavailable"}:
+            raise HTTPException(status_code=409, detail=exc.as_dict()) from None
         raise HTTPException(status_code=400, detail=exc.as_dict()) from None
-    return JSONResponse(status_code=202, content=result)
+    # Идентичный повтор с тем же ключом возвращает прежний запуск (200), новый
+    # запрос — 202. Расхождение содержимого под тем же ключом — 409 выше.
+    status = 200 if result.get("existing") else 202
+    return JSONResponse(status_code=status, content=result)
 
 
 @app.get("/runs", dependencies=[Depends(require_token)])

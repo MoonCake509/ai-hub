@@ -72,3 +72,23 @@
 /* CORE-03 reconciliation panel */
 .recon-panel{grid-column:1/-1;min-width:0}.recon-toolbar{display:flex;align-items:end;gap:8px;flex-wrap:wrap}.recon-toolbar label{display:grid;gap:4px;color:var(--muted);font-size:10px}.recon-toolbar select{min-width:140px;font-size:11px;padding:6px 8px}.recon-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:7px}.recon-case{display:grid;gap:6px;width:100%;min-width:0;text-align:left;padding:10px;border:1px solid var(--line);border-radius:8px;background:#151e2a}.recon-case.active{border-color:var(--accent);background:#1c2c37}.recon-case-title,.recon-case-meta{overflow-wrap:anywhere}.recon-case-title{font-size:11px}.recon-case-states{display:flex;flex-wrap:wrap;gap:5px}.recon-decision-accepted_historical{color:#d4b9f1;background:#2a2338}.recon-decision-rejected{color:#efb3b9;background:#3a252c}.recon-decision-unresolved{color:#e5c58d;background:#342d21}.recon-case-meta{font-size:10px;color:var(--faint)}.recon-detail{margin-top:14px;padding:15px;border:1px solid #3d5062;border-radius:9px;background:#141b25}.recon-detail-head{display:flex;justify-content:space-between;align-items:center;gap:10px}.recon-detail-head h3{font-size:14px;overflow-wrap:anywhere}.recon-state-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(165px,1fr));gap:6px;margin:12px 0}.recon-field{min-width:0;display:grid;gap:3px;padding:7px 8px;border-radius:6px;background:#111925;font-size:10px}.recon-label{color:var(--faint)}.recon-value{overflow-wrap:anywhere;white-space:pre-wrap}.recon-evidence h4,.recon-decision h4,.recon-audit h4{font-size:11px;margin:12px 0 7px}.recon-evidence{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:5px}.recon-warning{border:1px solid #64513a;background:#241f18}.recon-decision{display:grid;gap:8px;margin-top:13px;padding:11px;border:1px solid #38485b;border-radius:8px;background:#18212d}.recon-decision h4{margin:0}.recon-decision p{margin:0}.recon-reason-label{display:grid;gap:5px;font-size:10px}.recon-reason-label textarea{width:100%;resize:vertical;min-height:70px}.recon-audit{margin-top:14px}.recon-audit-entry{padding:8px 0;border-top:1px solid var(--line);font-size:10px}.recon-audit-entry p{margin:4px 0 0;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--muted)}.recon-audit-meta{display:block;color:var(--faint);margin-top:2px;overflow-wrap:anywhere}.recon-decision-msg{margin:0}
 @media(max-width:600px){.recon-toolbar{align-items:stretch;display:grid;grid-template-columns:1fr 1fr}.recon-toolbar label select{min-width:0;width:100%}.recon-toolbar button{grid-column:1/-1;justify-self:start}.recon-list{grid-template-columns:1fr}.recon-detail{padding:10px}}
+
+/* FLOW-P1: панель процессов — создание и детали запуска */
+.runs-panel{grid-column:1/-1;min-width:0}
+.run-create{display:grid;gap:9px;max-width:640px;margin:10px 0;padding:12px;border:1px solid var(--line);border-radius:9px;background:#141b25}
+.run-create label{display:grid;gap:4px;color:var(--muted);font-size:10px}
+.run-create input,.run-create textarea{font-size:12px;padding:6px 8px}
+.run-budgets{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;border:1px solid var(--line);border-radius:8px;padding:9px}
+.run-budgets legend{color:var(--muted);font-size:10px;padding:0 5px}
+.run-assignments{display:grid;gap:3px;padding:8px;border:1px dashed var(--line);border-radius:7px;font-size:10px}
+.run-row{cursor:pointer}
+.run-row.active{border-color:var(--accent)}
+.run-goal{font-size:10px;margin:3px 0}
+.run-detail{margin-top:14px;padding:14px;border:1px solid #3d5062;border-radius:9px;background:#141b25;display:grid;gap:9px}
+.run-steps{width:100%;border-collapse:collapse;font-size:11px}
+.run-steps th,.run-steps td{padding:5px 7px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+.run-steps th{color:var(--faint);font-size:10px}
+.run-error{color:#efb3b9;font-size:10px;white-space:pre-wrap}
+.run-result-output{max-height:280px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;background:#111925;border-radius:7px;padding:10px;font-size:10px;margin:7px 0}
+.run-receipt{display:grid;gap:3px;padding:9px;border:1px solid #2c5744;border-radius:7px;background:#14231c;font-size:10px}
+.run-events{display:grid;gap:2px;max-height:220px;overflow:auto;font-size:10px;padding:8px;border:1px solid var(--line);border-radius:7px;background:#111925}

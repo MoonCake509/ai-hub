@@ -94,7 +94,9 @@ async function api(path, opts = {}) {
   try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
   if (!resp.ok) {
     const detail = data && (data.detail || data.error) ? (data.detail || data.error) : resp.status;
-    throw new Error(typeof detail === 'string' ? detail : JSON.stringify(detail));
+    const error = new Error(typeof detail === 'string' ? detail : JSON.stringify(detail));
+    error.detail = detail;
+    throw error;
   }
   return data;
 }
@@ -445,10 +447,32 @@ async function loadAgentProfiles(agentId) {
   }
 }
 
-// FLOW-04: запуски процесса — состояние читается из базы, браузер ничего не держит.
+// FLOW-P1: запуски процесса — состояние читается из базы, браузер ничего не держит.
+// Создание процесса с целью/критериями/назначениями/бюджетом и экран запуска:
+// шаги, причины ожидания/ошибок, назначение, пакет, receipt проверок, решения,
+// итог. После reload всё восстанавливается из БД (список + #run=<id> в адресе).
 const RUN_STATE_RU = {active:'идёт', paused:'пауза', cancelled:'отменён', done:'завершён', failed:'ошибка'};
 const TASK_STATE_RU = {pending:'ожидает', dispatched:'выдан', running:'в работе', done:'готово',
-  failed:'ошибка', skipped:'пропущен', cancelled:'отменён'};
+  failed:'ошибка', skipped:'пропущен', cancelled:'отменён', blocked:'заблокирован',
+  waiting_context:'ждёт контекста'};
+const RUN_EVENT_RU = {run_created:'процесс создан', task_dispatched:'шаг выдан', task_done:'шаг готов',
+  task_failed:'ошибка шага', task_blocked:'шаг заблокирован', task_cancelled:'шаг отменён',
+  task_waiting_context:'собирается контекст', task_waiting_input:'шаг ждёт вход',
+  task_requeued:'возврат к кодеру', task_retry:'повтор', duplicate_result:'повтор результата проигнорирован',
+  result_after_cancel:'результат после отмены', candidate_snapshot_started:'снимок кандидата',
+  candidate_ready:'кандидат зафиксирован', checks_started:'проверки запущены',
+  checks_done:'проверки завершены', checks_unavailable:'проверки недоступны',
+  pipeline_failed:'сбой конвейера', run_done:'процесс завершён', run_failed:'процесс упал',
+  run_cancel:'процесс отменён', run_pause:'пауза', run_resume:'продолжение',
+  budget_exceeded:'бюджет исчерпан', run_created_existing:'повтор создания (тот же процесс)'};
+let currentRunId = '';
+let runDetailRequest = 0;
+let runCreatePending = false;
+try { const match = String(window.location.hash || '').match(/run=([0-9a-f]+)/); if (match) currentRunId = match[1]; } catch (e) { /* тесты без window */ }
+
+function runHashSet(runId) {
+  try { window.history.replaceState(null, '', runId ? '#run=' + runId : window.location.pathname); } catch (e) { /* тесты */ }
+}
 
 async function loadRuns() {
   const box = $('#runs-list');
@@ -460,13 +484,16 @@ async function loadRuns() {
     status.textContent = items.length ? 'Запусков: ' + items.length : 'Запусков пока нет';
     box.replaceChildren();
     for (const run of items) {
-      const row = el('article', 'run-row');
+      const row = el('article', 'run-row' + (run.id === currentRunId ? ' active' : ''));
       const head = el('div', 'run-head');
-      head.append(el('strong', '', (run.template_id || 'запуск') + ' · ' + run.id.slice(0, 8)));
+      const title = el('strong', '', (run.template_id || 'запуск') + ' · ' + run.id.slice(0, 8));
+      if (run.goal) title.title = run.goal;
+      head.append(title);
       head.append(el('span', 'badge run-' + run.state, RUN_STATE_RU[run.state] || run.state));
       head.append(el('span', 'muted', (run.done || 0) + ' из ' + (run.total || 0) +
         (run.current ? ' · сейчас: ' + run.current : '')));
       row.append(head);
+      if (run.goal) row.append(el('div', 'muted run-goal', run.goal.slice(0, 140)));
       const bar = el('div', 'run-bar');
       const fill = el('span', 'run-bar-fill');
       fill.style.width = Math.round(100 * (run.done || 0) / Math.max(1, run.total || 0)) + '%';
@@ -476,23 +503,304 @@ async function loadRuns() {
       const act = (label, action) => {
         const button = el('button', 'ghost small', label);
         button.type = 'button';
-        button.onclick = async () => {
+        button.onclick = async (event) => {
+          event.stopPropagation();
           button.disabled = true;
-          try { await api('/runs/' + run.id + '/' + action, {method: 'POST'}); await loadRuns(); }
+          try { await api('/runs/' + run.id + '/' + action, {method: 'POST'}); await loadRuns(); await renderRunDetail(); }
           catch (error) { status.textContent = 'Не удалось: ' + error.message; }
           finally { button.disabled = false; }
         };
         return button;
       };
+      const detail = el('button', 'ghost small', 'Подробнее');
+      detail.type = 'button';
+      detail.onclick = (event) => { event.stopPropagation(); openRunDetail(run.id); };
+      actions.append(detail);
       if (run.state === 'active') { actions.append(act('Выполнить шаг', 'dispatch'), act('Пауза', 'pause')); }
       if (run.state === 'paused') actions.append(act('Продолжить', 'resume'));
       if (run.state === 'active' || run.state === 'paused') actions.append(act('Отменить', 'cancel'));
       row.append(actions);
+      row.onclick = () => openRunDetail(run.id);
       box.append(row);
     }
   } catch (error) {
     status.textContent = 'Не удалось загрузить запуски: ' + error.message;
   }
+  if (currentRunId) await renderRunDetail();
+}
+
+async function openRunDetail(runId) {
+  currentRunId = runId;
+  runHashSet(runId);
+  await renderRunDetail();
+  await loadRuns();
+}
+
+function runCloseDetail() {
+  currentRunId = '';
+  runDetailRequest++;
+  runHashSet('');
+  const box = $('#run-detail');
+  if (box) { box.hidden = true; box.replaceChildren(); }
+  loadRuns();
+}
+
+async function renderRunDetail() {
+  const box = $('#run-detail');
+  if (!box) return;
+  const runId = currentRunId;
+  const request = ++runDetailRequest;
+  if (!runId) { box.hidden = true; return; }
+  let run;
+  try {
+    run = await api('/runs/' + runId);
+  } catch (error) {
+    if (request !== runDetailRequest || currentRunId !== runId) return;
+    box.hidden = false;
+    box.replaceChildren(el('p', 'hint', 'Не удалось загрузить запуск: ' + error.message));
+    return;
+  }
+  if (request !== runDetailRequest || currentRunId !== runId) return;
+  box.hidden = false;
+  box.replaceChildren();
+  const head = el('div', 'run-head');
+  head.append(el('strong', '', 'Запуск ' + run.id.slice(0, 8)));
+  head.append(el('span', 'badge run-' + run.state, RUN_STATE_RU[run.state] || run.state));
+  const close = el('button', 'ghost small', 'Закрыть');
+  close.type = 'button';
+  close.onclick = runCloseDetail;
+  head.append(close);
+  box.append(head);
+  if (run.goal) box.append(el('p', 'run-goal', 'Цель: ' + run.goal));
+  if (run.criteria && run.criteria.length) box.append(el('p', 'muted', 'Критерии: ' + run.criteria.join('; ')));
+  const budgets = run.budgets || {}, used = run.budget_used || {};
+  if (Object.keys(budgets).length) {
+    const parts = [];
+    if (budgets.max_dispatches) parts.push('шаги ' + (used.dispatches || 0) + '/' + budgets.max_dispatches);
+    if (budgets.max_job_calls) parts.push('вызовы ' + (used.job_calls || 0) + '/' + budgets.max_job_calls);
+    if (budgets.max_seconds) parts.push('время до ' + budgets.max_seconds + 'с');
+    box.append(el('p', 'muted', 'Бюджет: ' + parts.join(' · ')));
+  }
+  if (run.candidate_digest) box.append(el('p', 'muted', 'Кандидат: ' + run.candidate_digest.slice(0, 24) + '…'));
+  const receipt = run.check_receipt || null;
+  if (receipt && receipt.checks) {
+    const receiptBox = el('div', 'run-receipt');
+    receiptBox.append(el('strong', '', 'Receipt проверок: ' +
+      (receipt.ok ? 'пройдены' : 'есть падения') + ' (' + receipt.checks.length + ')'));
+    for (const check of receipt.checks.slice(0, 10)) {
+      receiptBox.append(el('div', 'muted', (check.passed ? '✓ ' : '✗ ') + check.name +
+        ' — exit ' + check.exit_code));
+    }
+    box.append(receiptBox);
+  }
+  // Шаги: состояние, ошибка/причина ожидания, назначение, пакет, результат.
+  const table = el('table', 'run-steps');
+  table.append(el('thead'));
+  const headerRow = el('tr');
+  for (const label of ['Шаг', 'Роль', 'Состояние', 'Назначение', 'Пакет', 'Ошибка / причина']) {
+    headerRow.append(el('th', '', label));
+  }
+  table.children[0].append(headerRow);
+  const body = el('tbody');
+  for (const task of run.tasks || []) {
+    const row = el('tr');
+    row.append(el('td', '', task.key));
+    row.append(el('td', '', task.role || '—'));
+    const stateCell = el('td');
+    stateCell.append(el('span', 'badge task-' + task.state, TASK_STATE_RU[task.state] || task.state));
+    if (task.attempt) stateCell.append(el('span', 'muted', ' попытка ' + task.attempt));
+    row.append(stateCell);
+    const assignment = task.assignment || {};
+    row.append(el('td', '', (assignment.agent_id || task.agent || '—') +
+      (assignment.model ? ' · ' + assignment.model : '')));
+    row.append(el('td', '', task.context_id ? task.context_id.slice(0, 8) +
+      (task.packet_revision ? '@р' + task.packet_revision : '') : '—'));
+    row.append(el('td', 'run-error', task.error || ''));
+    body.append(row);
+    if (task.result && Object.keys(task.result).length) {
+      const resultRow = el('tr', 'run-result-row');
+      const cell = el('td');
+      cell.colSpan = 6;
+      const resultDetails = el('details', 'run-result-details');
+      resultDetails.append(el('summary', '', 'Результат'),
+        el('pre', 'run-result-output', JSON.stringify(task.result, null, 2)));
+      cell.append(resultDetails);
+      resultRow.append(cell);
+      body.append(resultRow);
+    }
+  }
+  table.append(body);
+  box.append(table);
+  // Журнал решений и событий — последние 30.
+  const eventsBox = el('div', 'run-events');
+  eventsBox.append(el('strong', '', 'Журнал событий'));
+  for (const event of (run.events || []).slice(-30)) {
+    const label = RUN_EVENT_RU[event.event] || event.event;
+    const detail = event.payload && (event.payload.reason || event.payload.error);
+    const at = event.created_at ? event.created_at.slice(11, 19) : '';
+    eventsBox.append(el('div', 'muted', at + ' ' + label + (detail ? ' — ' + String(detail).slice(0, 160) : '')));
+  }
+  box.append(eventsBox);
+  // Итоговое состояние: почему процесс ждёт или упал.
+  if (run.state === 'failed' || run.state === 'cancelled') {
+    const last = (run.events || []).filter(e => e.event === 'run_failed' || e.event === 'run_cancel').pop();
+    if (last && last.payload && last.payload.reason) {
+      box.append(el('p', 'run-error', 'Причина: ' + last.payload.reason));
+    }
+  }
+  if (run.cancel_info && (run.cancel_info.stop_requested || []).length) {
+    box.append(el('p', 'muted', 'Остановка исполнителя не подтверждена для ' +
+      run.cancel_info.stop_requested.length + ' заданий'));
+  }
+  const actions = el('div', 'row');
+  const act = (label, action) => {
+    const button = el('button', 'ghost small', label);
+    button.type = 'button';
+    button.onclick = async () => {
+      button.disabled = true;
+      try { await api('/runs/' + run.id + '/' + action, {method: 'POST'}); await renderRunDetail(); await loadRuns(); }
+      catch (error) { box.append(el('p', 'run-error', 'Не удалось: ' + error.message)); }
+      finally { button.disabled = false; }
+    };
+    return button;
+  };
+  if (run.state === 'active') { actions.append(act('Выполнить шаг', 'dispatch'), act('Пауза', 'pause')); }
+  if (run.state === 'paused') actions.append(act('Продолжить', 'resume'));
+  if (run.state === 'active' || run.state === 'paused') actions.append(act('Отменить', 'cancel'));
+  if (actions.children.length) box.append(actions);
+}
+
+// Создание процесса: цель, критерии, назначения (снимок карточек ролей), бюджет,
+// предконтроль доступности агентов и наличия утверждённых проверок проекта.
+async function runCurrentProject() {
+  const saved = storeGet('aihub.project');
+  if (saved) return saved;
+  try {
+    const data = await api('/projects');
+    const first = (data.projects || [])[0];
+    return first ? first.id : '';
+  } catch (e) { return ''; }
+}
+
+async function runPreflight() {
+  const hint = $('#flow-preflight');
+  const projectId = await runCurrentProject();
+  if (!projectId) { hint.textContent = 'Сначала создайте проект во вкладке «Рабочее пространство».'; return ''; }
+  try {
+    const project = await api('/projects/' + projectId);
+    const settings = project.settings || {};
+    const checks = settings.checks && typeof settings.checks === 'object' ? Object.keys(settings.checks) : [];
+    const lines = ['Проект: ' + (project.name || projectId.slice(0, 8)) +
+      (project.workdir ? ' · ' + project.workdir : '')];
+    lines.push('Утверждённые проверки проекта: ' + (checks.length ? checks.join(', ') :
+      'нет — шаг тестирования будет ждать проверок и не пройдёт'));
+    const agentsData = await api('/agents');
+    const registry = new Map((agentsData.agents || []).map(a => [a.id, a]));
+    const cards = project.roles || [];
+    const box = $('#flow-assignments');
+    box.replaceChildren();
+    box.append(el('strong', '', 'Назначения (снимок на момент создания)'));
+    for (const role of ['planner', 'coder', 'tester', 'reviewer', 'archivist']) {
+      const card = cards.find(c => c.role_id === role) || {};
+      const agentId = card.agent_id || 'codex';
+      const known = registry.has(agentId);
+      const line = el('div', 'muted', role + ' → ' + agentId +
+        (card.model ? ' · ' + card.model : '') + (known ? '' : ' (нет в реестре — шаг будет ждать)'));
+      box.append(line);
+      if (!known) lines.push('Агент «' + agentId + '» для роли ' + role + ' не зарегистрирован');
+    }
+    hint.textContent = lines.join('. ');
+    return projectId;
+  } catch (error) {
+    hint.textContent = 'Предконтроль не завершился: ' + error.message;
+    return projectId;
+  }
+}
+
+async function runShowCreate() {
+  const form = $('#flow-create');
+  if (!form) return;
+  form.hidden = false;
+  await runPreflight();
+  const goal = $('#flow-goal');
+  if (goal) goal.focus();
+}
+
+async function runSubmitCreate(event) {
+  event.preventDefault();
+  const status = $('#flow-preflight');
+  const submit = $('#flow-submit');
+  if (runCreatePending) return;
+  runCreatePending = true;
+  submit.disabled = true;
+  submit.textContent = 'Создаю…';
+  try {
+    const projectId = await runCurrentProject();
+    if (!projectId) { status.textContent = 'Нет проекта: создайте его во вкладке «Рабочее пространство».'; return; }
+    const goal = $('#flow-goal').value.trim();
+    if (!goal) { status.textContent = 'Укажите цель процесса.'; $('#flow-goal').focus(); return; }
+    const parseBudget = (id, label, min) => {
+      const raw = $(id).value.trim();
+      if (!raw) return {ok: true, value: null};
+      const value = Number(raw);
+      if (!Number.isSafeInteger(value) || value < min) {
+        status.textContent = label + ': введите целое число не меньше ' + min + '.';
+        $(id).focus();
+        return {ok: false, value: null};
+      }
+      return {ok: true, value};
+    };
+    const rawCycles = $('#flow-max-cycles').value.trim();
+    const cycles = rawCycles === '' ? 0 : Number(rawCycles);
+    if (!Number.isSafeInteger(cycles) || cycles < 0) {
+      status.textContent = 'Циклы исправлений: введите целое число не меньше 0.';
+      $('#flow-max-cycles').focus();
+      return;
+    }
+    const policy = {max_cycles: cycles, budgets: {}};
+    for (const [id, key, label] of [['#flow-max-dispatches', 'max_dispatches', 'Максимум шагов'],
+                                    ['#flow-max-calls', 'max_job_calls', 'Максимум вызовов'],
+                                    ['#flow-max-seconds', 'max_seconds', 'Лимит времени']]) {
+      const parsed = parseBudget(id, label, 1);
+      if (!parsed.ok) return;
+      if (parsed.value !== null) policy.budgets[key] = parsed.value;
+    }
+    const body = {
+      project_id: projectId,
+      template_id: 'five-roles',
+      goal,
+      criteria: $('#flow-criteria').value.split(';').map(s => s.trim()).filter(Boolean),
+      entry: $('#flow-entry').value.trim(),
+      contracts: $('#flow-contracts').value.split(',').map(s => s.trim()).filter(Boolean),
+      policy,
+      request_key: newKey(),
+    };
+    status.textContent = 'Создаю процесс…';
+    const created = await api('/runs', {method: 'POST', body: JSON.stringify(body), timeout: 30000});
+    $('#flow-create').hidden = true;
+    $('#flow-create').reset ? $('#flow-create').reset() : null;
+    status.textContent = '';
+    await openRunDetail(created.run_id);
+  } catch (error) {
+    status.textContent = error.detail?.code === 'idempotency_conflict' || error.message === '409'
+      ? 'Конфликт: такой ключ создания уже занят другим содержимым (409).'
+      : 'Не удалось создать процесс: ' + (error.detail?.message || error.message);
+  } finally {
+    runCreatePending = false;
+    submit.disabled = false;
+    submit.textContent = 'Создать процесс';
+  }
+}
+
+function runsWire() {
+  const refresh = $('#runs-refresh');
+  if (refresh) refresh.onclick = () => { loadRuns(); if (currentRunId) renderRunDetail(); };
+  const create = $('#runs-new');
+  if (create) create.onclick = () => runShowCreate();
+  const cancel = $('#flow-create-cancel');
+  if (cancel) cancel.onclick = () => { $('#flow-create').hidden = true; };
+  const form = $('#flow-create');
+  if (form) form.onsubmit = runSubmitCreate;
 }
 
 // ADAPTER-01: возможности канала под селектором модели. Выключенное — с причиной.
@@ -1107,19 +1415,19 @@ function wsStartPolling(){clearInterval(WS.pollTimer);WS.pollTimer=setInterval((
 function wsProjectDialog(create=false){WS.newProject=create;$('#project-dialog-title').textContent=create?'Новый проект':'Настройки проекта';$('#project-name').value=create?'':WS.project?.name||'';$('#project-host').value=create?'laptop':WS.project?.host_id||'laptop';$('#project-workdir').value=create?'':WS.project?.workdir||'';$('#project-dialog-error').textContent='';$('#project-dialog').showModal();$('#project-name').focus()}
 async function wsSaveProject(event){event.preventDefault();if(WS.projectSaving)return;const payload={name:$('#project-name').value.trim(),host_id:$('#project-host').value,workdir:$('#project-workdir').value.trim()};if(!payload.name)return;const button=$('#project-settings-form').querySelector('button[type=submit]'),originalText=button.textContent;WS.projectSaving=true;button.disabled=true;button.textContent='Сохраняю…';try{const project=await api(WS.newProject?'/projects':'/projects/'+WS.project.id,{method:WS.newProject?'POST':'PATCH',body:JSON.stringify(payload)});storeSet('aihub.project',project.id);$('#project-dialog').close();WS.conv=null;await wsRefreshAll();toast('Проект сохранён')}catch(error){$('#project-dialog-error').textContent=error.message}finally{WS.projectSaving=false;button.disabled=false;button.textContent=originalText}}
 function wsWire(){
+ runsWire();
  document.querySelectorAll('.tab').forEach(tab=>tab.addEventListener('click',()=>switchView(tab.dataset.view)));
  $('#workspace-retry').onclick=action(wsRefreshAll);$('#conv-new').onclick=action(wsNewConversation);$('#project-new').onclick=()=>wsProjectDialog(true);$('#project-settings').onclick=()=>wsProjectDialog(!WS.project);$('#project-dialog-close').onclick=()=>$('#project-dialog').close();$('#project-settings-form').onsubmit=wsSaveProject;
  $('#role-agent').onchange=action(async()=>{const roleId=WS.roleId,agentId=$('#role-agent').value;setDraftDirty();await wsPopulateRoleProfiles(agentId,'','');if(WS.roleId===roleId&&$('#role-agent').value===agentId)setDraftDirty()});$('#role-profile').onchange=action(async()=>{const roleId=WS.roleId,agentId=$('#role-agent').value,profileId=$('#role-profile').value;const data=await wsGetProfiles(agentId);if(WS.roleId!==roleId||$('#role-agent').value!==agentId||$('#role-profile').value!==profileId)return;wsPopulateRoleModels(data,profileId,'');$('#role-capability').textContent=wsUpdateRoleCapability(agentId,profileId,$('#role-model').value);setDraftDirty()});$('#role-model').onchange=()=>{$('#role-capability').textContent=wsUpdateRoleCapability($('#role-agent').value,$('#role-profile').value,$('#role-model').value);setDraftDirty()};$('#role-instructions').oninput=setDraftDirty;$('#role-save').onclick=action(async()=>{await wsSaveRole();toast('Настройки роли сохранены')});$('#chat-target').onchange=action(()=>wsEditRole($('#chat-target').value));
  $('#att-file').onchange=action(async event=>{const files=Array.from(event.target.files||[]);try{await wsUpload(files)}finally{event.target.value=''}});
- const filterBox=$('#att-filter');if(filterBox)filterBox.oninput=event=>{WS.attFilter=event.target.value||'';wsRenderAttachments()};
- const clearButton=$('#att-clear');if(clearButton)clearButton.onclick=()=>{WS.selectedAtts.clear();wsRenderAttachments()};
+ const filterBox=$('#att-filter');if(filterBox)filterBox.oninput=event=>{WS.attFilter=event.target.value||'';wsRenderAttachments()}; const clearButton=$('#att-clear');if(clearButton)clearButton.onclick=()=>{WS.selectedAtts.clear();wsRenderAttachments()};
  const convFilter=$('#conv-filter');if(convFilter)convFilter.oninput=event=>{WS.convFilter=event.target.value||'';WS.convSeq++;WS.convCursor='';WS.convHasMore=false;WS.convLoading=true;WS.convs=[];delete WS.convSignature;wsRenderConversations();clearTimeout(WS.convFilterTimer);WS.convFilterTimer=setTimeout(()=>{wsLoadConversations({reset:true}).catch(workspaceError)},260)};const convMore=$('#conv-more');if(convMore)convMore.onclick=()=>wsLoadMoreConversations().catch(workspaceError);
  $('#chat-form').onsubmit=async event=>{event.preventDefault();const input=$('#chat-input'),draft=input.value,text=draft.trim(),submittedProjectId=WS.project?.id,submittedConversationId=WS.conv?.id;if(!text||WS.sending)return;WS.sending=true;wsUpdateRecipient();$('#chat-msg').className='msg';$('#chat-msg').textContent='Передаю задачу…';try{const response=await wsSend(text),stillInSubmittedChat=WS.project?.id===submittedProjectId&&(!submittedConversationId||WS.conv?.id===submittedConversationId);if(stillInSubmittedChat&&input.value===draft)input.value='';if(stillInSubmittedChat){const warnings=response?.context_warnings||[];if(warnings.length){$('#chat-msg').className='msg warn-text';$('#chat-msg').textContent='Задача принята. Контекст: '+warnings.join(' ')}else{$('#chat-msg').className='msg ok';$('#chat-msg').textContent='Задача принята. Ответ появится в этом чате.'}}}catch(error){if(WS.project?.id===submittedProjectId&&(!submittedConversationId||WS.conv?.id===submittedConversationId)){$('#chat-msg').className='msg error';$('#chat-msg').textContent=error.message;workspaceError(error)}}finally{WS.sending=false;wsUpdateRecipient()}};
  $('#chat-input').onkeydown=event=>{if(event.key==='Enter'&&(event.ctrlKey||event.metaKey)){event.preventDefault();$('#chat-form').requestSubmit()}};$('#token-form').onsubmit=event=>{event.preventDefault();saveToken().catch(workspaceError)};
 }
 
 function stopPolling(){pollTimers.forEach(clearInterval);pollTimers=[];clearInterval(WS.pollTimer)}
-function startPolling(){pollTimers.forEach(clearInterval);pollTimers=[setInterval(()=>health(),15000),setInterval(()=>{if(token&&!document.hidden&&WS.view==='ops')loadJobs()},5000),setInterval(()=>{if(token&&!document.hidden&&WS.view==='ops')loadAgents().catch(error=>{if(error.message!=='unauthorized')$('#health-text').textContent='ошибка наблюдений: '+error.message})},30000)];wsStartPolling()}
+function startPolling(){pollTimers.forEach(clearInterval);pollTimers=[setInterval(()=>health(),15000),setInterval(()=>{if(token&&!document.hidden&&WS.view==='ops')loadJobs()},5000),setInterval(()=>{if(token&&!document.hidden&&WS.view==='ops'){loadRuns();if(currentRunId)renderRunDetail()}},5000),setInterval(()=>{if(token&&!document.hidden&&WS.view==='ops')loadAgents().catch(error=>{if(error.message!=='unauthorized')$('#health-text').textContent='ошибка наблюдений: '+error.message})},30000)];wsStartPolling()}
 
 async function boot(){
  await loadAgents();await Promise.allSettled([health(),loadJobs()]);

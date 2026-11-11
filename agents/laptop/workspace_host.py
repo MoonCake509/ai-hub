@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import errno
 import fnmatch
 import hashlib
 import json
@@ -45,10 +46,73 @@ MAX_SNAPSHOT_FILES = 20000
 MAX_SNAPSHOT_BYTES = 200 * 1024 * 1024
 MAX_FILE_HASH = 512 * 1024
 
-DENY_DIRS = {".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv",
-             "outbox", "models", ".ssh", "appdata"}
-DENY_SUFFIX = (".pem", ".key", ".pfx", ".p12", ".dump", ".bak", ".kdbx")
-DENY_NAMES = {"token.txt", "credentials", ".netrc", "id_rsa", "id_ed25519"}
+
+def _load_canonical_policy() -> dict:
+    """Единый источник deny-политики — hub/app/security_policy.py репозитория.
+
+    Модуль грузится по пути, без импорта пакета hub: host worker исполняется
+    на устройстве отдельно от хаба, но обязан отклонять те же пути. Встроенная
+    копия — только аварийный fallback: расхождение с каноном поднимает ошибку,
+    а не молча продолжает работу с другой политикой.
+    """
+    fallback = {
+        "DENY_DIRS": {".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv",
+                      "venv", "dist", "build", ".next", ".idea", ".mypy_cache",
+                      ".pytest_cache", "target", "vendor", "outbox", "models",
+                      ".ssh", "appdata"},
+        "SECRET_SUFFIXES": (".pem", ".key", ".pfx", ".p12", ".dump", ".bak", ".kdbx"),
+        "SECRET_NAMES": {"token.txt", "credentials", ".netrc", "id_rsa",
+                         "id_ed25519", "auth.json"},
+        "SECRET_PATTERNS": (
+            ".env", ".env.*", "*.pem", "*.key", "*.pfx", "*.p12",
+            "id_rsa*", "id_ed25519*", "*credentials*", "*secret*",
+            ".npmrc", ".pypirc", ".netrc", ".git-credentials",
+            "*.kdbx", "*.ovpn", "auth.json", "cookies*.txt",
+        ),
+    }
+    import importlib.util
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidate = os.path.abspath(os.path.join(here, "..", "..", "hub", "app",
+                                             "security_policy.py"))
+    if os.path.isfile(candidate):
+        try:
+            spec = importlib.util.spec_from_file_location("aihub_security_policy",
+                                                          candidate)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return {
+                "DENY_DIRS": set(module.DENY_DIRS),
+                "SECRET_SUFFIXES": tuple(module.SECRET_SUFFIXES),
+                "SECRET_NAMES": set(module.SECRET_NAMES),
+                "policy_digest": module.policy_digest(),
+                "denied_reason": module.denied_reason,
+            }
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"каноническая deny-политика не загрузилась: {exc}") from None
+    # Файл политики недоступен (автономная копия воркера): работаем на встроенной
+    # копии. Паритет с сервером гарантируют юнит-тесты репозитория, поэтому
+    # расхождение здесь — сигнал обновить копию воркера, а не молчать.
+    import sys
+    print("WARNING: aihub security_policy.py не найден, host worker использует "
+          "встроенную копию политики; обновите копию репозитория", file=sys.stderr)
+    return {"DENY_DIRS": set(fallback["DENY_DIRS"]),
+            "SECRET_SUFFIXES": tuple(fallback["SECRET_SUFFIXES"]),
+            "SECRET_NAMES": set(fallback["SECRET_NAMES"]),
+            "SECRET_PATTERNS": tuple(fallback["SECRET_PATTERNS"]),
+            "policy_digest": {
+                "deny_dirs": sorted(fallback["DENY_DIRS"]),
+                "secret_names": sorted(fallback["SECRET_NAMES"]),
+                "secret_suffixes": sorted(fallback["SECRET_SUFFIXES"]),
+                "secret_patterns": sorted(fallback["SECRET_PATTERNS"]),
+            },
+            "denied_reason": None}
+
+
+
+_POLICY = _load_canonical_policy()
+DENY_DIRS = _POLICY["DENY_DIRS"]
+DENY_SUFFIX = _POLICY["SECRET_SUFFIXES"]
+DENY_NAMES = _POLICY["SECRET_NAMES"]
 
 
 class OpFail(Exception):
@@ -98,6 +162,11 @@ def _rel(root: str, path: str) -> str:
 
 
 def denied(rel: str) -> str | None:
+    """Отказ по deny-политике. Канонический источник — security_policy хаба;
+    без доступа к файлу политики — встроенная копия (паритет ловят тесты)."""
+    canonical = _POLICY.get("denied_reason")
+    if canonical is not None:
+        return canonical(rel)
     parts = [p.lower() for p in re.split(r"[\\/]+", rel or "") if p]
     if not parts:
         return "пустой путь"
@@ -111,6 +180,12 @@ def denied(rel: str) -> str | None:
         return "секрет"
     if name.endswith(DENY_SUFFIX):
         return "секрет/дамп"
+    low_rel = (rel or "").lower()
+    for pattern in _POLICY.get("SECRET_PATTERNS", ()):
+        if fnmatch.fnmatch(name, pattern.lower()):
+            return "секрет (политика путей)"
+        if "*" in pattern and fnmatch.fnmatch(low_rel, pattern.lower()):
+            return "секрет (политика путей)"
     return None
 
 
@@ -259,6 +334,7 @@ def op_inspect(root: str, args: dict) -> dict:
             "node": _tool_version(["node", "--version"]),
         },
         "policy": {"deny_dirs": sorted(DENY_DIRS), "deny_suffix": list(DENY_SUFFIX)},
+        "security_policy": (_POLICY.get("policy_digest") or {"deny_dirs": sorted(DENY_DIRS)}),
         "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
 
@@ -431,8 +507,18 @@ def _writer_lock(root: str, timeout: float = 90):
                     time.sleep(0.1)
         else:
             import fcntl
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
-            acquired = True
+            deadline = time.monotonic() + max(0.0, timeout)
+            while True:
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                    break
+                except OSError as exc:
+                    if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                        raise
+                    if time.monotonic() >= deadline:
+                        raise OpFail("writer_busy", "another workspace writer holds this checkout")
+                    time.sleep(min(0.1, max(0.01, deadline - time.monotonic())))
         yield
     finally:
         if acquired:
@@ -730,6 +816,7 @@ def op_run_checks(root: str, args: dict) -> dict:
         raise OpFail("runner_unavailable", "isolated runner is not configured")
     results = []
     ok = True
+    verified_isolation: dict | None = None
     for item in plan:
         name = item.get("name")
         cmd = item.get("cmd") or []
@@ -780,6 +867,7 @@ def op_run_checks(root: str, args: dict) -> dict:
             after = tree_digest(workdir)
             if after != before:
                 raise OpFail("snapshot_changed", "isolated runner modified read-only snapshot")
+            verified_isolation = dict(isolation)
         except subprocess.TimeoutExpired:
             code, out, err = -1, "", f"isolated runner timeout after {timeout}s"
         except (ValueError, KeyError, TypeError, OSError) as exc:
@@ -789,8 +877,13 @@ def op_run_checks(root: str, args: dict) -> dict:
         results.append({"name": name, "cmd": cmd, "exit_code": code, "passed": passed,
                         "elapsed_s": round(time.time() - started, 2),
                         "stdout_tail": out[-4000:], "stderr_tail": err[-2000:]})
-    return {"snapshot_id": snap_id, "workdir": workdir, "ok": ok, "checks": results,
-            "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    receipt = {"snapshot_id": snap_id, "workdir": workdir, "ok": ok, "checks": results,
+               "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    # Изоляция, подтверждённая сверкой ответа runner'а: хаб принимает receipt
+    # только с этим блоком (flow_gates.validate_check_receipt).
+    if verified_isolation is not None:
+        receipt["isolation"] = verified_isolation
+    return receipt
 
 
 def isolated_runner_argv() -> list[str] | None:

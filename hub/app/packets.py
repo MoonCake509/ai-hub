@@ -6,33 +6,37 @@
 list_files), а не из предположений хаба.
 
 Инварианты:
-  * секретные пути и чужие каталоги не попадают в пакет никогда;
-  * одинаковый набор файлов даёт одинаковый digest;
-  * изменение файла после сборки обнаруживается сверкой и даёт конфликт,
-    а не тихую подмену входа.
+  * секретные пути и чужие каталоги не попадают в пакет никогда (политика —
+    единый модуль security_policy, тот же источник у host worker);
+  * digest включает SHA-256 каждого фактически передаваемого файла и версию
+    формата: изменение содержимого без смены размера меняет digest;
+  * каждая ревизия неизменяема: смена содержимого после preview даёт новую
+    ревизию со статусом conflict, история ревизий хранится отдельно;
+  * materialized ставится только после сверки manifest и content hash каждого
+    выбранного файла конкретной ревизии — не раньше.
 """
 from __future__ import annotations
 
 import fnmatch
+import base64
 import hashlib
 import json
 import os
 import uuid
 
-from . import context, db
+from . import context, db, security_policy
 
 LIST_PAGE = 200
 
 STATES = ("probing", "sealed", "materializing", "materialized", "conflict", "failed")
 
-# Пути, которые не покидают хост ни при каких условиях.
-SECRET_PATTERNS = (
-    ".env", ".env.*", "*.pem", "*.key", "*.pfx", "*.p12", "id_rsa*", "id_ed25519*",
-    "*credentials*", "*secret*", ".npmrc", ".pypirc", ".netrc", ".git-credentials",
-    "*.kdbx", "*.ovpn", "auth.json", "cookies*.txt",
-)
-SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build",
-             ".next", ".idea", ".mypy_cache", ".pytest_cache", "target", "vendor"}
+# Версия формата digest пакета. Смена контракта инвалидирует старые digest.
+PACKET_FORMAT_VERSION = 2
+
+# Пути, которые не покидают хост ни при каких условиях — единая политика
+# с host worker (agents/laptop/workspace_host.py), см. security_policy.
+SECRET_PATTERNS = security_policy.SECRET_PATTERNS
+SKIP_DIRS = security_policy.DENY_DIRS
 
 
 class PacketError(ValueError):
@@ -60,17 +64,11 @@ def normalize_path(path: str) -> str:
 
 
 def is_secret(rel: str) -> bool:
-    name = rel.rsplit("/", 1)[-1]
-    for pattern in SECRET_PATTERNS:
-        if fnmatch.fnmatch(name.lower(), pattern.lower()):
-            return True
-        if "*" in pattern and fnmatch.fnmatch(rel.lower(), pattern.lower()):
-            return True
-    return False
+    return security_policy.is_secret(rel)
 
 
 def in_skipped_dir(rel: str) -> bool:
-    return any(part in SKIP_DIRS for part in rel.split("/")[:-1])
+    return security_policy.in_skipped_dir(rel)
 
 
 def matches(rel: str, patterns: list[str]) -> str | None:
@@ -88,8 +86,10 @@ def canonical(items: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def digest(items: list[dict]) -> str:
-    return hashlib.sha256(canonical(items).encode("utf-8")).hexdigest()
+def digest(items: list[dict], version: int = PACKET_FORMAT_VERSION) -> str:
+    """Digest пакета: SHA выбранных файлов + семантическая версия формата."""
+    body = f"aihub-packet-v{version}\n" + canonical(items)
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
 def select(entries: list[dict], requested: list[str], budget_bytes: int) -> tuple[list[dict], int, dict]:
@@ -218,6 +218,31 @@ def _write_items(conn, packet_id: str, items: list[dict]) -> None:
             sel=bool(item["selected"]), r=item["reason"])
 
 
+def _save_revision(conn, packet_id: str, revision: int, digest_value: str,
+                   items: list[dict]) -> None:
+    """Фиксирует ревизию в истории. Ревизии неизменяемы: on conflict не трогаем."""
+    conn.run(db._qualify(
+        "insert into aihub.context_packet_revisions(packet_id, revision, digest, items)"
+        " values (:p, :r, :d, :i::jsonb) on conflict (packet_id, revision) do nothing"),
+        p=packet_id, r=int(revision), d=digest_value,
+        i=json.dumps(items, ensure_ascii=False))
+
+
+def revision_items(packet_id: str, revision: int) -> list[dict] | None:
+    """Манифест конкретной ревизии из истории — неизменяемый снимок пакета."""
+    with db._lock:
+        conn = db.connect()
+        row = db._one(conn, db._qualify(
+            "select items from aihub.context_packet_revisions"
+            " where packet_id = :p and revision = :r"), p=packet_id, r=int(revision))
+    if not row:
+        return None
+    items = row.get("items")
+    if isinstance(items, str):
+        items = json.loads(items or "[]")
+    return items
+
+
 def seal(packet_id: str, entries: list[dict], recheck: bool = False) -> dict:
     """Фиксирует пакет по фактическому списку файлов хоста.
 
@@ -251,7 +276,8 @@ def seal(packet_id: str, entries: list[dict], recheck: bool = False) -> dict:
                 " updated_at = now() where id = :i returning revision"),
                 d=new_digest, u=int(used), i=packet_id,
                 m=json.dumps({"stats": stats, "previous_digest": row["digest"]}, ensure_ascii=False))
-        fresh = _packet_row(packet_id)
+            fresh = _packet_row(packet_id)
+            _save_revision(conn, packet_id, int(fresh["revision"]), new_digest, items)
         return {"packet_id": packet_id, "state": "conflict", "digest": new_digest,
                 "changed": True, "revision": int(fresh["revision"]),
                 "previous_digest": row["digest"]}
@@ -264,7 +290,9 @@ def seal(packet_id: str, entries: list[dict], recheck: bool = False) -> dict:
             " manifest = :m::jsonb, sealed_at = now(), updated_at = now()"
             " where id = :i returning id"),
             d=new_digest, u=int(used), i=packet_id,
-            m=json.dumps({"stats": stats}, ensure_ascii=False))
+            m=json.dumps({"stats": stats, "format_version": PACKET_FORMAT_VERSION},
+                         ensure_ascii=False))
+        _save_revision(conn, packet_id, int(row["revision"]), new_digest, items)
     return {"packet_id": packet_id, "state": "sealed", "digest": new_digest,
             "changed": not recheck, "revision": int(row["revision"]), "used_bytes": int(used),
             "stats": stats}
@@ -367,8 +395,8 @@ def _entries_from_listing(result: dict | None) -> list[dict]:
     return out
 
 
-def _store_built(packet_id: str, built: dict) -> None:
-    """Пишет собранный вход; изменившийся digest означает конфликт, а не новую тишину."""
+def _store_built(packet_id: str, built: dict, contents: dict[str, str] | None = None) -> None:
+    """Пишет собранный вход; изменившийся digest означает конфликт и новую ревизию."""
     previous = (_packet_row(packet_id) or {}).get("digest")
     state = "conflict" if previous and previous != built["digest"] else "sealed"
     bump = ", revision = revision + 1" if state == "conflict" else ""
@@ -378,13 +406,43 @@ def _store_built(packet_id: str, built: dict) -> None:
     with db._lock:
         conn = db.connect()
         _write_items(conn, packet_id, built["items"])
-        db._one(conn, db._qualify(
+        row = db._one(conn, db._qualify(
             "update aihub.context_packets set state = :st, digest = :d, used_bytes = :u,"
             " budget_bytes = :b, manifest = :m::jsonb, sealed_at = now(), updated_at = now()"
-            + bump + " where id = :i returning id"),
+            + bump + " where id = :i returning revision"),
             st=state, d=built["digest"], u=int(built["used_tokens"]),
             b=int(built["budget_tokens"]), i=packet_id,
             m=json.dumps(payload, ensure_ascii=False))
+        revision = int(row["revision"])
+        conn.run(db._qualify(
+            "delete from aihub.context_packet_files where packet_id = :p and revision = :r"),
+            p=packet_id, r=revision)
+        selected = {item["path"] for item in built["items"] if item.get("selected")}
+        for path in sorted(selected):
+            text = (contents or {}).get(path)
+            item = next(item for item in built["items"] if item["path"] == path)
+            if text is None:
+                raise PacketError("context_missing", f"нет проверенного содержимого: {path}")
+            raw = text.encode("utf-8")
+            if len(raw) != int(item["size"]) or hashlib.sha256(raw).hexdigest() != item["sha256"]:
+                raise PacketError("context_hash_mismatch", f"содержимое не прошло сверку: {path}")
+            conn.run(db._qualify(
+                "insert into aihub.context_packet_files(packet_id, revision, path, sha256, size, content)"
+                " values (:p, :r, :path, :sha, :size, :content)"),
+                p=packet_id, r=revision, path=path, sha=item["sha256"],
+                size=int(item["size"]), content=text)
+        _save_revision(conn, packet_id, revision, built["digest"],
+                       built["items"])
+
+
+def verified_contents(packet_id: str, revision: int) -> list[dict]:
+    """Returns only the selected UTF-8 bytes verified for an immutable revision."""
+    with db._lock:
+        conn = db.connect()
+        return [dict(row) for row in db._rows(conn, db._qualify(
+            "select path, sha256, size, content from aihub.context_packet_files"
+            " where packet_id = :p and revision = :r order by path"),
+            p=packet_id, r=int(revision))]
 
 
 def _store_collected(packet_id: str, collected: list[dict]) -> None:
@@ -468,44 +526,227 @@ def poll_active(limit: int = 20) -> int:
             if isinstance(request, str):
                 request = json.loads(request)
             entries = (packet_row.get("manifest") or {}).get("collected") or []
-            contents = {f.get("path"): (f.get("text") or "")
-                        for f in ((job.get("result") or {}).get("files") or []) if f.get("path")}
+            returned = {f.get("path"): f for f in ((job.get("result") or {}).get("files") or [])
+                        if f.get("path")}
+            expected = {e["path"]: e for e in entries}
+            contents = {}
+            verified_entries = []
+            for path, file in returned.items():
+                listed = expected.get(path)
+                text = file.get("text")
+                if not listed or not isinstance(text, str):
+                    continue
+                raw = text.encode("utf-8")
+                actual_sha = hashlib.sha256(raw).hexdigest()
+                if (int(file.get("offset") or 0) != 0
+                        or int(file.get("length") or len(raw)) != len(raw)
+                        or len(raw) != int(listed.get("size") or 0)
+                        or actual_sha != (listed.get("sha256") or "")
+                        or file.get("sha256") != listed.get("sha256")):
+                    continue
+                contents[path] = text
+                verified_entries.append(listed)
             try:
-                built = context.build(entries, contents, request.get("goal") or "",
+                built = context.build(verified_entries, contents, request.get("goal") or "",
                                       request.get("entry") or "",
                                       request.get("contracts") or [],
                                       int(request.get("budget_tokens") or 0))
             except context.ContextError as exc:
                 fail(row["id"], exc.message)
                 continue
-            _store_built(row["id"], built)
+            _store_built(row["id"], built, contents)
+        elif op == "materialize":
+            _continue_materialize(row["id"], job)
         elif op == "snapshot":
             result = job.get("result") or {}
             mark_materialized(row["id"], result.get("snapshot_id") or "", result.get("tree_digest"))
     return moved
 
 
+MATERIALIZE_CHUNK = 8
+
+
+def _revision_manifest(packet: dict) -> tuple[int, list[dict]]:
+    """Манифест конкретной ревизии: из истории, для старых пакетов — текущий."""
+    revision = int(packet.get("revision") or 1)
+    items = revision_items(packet["id"], revision)
+    if items is None:
+        items = packet.get("items") or []
+    return revision, [dict(i) for i in items]
+
+
 def start_materialize(packet_id: str) -> dict:
-    """Материализация на хосте: управляемый снимок проекта под этот пакет."""
+    """Материализация ТОЛЬКО выбранных файлов конкретной ревизии пакета.
+
+    Весь проект не копируется: хаб запрашивает по read_files выбранные пути
+    ревизии и сверяет sha256 каждого файла с манифестом до того, как поставить
+    materialized. Подменённый ответ хоста (несовпадение hash) даёт conflict.
+    """
     from . import workspace
     packet = _packet_row(packet_id)
     if not packet:
         raise PacketError("not_found", "пакет не найден")
     if packet["state"] not in ("sealed", "conflict"):
         raise PacketError("bad_state", f"пакет в состоянии {packet['state']}, нужен sealed")
+    revision, items = _revision_manifest(packet)
+    selected = [i for i in items if i.get("selected")]
+    with db._lock:
+        conn = db.connect()
+        conn.run(db._qualify(
+            "delete from aihub.context_packet_files where packet_id = :p and revision = :r"),
+            p=packet_id, r=revision)
     project = db.get_project(packet["project_id"])
     if not project:
         raise PacketError("no_project", "проект пакета не найден")
+    for item in selected:
+        if security_policy.is_secret(item["path"]):
+            raise PacketError("denied_path", f"выбранный путь запрещён политикой: {item['path']}")
+        if not item.get("sha256"):
+            raise PacketError("no_hash", f"в манифесте ревизии нет sha256: {item['path']}")
+    manifest = {"materialize": {"revision": revision, "total": len(selected),
+                                "verified": [], "pending": [i["path"] for i in selected]}}
+    with db._lock:
+        conn = db.connect()
+        db._one(conn, db._qualify(
+            "update aihub.context_packets set manifest = manifest || :m::jsonb, updated_at = now()"
+            " where id = :i returning id"),
+            m=json.dumps(manifest, ensure_ascii=False), i=packet_id)
+    if not selected:
+        mark_materialized(packet_id, f"hub://packets/{packet_id}@{revision}",
+                          packet.get("digest"))
+        return {"packet_id": packet_id, "state": "materialized", "revision": revision,
+                "files": 0}
     job = workspace.create_op_job(
-        "snapshot", {"root": project.get("workdir") or "", "label": f"packet-{packet_id[:8]}"},
+        "read_files",
+        {"root": project.get("workdir") or "",
+         "files": [{"path": i["path"]} for i in selected[:MATERIALIZE_CHUNK]]},
         project.get("host_id") or "", project["id"])
     with db._lock:
         conn = db.connect()
         db._one(conn, db._qualify(
             "update aihub.context_packets set state = 'materializing', provider_job_id = :j,"
-            " provider_op = 'snapshot', updated_at = now() where id = :i returning id"),
+            " provider_op = 'materialize', updated_at = now() where id = :i returning id"),
             j=job["job"]["id"], i=packet_id)
-    return {"packet_id": packet_id, "state": "materializing", "job_id": job["job"]["id"]}
+    return {"packet_id": packet_id, "state": "materializing", "job_id": job["job"]["id"],
+            "revision": revision, "files": len(selected)}
+
+
+def _continue_materialize(packet_id: str, job: dict) -> None:
+    """Сверка прочитанных файлов с манифестом ревизии; при полном совпадении —
+    materialized, иначе conflict с причиной. Невыбранные файлы не запрашиваются."""
+    from . import workspace
+    packet = _packet_row(packet_id) or {}
+    project = db.get_project(packet.get("project_id") or "")
+    if not project:
+        fail(packet_id, "проект пакета не найден")
+        return
+    revision, items = _revision_manifest(packet)
+    by_path = {i["path"]: i for i in items if i.get("selected")}
+    state = (packet.get("manifest") or {}).get("materialize") or {}
+    verified = list(state.get("verified") or [])
+    pending = list(state.get("pending") or [])
+    reason = None
+    chunk_contents = []
+    for entry in ((job.get("result") or {}).get("files") or []):
+        path = entry.get("path")
+        want = by_path.get(path)
+        # Чужой или невыбранный файл из ответа хоста не принимается.
+        if want is None:
+            reason = f"хост вернул невыбранный файл: {path}"
+            break
+        got_sha = entry.get("sha256")
+        if not got_sha or got_sha != (want.get("sha256") or None):
+            reason = f"hash mismatch для {path}: хост вернул {got_sha!r}"
+            break
+        if int(entry.get("size") or -1) != int(want.get("size") or -2):
+            reason = f"размер не сошёлся для {path}"
+            break
+        try:
+            if isinstance(entry.get("text"), str):
+                raw = entry["text"].encode("utf-8")
+                text = entry["text"]
+            else:
+                raw = base64.b64decode(entry.get("content_b64") or "", validate=True)
+                text = raw.decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            reason = f"содержимое не является UTF-8: {path}"
+            break
+        if (len(raw) != int(want.get("size") or 0)
+                or hashlib.sha256(raw).hexdigest() != want.get("sha256")):
+            reason = f"содержимое не прошло SHA-256: {path}"
+            break
+        chunk_contents.append((path, want, text))
+        if path in pending:
+            pending.remove(path)
+        if path not in verified:
+            verified.append(path)
+    if reason is None:
+        returned = {e.get("path") for e in ((job.get("result") or {}).get("files") or [])}
+        missing = [p for p in list(pending) if p in by_path and p not in returned]
+        if missing:
+            reason = f"хост не вернул выбранные файлы: {', '.join(missing[:3])}"
+    if reason is not None:
+        with db._lock:
+            conn = db.connect()
+            conn.run(db._qualify(
+                "delete from aihub.context_packet_files where packet_id = :p and revision = :r"),
+                p=packet_id, r=revision)
+            db._one(conn, db._qualify(
+                "update aihub.context_packets set state = 'conflict',"
+                " manifest = manifest || :m::jsonb, updated_at = now()"
+                " where id = :i returning id"),
+                m=json.dumps({"materialize": {"error": reason, "revision": revision}},
+                             ensure_ascii=False), i=packet_id)
+        return
+    if chunk_contents:
+        with db._lock:
+            conn = db.connect()
+            for path, item, text in chunk_contents:
+                conn.run(db._qualify(
+                    "insert into aihub.context_packet_files(packet_id, revision, path, sha256, size, content)"
+                    " values (:p, :r, :path, :sha, :size, :content)"
+                    " on conflict (packet_id, revision, path) do update set"
+                    " sha256 = excluded.sha256, size = excluded.size, content = excluded.content"),
+                    p=packet_id, r=revision, path=path, sha=item["sha256"],
+                    size=int(item["size"]), content=text)
+    if pending:
+        # Следующая порция выбранных файлов этой же ревизии.
+        progress = {"materialize": {"revision": revision, "total": state.get("total"),
+                                    "verified": verified, "pending": pending}}
+        with db._lock:
+            conn = db.connect()
+            db._one(conn, db._qualify(
+                "update aihub.context_packets set manifest = manifest || :m::jsonb,"
+                " updated_at = now() where id = :i returning id"),
+                m=json.dumps(progress, ensure_ascii=False), i=packet_id)
+        chunk = [by_path[p] for p in pending if p in by_path][:MATERIALIZE_CHUNK]
+        next_job = workspace.create_op_job(
+            "read_files",
+            {"root": project.get("workdir") or "",
+             "files": [{"path": i["path"]} for i in chunk]},
+            project.get("host_id") or "", project["id"])
+        with db._lock:
+            conn = db.connect()
+            db._one(conn, db._qualify(
+                "update aihub.context_packets set provider_job_id = :j, updated_at = now()"
+                " where id = :i returning id"), j=next_job["job"]["id"], i=packet_id)
+        return
+    # Все выбранные файлы сверены. materialized только сейчас.
+    rev_digest = digest([{"path": i["path"], "size": i["size"],
+                          "sha256": i.get("sha256"), "selected": True}
+                         for i in items if i.get("selected")])
+    if not verify_materialized({"digest": packet.get("digest")}, rev_digest):
+        with db._lock:
+            conn = db.connect()
+            db._one(conn, db._qualify(
+                "update aihub.context_packets set state = 'conflict',"
+                " manifest = manifest || :m::jsonb, updated_at = now()"
+                " where id = :i returning id"),
+                m=json.dumps({"materialize": {"error": "digest ревизии не совпал с digest пакета",
+                                              "revision": revision}}, ensure_ascii=False),
+                i=packet_id)
+        return
+    mark_materialized(packet_id, f"hub://packets/{packet_id}@{revision}", rev_digest)
 
 
 def start_recheck(packet_id: str) -> dict:

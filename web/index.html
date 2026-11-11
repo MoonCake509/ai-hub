@@ -88,8 +88,30 @@
   </section>
   <section class="panel runs-panel" aria-labelledby="runs-title">
     <div class="panel-head"><div><div class="eyebrow">FLOW</div><h2 id="runs-title">Запуски процесса</h2></div>
-      <div class="recon-toolbar"><button type="button" class="ghost small" id="runs-refresh">Обновить</button></div></div>
+      <div class="recon-toolbar"><button type="button" class="ghost small" id="runs-refresh">Обновить</button>
+        <button type="button" class="small" id="runs-new">Новый процесс</button></div></div>
     <p class="hint" id="runs-status" role="status" aria-live="polite">Загрузка запусков…</p>
+    <form id="flow-create" class="run-create" hidden>
+      <label>Цель процесса<textarea id="flow-goal" rows="3" maxlength="2000" required
+        placeholder="Что должно измениться и зачем"></textarea></label>
+      <label>Критерии приёмки (через точку с запятой)<input id="flow-criteria" maxlength="500"
+        placeholder="тесты зелёные; изменение только в src/"></label>
+      <label>Точка входа<input id="flow-entry" maxlength="200" placeholder="src/app.py"></label>
+      <label>Обязательные контракты (через запятую)<input id="flow-contracts" maxlength="300"
+        placeholder="docs/api.yaml, schema.sql"></label>
+      <fieldset class="run-budgets"><legend>Бюджет процесса</legend>
+        <label>Циклов исправлений<input id="flow-max-cycles" type="number" min="0" value="2"></label>
+        <label>Максимум шагов<input id="flow-max-dispatches" type="number" min="1" placeholder="не ограничено"></label>
+        <label>Максимум вызовов<input id="flow-max-calls" type="number" min="1" placeholder="не ограничено"></label>
+        <label>Лимит времени, с<input id="flow-max-seconds" type="number" min="1" placeholder="не ограничено"></label>
+      </fieldset>
+      <div id="flow-assignments" class="run-assignments"></div>
+      <p class="hint" id="flow-preflight" role="status" aria-live="polite"></p>
+      <div class="row">
+        <button type="submit" id="flow-submit">Создать процесс</button>
+        <button type="button" class="ghost" id="flow-create-cancel">Отмена</button>
+      </div>
+    </form>
     <div id="runs-list" class="runs-list"></div>
     <section id="run-detail" class="run-detail" hidden aria-live="polite"></section>
   </section>

@@ -16,6 +16,19 @@ CONTRACT_HINTS = ("openapi", "schema.sql", "contract", ".proto", "types.ts",
                   "api.yaml", "api.json", "migrations/")
 MAX_IMPORT_DEPTH = 1
 
+# Версия формата digest: смена контракта меняет все digest, старые значения
+# нельзя сравнивать с новыми. Digest включает SHA-256 каждого фактически
+# передаваемого файла: замена содержимого без смены размера меняет digest.
+FORMAT_VERSION = 2
+
+
+def content_digest(items: list[dict]) -> str:
+    """Канонический digest выбранных файлов: путь|размер|sha256 + версия формата."""
+    lines = [f"aihub-context-v{FORMAT_VERSION}"]
+    for item in sorted(items, key=lambda x: x["path"]):
+        lines.append(f"{item['path']}|{int(item['size'])}|{item.get('sha256') or '-'}")
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+
 
 class ContextError(ValueError):
     def __init__(self, code: str, message: str, details: dict | None = None):
@@ -123,7 +136,17 @@ def build(entries: list[dict], contents: dict[str, str], goal: str, entry: str,
                            {"missing": missing})
 
     sizes = {path: int(e.get("size") or 0) for path, e in by_path.items()}
-    hashes = {path: (e.get("sha256") or None) for path, e in by_path.items()}
+    # SHA обязателен для выбранных файлов: digest пакета защищает содержимое,
+    # а не метаданные. Если хост не прислал sha, считаем из переданного
+    # содержимого; выбранный файл без sha и без содержимого — дыра в сверке.
+    hashes: dict[str, str | None] = {}
+    for path, e in by_path.items():
+        sha = e.get("sha256") or None
+        if not sha:
+            text = (contents or {}).get(path)
+            if text is not None:
+                sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        hashes[path] = sha
     tokens = {path: estimate_tokens(sizes[path]) for path in by_path}
 
     required_tokens = sum(tokens[c] for c in required)
@@ -167,9 +190,11 @@ def build(entries: list[dict], contents: dict[str, str], goal: str, entry: str,
 
     total_tokens = sum(tokens.values()) or 1
     selected = [i for i in items if i["selected"]]
-    digest = hashlib.sha256((
-        "|".join(f"{i['path']}|{i['size']}" for i in sorted(selected, key=lambda x: x["path"]))
-    ).encode("utf-8")).hexdigest()
+    for item in selected:
+        if not item.get("sha256"):
+            raise ContextError("no_hash", f"нет sha256 для файла {item['path']}",
+                               {"path": item["path"]})
+    digest = content_digest(selected)
     return {
         "items": items,
         "selected": [i["path"] for i in selected],
@@ -179,6 +204,7 @@ def build(entries: list[dict], contents: dict[str, str], goal: str, entry: str,
         "saved_tokens": max(0, sum(tokens.values()) - used),
         "saved_ratio": round(1 - (used / total_tokens), 3) if total_tokens else 0.0,
         "digest": digest,
+        "format_version": FORMAT_VERSION,
         "contracts": required,
         "imports": sorted(imports),
     }

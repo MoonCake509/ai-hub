@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import os
 import threading
@@ -23,6 +24,32 @@ _lock = threading.RLock()
 # Сколько кандидатов очереди просматривать в поисках свободного checkout.
 CANDIDATES = max(1, min(50, int(os.environ.get("LEASE_CANDIDATES", "10"))))
 _conn: pg8000.native.Connection | None = None
+
+# Глубина явных транзакций на единственном соединении. Все вызовы идут под
+# db._lock (RLock), поэтому счётчик корректен: вложенный db.transaction не
+# шлёт второй "begin"/"commit", а сливается с внешней транзакцией — так
+# create_job внутри dispatch атомарен с выдачей шага, а не коммитит её раньше.
+_txn_depth = 0
+
+
+@contextlib.contextmanager
+def transaction(conn):
+    """Явная транзакция: begin/commit на внешнем уровне, вложенные — no-op."""
+    global _txn_depth
+    if _txn_depth == 0:
+        conn.run("begin")
+    _txn_depth += 1
+    try:
+        yield
+    except Exception:
+        _txn_depth -= 1
+        if _txn_depth == 0:
+            conn.run("rollback")
+        raise
+    else:
+        _txn_depth -= 1
+        if _txn_depth == 0:
+            conn.run("commit")
 
 
 def _json_object(value):
@@ -284,6 +311,47 @@ DDL = [
         reason text not null default '',
         primary key (packet_id, path)
     )""",
+    """create table if not exists aihub.context_packet_files (
+        packet_id text not null references aihub.context_packets(id) on delete cascade,
+        revision int not null,
+        path text not null,
+        sha256 text not null,
+        size bigint not null,
+        content text not null,
+        primary key (packet_id, revision, path)
+    )""",
+    # FLOW-P1: история ревизий пакетов — ревизии неизменяемы, текущие items лишь указатель.
+    """create table if not exists aihub.context_packet_revisions (
+        packet_id text not null references aihub.context_packets(id) on delete cascade,
+        revision int not null,
+        digest text,
+        items jsonb not null default '[]',
+        sealed_at timestamptz not null default now(),
+        primary key (packet_id, revision)
+    )""",
+    # FLOW-P1: запуск связан с целью, критериями, снимком назначений и проекта.
+    "alter table aihub.runs add column if not exists request_key text",
+    "alter table aihub.runs add column if not exists idempotency_sha text",
+    "create unique index if not exists runs_request_key on aihub.runs(request_key)"
+    " where request_key is not null",
+    "alter table aihub.runs add column if not exists goal text not null default ''",
+    "alter table aihub.runs add column if not exists criteria jsonb not null default '[]'",
+    "alter table aihub.runs add column if not exists assignments jsonb not null default '{}'",
+    "alter table aihub.runs add column if not exists project_snapshot jsonb not null default '{}'",
+    "alter table aihub.runs add column if not exists budgets jsonb not null default '{}'",
+    "alter table aihub.runs add column if not exists budget_used jsonb not null default '{}'",
+    # FLOW-P1: проверяемый кандидат и receipt изолированного runner'а.
+    "alter table aihub.runs add column if not exists candidate_digest text",
+    "alter table aihub.runs add column if not exists candidate_snapshot_id text",
+    "alter table aihub.runs add column if not exists check_receipt jsonb",
+    "alter table aihub.runs add column if not exists pipeline jsonb not null default '{}'",
+    "alter table aihub.runs add column if not exists cancel_info jsonb",
+    # FLOW-P1: контекст, результат, назначение и receipt фиксируются на задаче.
+    "alter table aihub.run_tasks add column if not exists assignment jsonb not null default '{}'",
+    "alter table aihub.run_tasks add column if not exists result jsonb",
+    "alter table aihub.run_tasks add column if not exists receipt jsonb",
+    "alter table aihub.run_tasks add column if not exists retry_feedback jsonb not null default '{}'",
+    "alter table aihub.run_tasks add column if not exists packet_revision int",
 ]
 
 
@@ -360,8 +428,7 @@ def create_job(agent_id: str, prompt: str, prompt_sha: str, timeout_s: int,
     job_id = uuid.uuid4().hex
     with _lock:
         conn = connect()
-        conn.run("begin")
-        try:
+        with transaction(conn):
             # Проверка места в очереди и вставка должны быть одной операцией:
             # иначе два процесса увидят одинаково свободное место и превысят лимит.
             conn.run("select pg_advisory_xact_lock(7401)")
@@ -377,7 +444,6 @@ def create_job(agent_id: str, prompt: str, prompt_sha: str, timeout_s: int,
                             or (existing.get("requested_model") or None) != (requested_model or None)
                             or (existing.get("requested_profile") or None) != (requested_profile or None)):
                         raise ValueError("idempotency_key_conflict")
-                    conn.run("commit")
                     return existing, False
             if max_queue:
                 depth = _one(conn, "select count(*) as n from aihub.jobs where status = 'queued'")["n"]
@@ -394,10 +460,6 @@ def create_job(agent_id: str, prompt: str, prompt_sha: str, timeout_s: int,
                 sn=json.dumps(workspace, ensure_ascii=False), kd=kind,
             )
             conn.run(_qualify("insert into aihub.job_events(job_id, event) values (:j, 'queued')"), j=job_id)
-            conn.run("commit")
-        except Exception:
-            conn.run("rollback")
-            raise
         return get_job(job_id), True
 
 
@@ -837,14 +899,11 @@ def cancel_job(job_id: str) -> str:
     """queued → cancelled сразу; running → cancel_requested (подтверждает исполнитель)."""
     with _lock:
         conn = connect()
-        conn.run("begin")
-        try:
+        with transaction(conn):
             job = _one(conn, "select * from aihub.jobs where id = :j for update", j=job_id)
             if not job:
-                conn.run("rollback")
                 return "not_found"
             if job["status"] in ("succeeded", "failed", "cancelled", "timeout"):
-                conn.run("rollback")
                 return "already_finished"
             if job["status"] == "queued":
                 conn.run(_qualify("update aihub.jobs set status = 'cancelled', finished_at = now() where id = :j"), j=job_id)
@@ -858,10 +917,6 @@ def cancel_job(job_id: str) -> str:
             if status == "cancelled":
                 from . import resources
                 resources.release_for_job(conn, job_id)
-            conn.run("commit")
-        except Exception:
-            conn.run("rollback")
-            raise
         return status
 
 
@@ -909,6 +964,7 @@ def expire_leases() -> int:
 # ============================================================
 
 ROLE_IDS = ("architect", "coder", "tester", "reviewer", "archivist")
+ROLE_ALIASES = {"planner": "architect"}
 
 ROLE_RU = {
     "architect": "Архитектор",
@@ -1009,6 +1065,7 @@ def update_project(project_id: str, name=None, host_id=None, workdir=None,
 def update_role(project_id: str, role_id: str, agent_id=None, profile=None,
                 model=None, instructions=None, timeout_s=None) -> dict | None:
     """Назначение роли. model=None означает «сброс к значению по умолчанию профиля»."""
+    role_id = ROLE_ALIASES.get(role_id, role_id)
     if role_id not in ROLE_IDS:
         raise ValueError("unknown_role")
     with _lock:

@@ -978,10 +978,10 @@ def expire_leases() -> int:
 # 9.2: проекты, роли, чаты, вложения
 # ============================================================
 
-ROLE_IDS = ("architect", "coder", "tester", "reviewer", "archivist")
+ROLE_IDS = ("planner", "coder", "tester", "reviewer", "archivist")
 
-# В данных роль называется architect (исторически planner в шаблонах), в интерфейсе
-# и документах — «Архитектор». Подпись не меняет идентификаторы назначений.
+# Идентификатор роли в данных — planner, как в шаблонах и назначениях; в интерфейсе
+# и документах подпись «Архитектор». architect принимается только как старый алиас.
 ROLE_LABELS = {
     "architect": "Архитектор",
     "planner": "Архитектор",
@@ -990,7 +990,7 @@ ROLE_LABELS = {
     "reviewer": "Ревьюер",
     "archivist": "Архивариус",
 }
-ROLE_ALIASES = {"planner": "architect"}
+ROLE_ALIASES = {"architect": "planner"}
 
 ROLE_RU = {
     "architect": "Архитектор",
@@ -1012,6 +1012,12 @@ def seed_workspace() -> dict:
                 conn.run(_qualify(
                     "insert into aihub.projects(id, name, host_id, workdir, settings)"
                     " values ('ai-hub', 'AI Hub', 'laptop', '', '{}'::jsonb)"))
+            # Раньше роль архитектора хранилась как architect; данные переводим на
+            # planner, чтобы шаблоны и назначения ссылались на один идентификатор.
+            conn.run(_qualify(
+                "update aihub.roles r set role_id = 'planner' where r.role_id = 'architect'"
+                " and not exists (select 1 from aihub.roles p"
+                " where p.project_id = r.project_id and p.role_id = 'planner')"))
             for rid in ROLE_IDS:
                 ex = _one(conn, _qualify(
                     "select 1 as one from aihub.roles where project_id = 'ai-hub' and role_id = :r"), r=rid)

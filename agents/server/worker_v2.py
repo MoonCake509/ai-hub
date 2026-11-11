@@ -57,21 +57,32 @@ TOKEN = os.environ.get("HUB_TOKEN") or read("token.txt", "")
 WORKER = os.environ.get("COMPUTERNAME", "server") + "-host"
 
 
-def run_qwen(prompt: str, timeout: int) -> dict:
+def run_qwen(prompt: str, timeout: int, job: dict) -> dict:
     env = dict(os.environ)
     env["QWEN_CDP_PORT"] = os.environ.get("QWEN_CDP_PORT", "9333")
     started = time.time()
     proc = subprocess.run(
-        [NODE, QWEN_JS, "ask", prompt],
+        [NODE, QWEN_JS, "ask-json", job.get("requested_model") or "", prompt],
         capture_output=True, stdin=subprocess.DEVNULL, timeout=timeout,
         env=env, creationflags=CREATE_NO_WINDOW,
     )
     out = proc.stdout.decode("utf-8", "replace").strip()
     err = proc.stderr.decode("utf-8", "replace").strip()
+    if proc.returncode:
+        return {"output": "", "usage": {}, "exit_code": proc.returncode,
+                "error": err[-1000:] or "Qwen Chat adapter failed"}
+    try:
+        result = json.loads(out)
+        output, model = result["output"], result["model"]
+        if not isinstance(output, str) or not output.strip() or not isinstance(model, str) or not model:
+            raise ValueError("empty answer or missing model")
+    except (ValueError, TypeError, KeyError):
+        return {"output": "", "usage": {}, "exit_code": 1,
+                "error": "Qwen Chat adapter returned an invalid response"}
     return {
-        "output": out or err[-2000:],
-        "usage": {},
-        "exit_code": proc.returncode,
+        "output": output,
+        "usage": {"model": model, "model_source": "qwen_chat_ui"},
+        "exit_code": 0,
         "elapsed": round(time.time() - started, 2),
     }
 
@@ -250,7 +261,7 @@ def run_llm(prompt: str, timeout: int, job: dict | None = None) -> dict:
                 "error": str(exc)[:500], "elapsed": round(time.time() - started, 2)}
 
 AGENTS = {
-    "qwen-server": {"runner": run_qwen, "timeout": 600},
+    "qwen-server": {"runner": run_qwen, "timeout": 600, "job_args": True},
     "openclaw-server": {"runner": run_openclaw, "timeout": 600},
     "hermes-server": {"runner": run_hermes, "timeout": 600},
     "llm-server": {"runner": run_llm, "timeout": 300, "job_args": True},
@@ -396,7 +407,7 @@ def worker_heartbeat_payload() -> dict:
     for agent_id, spec in AGENTS.items():
         info = WORKER_CLI.get(agent_id) or {}
         item = {"id": agent_id, "capabilities": {
-            "workdir": bool(spec.get("job_args")),
+            "workdir": bool(spec.get("supports_workdir") and spec.get("job_args")),
             "attachments": agent_id in ("llm-server", "xiaomi-ocr-server"),
         }}
         cli_path = info.get("path")

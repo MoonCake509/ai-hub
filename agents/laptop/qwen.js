@@ -8,19 +8,23 @@
 //
 // Требует: Qwen.exe запущен с --remote-debugging-port=9222
 const PORT = Number(process.env.QWEN_CDP_PORT || 9222);
+const COMPOSER = 'textarea:not([readonly]):not([aria-hidden="true"])';
 
-async function findTarget() {
+async function findTarget(requireChat = false) {
   const list = await (await fetch(`http://127.0.0.1:${PORT}/json/list`)).json();
   const pages = list.filter(x => x.type === 'page' || x.type === 'webview');
-  const t = pages.find(x => (x.url || '').includes('chat.qwen.ai'))
-    || pages.find(x => (x.url || '').includes('app.asar/out/renderer'))
-    || pages.find(x => (x.title || '').includes('Qwen'));
+  const chat = pages.find(x => {
+    try { return new URL(x.url).origin === 'https://chat.qwen.ai'; }
+    catch { return false; }
+  });
+  const t = chat || (!requireChat && (pages.find(x => (x.url || '').includes('app.asar/out/renderer'))
+    || pages.find(x => (x.title || '').includes('Qwen'))));
   if (!t) throw new Error(`Qwen webview не найден на порту ${PORT}. Запусти приложение с --remote-debugging-port=${PORT}`);
   return t;
 }
 
-async function connect() {
-  const target = await findTarget();
+async function connect(requireChat = false) {
+  const target = await findTarget(requireChat);
   const ws = new WebSocket(target.webSocketDebuggerUrl);
   let id = 0;
   const pending = new Map();
@@ -32,7 +36,9 @@ async function connect() {
   const evaluate = expr => new Promise(res => {
     const myId = ++id;
     pending.set(myId, m => {
-      if (m.result?.exceptionDetails) res({ error: m.result.exceptionDetails.text || 'js error' });
+      if (m.result?.exceptionDetails) {
+        res({ error: m.result.exceptionDetails.exception?.description || m.result.exceptionDetails.text });
+      }
       else res({ value: m.result?.result?.value });
     });
     ws.send(JSON.stringify({ id: myId, method: 'Runtime.evaluate', params: { expression: expr, returnByValue: true, awaitPromise: true, userGesture: true } }));
@@ -63,7 +69,7 @@ function extractAnswer(mainText) {
 }
 
 const SEND_SET = text => `(() => {
-  const ta = document.querySelector('textarea');
+  const ta = document.querySelector(${JSON.stringify(COMPOSER)});
   if (!ta) return 'NO_TEXTAREA';
   const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
   ta.focus();
@@ -74,7 +80,7 @@ const SEND_SET = text => `(() => {
 })()`;
 
 const SEND_SUBMIT = `(() => {
-  const ta = document.querySelector('textarea');
+  const ta = document.querySelector(${JSON.stringify(COMPOSER)});
   if (!ta) return 'NO_TEXTAREA';
   if (!ta.value.trim()) return 'ALREADY_EMPTY';
   const btn = [...document.querySelectorAll('button')].find(b => /^send$/i.test(b.getAttribute('aria-label') || '') || /^send$/i.test((b.innerText || '').trim()));
@@ -86,12 +92,12 @@ const SEND_SUBMIT = `(() => {
 })()`;
 
 async function submit(evaluate, text) {
-  await evaluate(SEND_SET(text));
+  if ((await evaluate(SEND_SET(text))).value !== 'SET') return 'FAILED';
   for (let i = 0; i < 6; i++) {
     await sleep(700);
     const r = await evaluate(SEND_SUBMIT);
     await sleep(1200);
-    const left = (await evaluate(`(() => { const t = document.querySelector('textarea'); return t ? t.value : null; })()`)).value;
+    const left = (await evaluate(`document.querySelector(${JSON.stringify(COMPOSER)})?.value ?? null`)).value;
     if (left === '' || left === null) return r.value;
   }
   return 'FAILED';
@@ -135,6 +141,100 @@ async function waitAnswer(evaluate, beforeText, timeoutMs = 240000) {
   return last;
 }
 
+function chatState(composerSelector) {
+  const answers = document.querySelectorAll('.response-message-content.phase-answer');
+  return {
+    count: answers.length,
+    text: answers[answers.length - 1]?.innerText || '',
+    model: document.querySelector('[aria-label="Select Model"]')?.innerText.trim() || '',
+    generating: Boolean(document.querySelector('.qwen-chat-message-awaiting-response'))
+      || [...document.querySelectorAll('button')].some(button =>
+        /^(stop|остановить)(?:\s|$)/i.test((button.getAttribute('aria-label') || '').trim())),
+    draft: document.querySelector(composerSelector)?.value || '',
+  };
+}
+
+async function readStructuredAnswer(expectedCount, expectedText, endMarker) {
+  const answers = document.querySelectorAll('.response-message-content.phase-answer');
+  const answer = answers[answers.length - 1];
+  if (answers.length !== expectedCount || answer?.innerText !== expectedText) {
+    throw new Error('Qwen Chat answer changed while being read');
+  }
+
+  let output = answer.innerText;
+  for (const block of answer.querySelectorAll('pre.qwen-markdown-code')) {
+    if (block.innerText.includes(endMarker)) throw new Error('Qwen Chat put the end marker inside a code block');
+    const button = block.querySelector('button[aria-label="Copy"], button[aria-label="Copy code"]');
+    const clipboard = navigator.clipboard;
+    if (!button || !clipboard) throw new Error('Qwen Chat code copy control is unavailable');
+    const original = Object.getOwnPropertyDescriptor(clipboard, 'writeText');
+    let copied;
+    // Capture the app's original code, including lines Monaco has not rendered.
+    // Intercept this button's clipboard write without replacing the system clipboard.
+    Object.defineProperty(clipboard, 'writeText', {
+      configurable: true,
+      value: async text => { copied = String(text); },
+    });
+    try {
+      button.click();
+      for (let i = 0; i < 10 && copied === undefined; i++) {
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+    } finally {
+      if (original) Object.defineProperty(clipboard, 'writeText', original);
+      else delete clipboard.writeText;
+    }
+    if (copied === undefined || !block.innerText || !output.includes(block.innerText)) {
+      throw new Error('Could not read original code from Qwen Chat');
+    }
+    output = output.replace(block.innerText, () => copied);
+  }
+  const markerLine = output.lastIndexOf('\n' + endMarker);
+  if (markerLine < 0 || output.slice(markerLine + 1).trim() !== endMarker) {
+    throw new Error('Qwen Chat answer has no separate end marker');
+  }
+  return output.slice(0, markerLine).replace(/\n+$/, '');
+}
+
+async function askStructured(evaluate, expectedModel, prompt) {
+  async function read(expression) {
+    const result = await evaluate(expression);
+    if (result.error) throw new Error(result.error);
+    return result.value;
+  }
+
+  const stateExpression = `(${chatState})(${JSON.stringify(COMPOSER)})`;
+  const before = await read(stateExpression);
+  const model = before.model.toLowerCase();
+  if (!model || (expectedModel && model !== expectedModel.toLowerCase())) {
+    throw new Error(`Qwen Chat model mismatch: expected ${expectedModel || 'a named model'}, selected ${before.model || '(unknown)'}`);
+  }
+  if (before.draft || before.generating) throw new Error('Qwen Chat is busy or contains an unsent draft');
+  const endMarker = `AIHUB-END-${crypto.randomUUID()}`;
+  const framedPrompt = `${prompt}\n\nAfter the complete answer, close any code fence and put this marker on its own final line: ${endMarker}`;
+  const sent = await submit(evaluate, framedPrompt);
+  if (!['CLICK', 'ENTER', 'ALREADY_EMPTY'].includes(sent)) throw new Error('Qwen Chat message was not submitted');
+
+  let last = '';
+  let stable = 0;
+  for (;;) {
+    await sleep(2000);
+    const state = await read(stateExpression);
+    if (state.model.toLowerCase() !== model) throw new Error('Qwen Chat model changed during the run');
+    if (state.count > before.count + 1) throw new Error('Qwen Chat received another turn during the run');
+    const finished = state.text.trimEnd().endsWith('\n' + endMarker);
+    if (state.count !== before.count + 1 || !finished || state.text !== last) {
+      last = state.text;
+      stable = 0;
+      continue;
+    }
+    if (++stable >= 4) {
+      const output = await read(`(${readStructuredAnswer})(${state.count}, ${JSON.stringify(state.text)}, ${JSON.stringify(endMarker)})`);
+      return { output, model, model_label: before.model };
+    }
+  }
+}
+
 function tail(mainText, n = 1500) {
   const lines = mainText.split('\n').map(s => s.trim()).filter(Boolean);
   return lines.slice(-n).join('\n');
@@ -148,7 +248,7 @@ function tail(mainText, n = 1500) {
     console.error(`ERR hard timeout ${hardMs}ms`);
     process.exit(3);
   }, hardMs);
-  const { ws, evaluate } = await connect();
+  const { ws, evaluate } = await connect(cmd === 'ask-json');
   try {
     if (cmd === 'ask') {
       const text = rest.join(' ');
@@ -158,6 +258,10 @@ function tail(mainText, n = 1500) {
       const after = await waitAnswer(evaluate, before);
       const ans = extractAnswer(after.slice(before.length)) || extractAnswer(after);
       console.log(ans || '(пусто)');
+    } else if (cmd === 'ask-json') {
+      const [expectedModel, ...prompt] = rest;
+      const result = await askStructured(evaluate, expectedModel, prompt.join(' '));
+      console.log(JSON.stringify(result));
     } else if (cmd === 'read') {
       const t = (await evaluate(READ)).value || '';
       console.log(extractAnswer(t) || '(пусто)');

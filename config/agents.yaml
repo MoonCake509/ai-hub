@@ -428,12 +428,13 @@ agents:
     command: "openclaw agent --message-file <file> --json"
 
   - id: qwen-server
-    model_selection: false
+    model_selection: true
     default_profile: qwen-sub
     profiles:
       - id: qwen-sub
         name: Qwen (подписка, сервер)
         models:
+          - qwen4-max-preview
           - qwen3.8-max
           - qwen3.8-plus
           - qwen3.8-flash
@@ -451,7 +452,7 @@ agents:
       stop: {supported: false, evidence: "unknown", reason: "не подтверждено"}
       output_control: {supported: false, evidence: "catalog", reason: "вывод не ограничивается каналом"}
     bridge_agent: qwen-server
-    notes: "CDP 9333, node qwen.js; требует авторизации в приложении"
+    notes: "Выбери указанную модель в Qwen Chat на сервере. Адаптер сверит её перед отправкой."
 
 # Пассивные пробы сервисов, которые видит контейнер хаба (DIAG-02).
 # Пробы агентов на хосте выполняет воркер (DIAG-03): 127.0.0.1 хоста из контейнера

@@ -94,7 +94,9 @@ async function api(path, opts = {}) {
   try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
   if (!resp.ok) {
     const detail = data && (data.detail || data.error) ? (data.detail || data.error) : resp.status;
-    throw new Error(typeof detail === 'string' ? detail : JSON.stringify(detail));
+    const error = new Error(typeof detail === 'string' ? detail : JSON.stringify(detail));
+    error.detail = detail;
+    throw error;
   }
   return data;
 }
@@ -780,9 +782,9 @@ async function runSubmitCreate(event) {
     status.textContent = '';
     await openRunDetail(created.run_id);
   } catch (error) {
-    status.textContent = error.message.includes('409') || error.message.includes('request_key')
+    status.textContent = error.detail?.code === 'idempotency_conflict' || error.message === '409'
       ? 'Конфликт: такой ключ создания уже занят другим содержимым (409).'
-      : 'Не удалось создать процесс: ' + error.message;
+      : 'Не удалось создать процесс: ' + (error.detail?.message || error.message);
   } finally {
     runCreatePending = false;
     submit.disabled = false;

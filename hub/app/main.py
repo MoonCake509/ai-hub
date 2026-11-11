@@ -1518,11 +1518,12 @@ async def run_create(request: Request) -> JSONResponse:
         result = await asyncio.to_thread(
             runs_ctrl.create_run, project_id, payload.get("template") or {},
             payload.get("policy") or {}, goal=goal or "",
-            criteria=criteria, request_key=(request_key or "").strip() or None)
+            criteria=criteria, request_key=(request_key or "").strip() or None,
+            require_ready_host=True)
     except runs_ctrl.RunError as exc:
         if exc.code == "not_found":
             raise HTTPException(status_code=404, detail=exc.as_dict()) from None
-        if exc.code == "idempotency_conflict":
+        if exc.code in {"idempotency_conflict", "runner_unavailable"}:
             raise HTTPException(status_code=409, detail=exc.as_dict()) from None
         raise HTTPException(status_code=400, detail=exc.as_dict()) from None
     # Идентичный повтор с тем же ключом возвращает прежний запуск (200), новый

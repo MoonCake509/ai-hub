@@ -159,7 +159,8 @@ def _idempotency_payload(project_id: str, template_id: str, goal: str,
 
 def create_run(project_id: str, template: dict, policy: dict | None = None,
                actor: str = "hub-token-holder", goal: str = "",
-               criteria: list | None = None, request_key: str | None = None) -> dict:
+               criteria: list | None = None, request_key: str | None = None,
+               require_ready_host: bool = False) -> dict:
     """Создаёт запуск: цель, критерии, policy и снимки фиксируются транзакцией.
 
     Повтор с тем же request_key и тем же содержимым возвращает прежний запуск;
@@ -192,6 +193,23 @@ def create_run(project_id: str, template: dict, policy: dict | None = None,
             raise RunError("idempotency_conflict",
                            "request_key уже занят другим содержимым запуска",
                            {"existing_run_id": existing["id"]})
+    if require_ready_host and template_id == templates.FIVE_ROLES_ID:
+        from . import workspace
+
+        if not project_snapshot["project_workdir"]:
+            raise RunError("no_workdir", "У проекта не указан рабочий каталог.")
+        checks = _project_checks(project_id)
+        if not checks:
+            raise RunError("no_check_plan", "В настройках проекта нет утверждённых проверок.")
+        try:
+            workspace.check_plan(project_id, checks)
+        except workspace.OpError as exc:
+            raise RunError(exc.code, str(exc)) from None
+        caps = workspace.host_capabilities(project_snapshot["project_host_id"])
+        if (caps.get("state") != "ok" or caps.get("isolated_runner_protocol") != 1
+                or "run_checks" not in (caps.get("workspace_ops") or [])):
+            raise RunError("runner_unavailable",
+                           "Воркер проекта не подтвердил готовность изолированного исполнителя проверок.")
     run_id = uuid.uuid4().hex
     with db._lock:
         conn = db.connect()

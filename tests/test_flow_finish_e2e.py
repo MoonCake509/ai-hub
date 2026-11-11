@@ -46,7 +46,8 @@ def main():
         image=subprocess.check_output(['/usr/bin/docker','image','inspect','--format','{{.Id}}','python:3.12-slim'],text=True).strip()
         assert re.fullmatch('sha256:[a-f0-9]{64}',image)
         admin.write_text(json.dumps({'allowed_roots':[str(workspace_dir)],'image':image,'docker':'/usr/bin/docker'}))
-        os.environ['AIHUB_ISOLATED_RUNNER_ARGV']=json.dumps([sys.executable,str(source/'tools/docker_check_runner.py'),'--config',str(admin)])
+        runner_argv=json.dumps([sys.executable,str(source/'tools/docker_check_runner.py'),'--config',str(admin)])
+        os.environ.pop('AIHUB_ISOLATED_RUNNER_ARGV', None)
         assert worker.beat()[0]==200
         from_ui='--from-ui' in sys.argv
         name='FLOW Browser Acceptance' if from_ui else 'FLOW finish fixture'
@@ -55,6 +56,11 @@ def main():
         request={'project_id':project['id'],'template_id':'five-roles','goal':'Set the fixture value to 2',
             'entry':'src/a.py','contracts':['docs/contract.md'],'criteria':['Actual assertion passes'],
             'request_key':uuid.uuid4().hex,'policy':{'max_cycles':1,'max_dispatches':10,'max_seconds':180}}
+        unavailable=api('POST','/runs',request,expected=409)
+        assert unavailable['detail']['code']=='runner_unavailable', unavailable
+        assert not api('GET','/runs?project_id='+project['id'])['items']
+        os.environ['AIHUB_ISOLATED_RUNNER_ARGV']=runner_argv
+        assert worker.beat()[0]==200
         if from_ui:
             run_id=None
             deadline=time.monotonic()+180

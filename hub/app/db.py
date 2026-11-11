@@ -362,6 +362,9 @@ DDL = [
         "alter table aihub.projects add column if not exists prepare_error jsonb",
         "alter table aihub.projects add column if not exists prepared_at timestamptz",
         "alter table aihub.projects add column if not exists request_key text",
+        "alter table aihub.projects add column if not exists index_sha text",
+        "alter table aihub.projects add column if not exists index_files int",
+        "alter table aihub.projects add column if not exists indexed_at timestamptz",
         "create unique index if not exists projects_request_key on aihub.projects(request_key)"
         " where request_key is not null",
     ]
@@ -1055,6 +1058,16 @@ def create_project(name: str, host_id: str = "laptop", workdir: str = "",
     if project is None:
         raise RuntimeError("project row disappeared after insert")
     return project
+
+
+def project_index_updated(project_id: str, head_sha: str, files: int) -> None:
+    """Карточка проекта: карта обновлена по этому коммиту."""
+    with _lock:
+        conn = connect()
+        with transaction(conn):
+            conn.run(_qualify(
+                "update aihub.projects set index_sha = :s, index_files = :f, indexed_at = now()"
+                " where id = :i"), s=head_sha, f=files, i=project_id)
 
 
 def project_by_request_key(key: str) -> dict | None:

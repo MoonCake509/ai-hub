@@ -33,7 +33,7 @@ import time
 import uuid
 import zipfile
 
-OPS = ["init_project", "write_reports", "inspect", "snapshot", "list_files", "read_files",
+OPS = ["init_project", "write_reports", "create_backup", "refresh_index", "inspect", "snapshot", "list_files", "read_files",
        "apply_patch", "run_checks", "package"]
 
 MAX_LIST = 200
@@ -440,6 +440,124 @@ def op_write_reports(root: str, args: dict) -> dict:
         os.replace(tmp, target)
         written.append(rel)
     return {"root": root, "written": written, "skipped": skipped}
+
+
+def _backup_table_row(cells: list[str]) -> str:
+    return "| " + " | ".join(str(c).replace("|", "\\|") for c in cells) + " |"
+
+
+def op_create_backup(root: str, args: dict) -> dict:
+    """Точка восстановления: zip зафиксированного коммита + строка в ops/BACKUPS.md.
+
+    Источник — `git archive HEAD`, поэтому точка соответствует конкретному SHA,
+    а не текущему содержимому каталога. Повтор с тем же ключом возвращает уже
+    созданный файл и не добавляет вторую строку в журнал.
+    """
+    import hashlib
+    import zipfile
+    from datetime import datetime, timezone
+
+    git_root = os.path.join(root, "repo")
+    if not os.path.isdir(os.path.join(git_root, ".git")):
+        git_root = root
+    code, head = _git(git_root, "rev-parse", "HEAD")
+    if code != 0 or not head:
+        raise OpFail("git_failed", "cannot read HEAD for backup")
+    head = head.strip()
+    label = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in str(args.get("label") or "backup"))[:48]
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    # Имя без времени: одна точка на коммит, повтор не плодит копии.
+    rel = f"ops/backups/{label}-{head[:8]}.zip"
+    target = os.path.join(root, *rel.split("/"))
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    if not os.path.isfile(target):
+        archive = subprocess.run(["git", "-C", git_root, "archive", "--format=zip",
+                                  f"--output={target}", "HEAD"],
+                                 capture_output=True, text=True, timeout=120)
+        if archive.returncode != 0:
+            raise OpFail("git_failed", f"git archive failed: {archive.stderr.strip()[:300]}")
+    digest = hashlib.sha256(open(target, "rb").read()).hexdigest()
+    size = os.path.getsize(target)
+    restore = f"git -C \"{git_root}\" checkout {head[:12]}"
+    journal = os.path.join(root, "ops", "BACKUPS.md")
+    row = _backup_table_row([label, stamp, head[:12], str(args.get("host") or "laptop"),
+                             f"`{rel}`", f"`{digest[:16]}`", f"`{restore}`"])
+    added = False
+    if os.path.isfile(journal):
+        with open(journal, encoding="utf-8") as fh:
+            text = fh.read()
+        if rel not in text:
+            if not text.endswith("\n"):
+                text += "\n"
+            text += row + "\n"
+            with open(journal, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(text)
+            added = True
+    return {"root": root, "path": rel, "sha256": digest, "size": size, "head_sha": head,
+            "journal_row_added": added, "restore": restore}
+
+
+INDEX_MAX_FILES = 2000
+
+
+def op_refresh_index(root: str, args: dict) -> dict:
+    """Карта проекта по зафиксированному коммиту: путь, размер, контрольная сумма.
+
+    Источник — `git ls-tree HEAD`, поэтому карта описывает коммит, а не текущее
+    состояние каталога. Одинаковый коммит даёт одинаковый файл: повтор не меняет
+    `ops/INDEX.md` и не создаёт версий в Git.
+    """
+    import hashlib
+
+    git_root = os.path.join(root, "repo")
+    if not os.path.isdir(os.path.join(git_root, ".git")):
+        git_root = root
+    code, head = _git(git_root, "rev-parse", "HEAD")
+    if code != 0 or not head:
+        raise OpFail("git_failed", "cannot read HEAD for index")
+    head = head.strip()
+    code, out = _git(git_root, "ls-tree", "-r", "--long", "HEAD")
+    if code != 0:
+        raise OpFail("git_failed", f"git ls-tree failed: {out[:200]}")
+    rows, total = [], 0
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        meta, _, path = line.partition("\t")
+        parts = meta.split()
+        if len(parts) < 4 or not path:
+            continue
+        size = parts[3]
+        target = os.path.join(git_root, *path.split("/"))
+        try:
+            with open(target, "rb") as fh:
+                digest = hashlib.sha256(fh.read()).hexdigest()[:16]
+        except OSError:
+            digest = "—"
+        rows.append(f"| `{path}` | {size} | `{digest}` |")
+        total += 1
+        if total >= INDEX_MAX_FILES:
+            break
+    body = [
+        "# Карта проекта",
+        "",
+        f"Коммит: `{head}` · файлов в карте: {total}",
+        "",
+        "| Путь | Байт | SHA-256 (16) |",
+        "| --- | --- | --- |",
+    ] + rows + ["", "Карта построена по зафиксированному коммиту; изменение файлов без коммита в ней не видно.", ""]
+    content = "\n".join(body)
+    target = os.path.join(root, "ops", "INDEX.md")
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    changed = True
+    if os.path.isfile(target):
+        with open(target, encoding="utf-8") as fh:
+            changed = fh.read() != content
+    if changed:
+        with open(target, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(content)
+    return {"root": root, "head_sha": head, "files": total, "changed": changed,
+            "path": "ops/INDEX.md", "digest": hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]}
 
 
 def op_inspect(root: str, args: dict) -> dict:
@@ -1096,6 +1214,8 @@ def op_package(root: str, args: dict, job_id: str = "") -> dict:
 HANDLERS = {
     "init_project": op_init_project,
     "write_reports": op_write_reports,
+    "create_backup": op_create_backup,
+    "refresh_index": op_refresh_index,
     "inspect": op_inspect,
     "snapshot": op_snapshot,
     "list_files": op_list_files,

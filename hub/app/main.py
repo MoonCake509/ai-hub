@@ -788,6 +788,78 @@ async def _prepare_project(project: dict, name: str, host_id: str, settings: dic
     return project
 
 
+def _ensure_restore_point(project: dict, label: str) -> dict:
+    """Точка восстановления до старта работы, если проект её требует.
+
+    Кодер не стартует без подтверждённой точки: задание на бэкап создаётся
+    хабом, ждём его отчёт с контрольной суммой. Отчёт с ошибкой — отказ старта.
+    """
+    settings = project.get("settings") if isinstance(project.get("settings"), dict) else {}
+    if not settings.get("backup_required"):
+        return {"ok": True, "skipped": "backup not required"}
+    root = str(project.get("workdir") or "").strip()
+    if not root:
+        return {"ok": False, "error": "project has no workdir"}
+    job = workspace.create_op_job(
+        "create_backup", {"root": root, "label": label,
+                          "host": str(project.get("host_id") or "laptop")},
+        str(project.get("host_id") or "laptop"), str(project.get("id") or ""),
+        f"backup:{project.get('id')}:{project.get('head_sha') or ''}:{label}", 180)
+    job_id = job["job"]["id"]
+    final = _wait_workspace_job(job_id, int(os.environ.get("BACKUP_WAIT_S", "180")))
+    if final.get("status") != "succeeded":
+        return {"ok": False, "error": final.get("error") or "backup job failed", "job": job_id}
+    report = final.get("result")
+    if not isinstance(report, dict):
+        try:
+            report = json.loads(final.get("result_output") or "{}")
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "backup report is not json", "job": job_id}
+    if not report.get("sha256") or not report.get("path"):
+        return {"ok": False, "error": "backup report has no checksum", "job": job_id}
+    return {"ok": True, "job": job_id, "path": report.get("path"),
+            "sha256": report.get("sha256"), "head_sha": report.get("head_sha")}
+
+
+@app.post("/projects/{project_id}/backups", dependencies=[Depends(require_token)])
+def create_project_backup(project_id: str, label: str = "manual") -> dict:
+    """Поставить точку восстановления вручную и дописать журнал ops/BACKUPS.md."""
+    project = db.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="project not found")
+    result = _ensure_restore_point({**project, "settings": {"backup_required": True}}, label)
+    if not result.get("ok"):
+        raise HTTPException(status_code=409, detail=result)
+    return result
+
+
+@app.post("/projects/{project_id}/index/refresh", dependencies=[Depends(require_token)])
+def refresh_project_index(project_id: str) -> dict:
+    """Архивариус: карта проекта по зафиксированному коммиту, отметка в карточке."""
+    project = db.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="project not found")
+    root = str(project.get("workdir") or "").strip()
+    if not root:
+        raise HTTPException(status_code=409, detail={"code": "no_workdir"})
+    try:
+        job = workspace.create_op_job(
+            "refresh_index", {"root": root}, str(project.get("host_id") or "laptop"),
+            project_id, f"index:{project_id}:{project.get('head_sha') or ''}", 180)
+    except workspace.OpError as exc:
+        raise HTTPException(status_code=400, detail={"code": exc.code, "message": str(exc)}) from exc
+    job_id = job["job"]["id"]
+    final = _wait_workspace_job(job_id, int(os.environ.get("INDEX_WAIT_S", "180")))
+    if final.get("status") != "succeeded":
+        raise HTTPException(status_code=409, detail={"code": "index_failed",
+                                                     "message": final.get("error"), "job": job_id})
+    report = final.get("result") if isinstance(final.get("result"), dict) else {}
+    if not report.get("digest"):
+        raise HTTPException(status_code=409, detail={"code": "index_report_invalid", "job": job_id})
+    db.project_index_updated(project_id, str(report.get("head_sha") or ""), int(report.get("files") or 0))
+    return {"job": job_id, **report}
+
+
 @app.post("/projects/{project_id}/reports/sync", dependencies=[Depends(require_token)])
 def sync_project_reports(project_id: str, run_id: str | None = None) -> dict:
     """Собрать ops/TASKFLOW.md и черновики PR по прогону и записать их на хост."""
@@ -1633,6 +1705,12 @@ async def run_create(request: Request) -> JSONResponse:
     project = await asyncio.to_thread(db.get_project, project_id)
     if not project:
         raise HTTPException(status_code=404, detail="project not found")
+    restore = await asyncio.to_thread(_ensure_restore_point, project,
+                                      str(request_key or "run")[:48] or "run")
+    if not restore.get("ok"):
+        raise HTTPException(status_code=409, detail={"code": "backup_unconfirmed",
+                                                     "message": restore.get("error"),
+                                                     "job": restore.get("job")})
     try:
         result = await asyncio.to_thread(
             runs_ctrl.create_run, project_id, payload.get("template") or {},

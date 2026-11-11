@@ -28,6 +28,8 @@ from . import db, workers, security_policy
 OPS = {
     "init_project": "рабочая папка проекта: шаблон, git init и первый коммит",
     "write_reports": "живые отчёты проекта в ops/: журнал и черновики PR",
+    "create_backup": "точка восстановления: zip коммита и строка в ops/BACKUPS.md",
+    "refresh_index": "карта проекта ops/INDEX.md по зафиксированному коммиту",
     "inspect": "канонический корень, git HEAD/status digest, возможности host",
     "snapshot": "управляемая копия и зафиксированное базовое состояние",
     "list_files": "ограниченный список путей с размерами и хешами",
@@ -42,7 +44,8 @@ OPS = {
 # управляемую область воркера и не должны блокировать кодеров.
 WRITES_ROOT = {"apply_patch"}
 # Операции, меняющие управляемое состояние: им нужен idempotency key по умолчанию.
-MUTATING = {"snapshot", "apply_patch", "package", "init_project", "write_reports"}
+MUTATING = {"snapshot", "apply_patch", "package", "init_project", "write_reports",
+            "create_backup", "refresh_index"}
 
 MAX_LIST = 200
 MAX_READ_FILES = 8
@@ -176,11 +179,19 @@ def validate(op: str, args: dict | None) -> dict:
                            "changes", "checks", "snapshot_id", "include",
                            "base_tree_digest", "name", "branch", "author_name",
                            "author_email", "template_version", "template_files",
-                           "repo_subdir", "reports"}
+                           "repo_subdir", "reports", "label", "host"}
     if unknown:
         raise OpError("bad_arg", "лишние поля: " + ", ".join(sorted(unknown)))
     root = canon(_str(args.get("root"), "root", 400))
     clean: dict = {"root": root}
+
+    if op == "refresh_index":
+        return clean
+
+    if op == "create_backup":
+        clean["label"] = _str(args.get("label"), "label", 48) or "backup"
+        clean["host"] = _str(args.get("host"), "host", 64) or "laptop"
+        return clean
 
     if op == "write_reports":
         reports = args.get("reports")

@@ -190,7 +190,9 @@ def collect_evidence(project: dict, sha: str, goal: str, budget_tokens: int = 20
         return [], {"state": "embed_failed", "sha": sha, "reason": str(exc)[:300]}
     if not vectors:
         return [], {"state": "no_vectors", "sha": sha}
-    found = search(project_id, vectors, sha, limit=12, models_map=models_map)
+    # Пустая карта моделей означает «фильтр неизвестен»: иначе сравнение с "" отбросит всё.
+    found = search(project_id, vectors, sha, limit=12,
+                   models_map=models_map or None)
     candidates: list[dict] = []
     for hit in found.get("matches") or []:
         if float(hit.get("score") or 0) <= 0:

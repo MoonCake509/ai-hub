@@ -33,7 +33,9 @@ import time
 import uuid
 import zipfile
 
-OPS = ["init_project", "write_reports", "create_backup", "refresh_index", "search_git", "read_at", "describe_files", "inspect", "snapshot", "list_files", "read_files",
+OPS = ["init_project", "write_reports", "create_backup", "refresh_index", "task_start", "verify_task", "task_merge", "setup_env",
+       "archive_artifacts", "publish_branch",
+       "search_git", "read_at", "describe_files", "inspect", "snapshot", "list_files", "read_files",
        "apply_patch", "run_checks", "package"]
 
 MAX_LIST = 200
@@ -521,6 +523,242 @@ def _is_secret_path(rel: str) -> bool:
 def _git_blob(git_root: str, path: str) -> bytes | None:
     code, out = _git(git_root, "show", f"HEAD:{path}")
     return out.encode("utf-8") if code == 0 else None
+
+
+def _repo_dir(root: str) -> str:
+    candidate = os.path.join(root, "repo")
+    # В рабочей копии задачи `.git` — файл-указатель на общий репозиторий.
+    return candidate if os.path.exists(os.path.join(candidate, ".git")) else root
+
+
+def op_task_start(root: str, args: dict) -> dict:
+    """Отдельная рабочая копия задачи: worktree от зафиксированного SHA.
+
+    Копия живёт в `<проект>/runs/<run>`: внутри `repo/` — рабочий каталог ветки
+    задачи, `ops/` — копия журналов на момент старта. Основная копия не меняется.
+    """
+    import shutil
+
+    run_id = str(args.get("run_id") or "")
+    branch = str(args.get("branch") or "")
+    base_sha = str(args.get("base_sha") or "")
+    if not run_id or not branch:
+        raise OpFail("bad_arg", "run_id и branch обязательны")
+    repo = _repo_dir(root)
+    task_root = os.path.join(root, "runs", run_id[:8])
+    task_repo = os.path.join(task_root, "repo")
+    if os.path.isdir(task_repo):
+        code, head = _git(task_repo, "rev-parse", "HEAD")
+        _, current = _git(task_repo, "rev-parse", "--abbrev-ref", "HEAD")
+        return {"task_root": task_root, "branch": current.strip() or branch,
+                "base_sha": base_sha, "head_sha": head.strip(), "created": False}
+    if not base_sha:
+        code, head = _git(repo, "rev-parse", "HEAD")
+        if code != 0:
+            raise OpFail("git_failed", "cannot read HEAD for task start")
+        base_sha = head.strip()
+    os.makedirs(os.path.join(root, "runs"), exist_ok=True)
+    code, out = _git(repo, "rev-parse", "--verify", f"refs/heads/{branch}")
+    if code == 0:
+        code, out = _git(repo, "worktree", "add", task_repo, branch)
+    else:
+        code, out = _git(repo, "worktree", "add", "-b", branch, task_repo, base_sha)
+    if code != 0:
+        raise OpFail("git_failed", f"git worktree add failed: {out[:300]}")
+    src_ops = os.path.join(root, "ops")
+    if os.path.isdir(src_ops):
+        shutil.copytree(src_ops, os.path.join(task_root, "ops"), dirs_exist_ok=True,
+                        ignore=shutil.ignore_patterns("backups", "runs"))
+    code, head = _git(task_repo, "rev-parse", "HEAD")
+    return {"task_root": task_root, "branch": branch, "base_sha": base_sha,
+            "head_sha": head.strip(), "created": True}
+
+
+def op_verify_task(root: str, args: dict) -> dict:
+    """Сверка рабочей папки и ветки задания перед записью.
+
+    Несовпадение ветки или коммита — отказ до изменения файлов.
+    """
+    repo = _repo_dir(root)
+    want_branch = str(args.get("branch") or "")
+    want_head = str(args.get("head_sha") or "")
+    code, head = _git(repo, "rev-parse", "HEAD")
+    if code != 0:
+        raise OpFail("git_failed", f"не Git-репозиторий: {root}")
+    _, branch = _git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    branch = branch.strip()
+    head = head.strip()
+    if want_branch and branch != want_branch:
+        raise OpFail("task_mismatch", f"ветка задания {want_branch}, в копии {branch}")
+    if want_head and head != want_head:
+        raise OpFail("task_mismatch", f"коммит задания {want_head[:12]}, в копии {head[:12]}")
+    return {"root": repo, "branch": branch, "head_sha": head,
+            "dirty": bool((_git(repo, "status", "--porcelain")[1] or "").strip())}
+
+
+def op_task_merge(root: str, args: dict) -> dict:
+    """Слияние проверенного коммита в основную ветку только через --ff-only.
+
+    Под блокировкой проекта: если основная ветка сдвинулась, слияние не делается,
+    ветка задачи сохраняется, а в ответе — причина и текущие коммиты.
+    """
+    import time as _time
+
+    repo = _repo_dir(root)
+    branch = str(args.get("branch") or "")
+    sha = str(args.get("sha") or "")
+    target = str(args.get("target") or "main")
+    if not branch or not sha:
+        raise OpFail("bad_arg", "branch и sha обязательны")
+    # Слияние выполняется в основной рабочей копии: целевая ветка может быть
+    # занята ею, а не копией задачи.
+    code, listed = _git(repo, "worktree", "list", "--porcelain")
+    if code == 0 and listed.strip():
+        primary = listed.splitlines()[0].replace("worktree ", "").strip()
+        if primary:
+            repo = primary
+    code, git_dir = _git(repo, "rev-parse", "--git-dir")
+    if code != 0:
+        raise OpFail("git_failed", f"не Git-репозиторий: {root}")
+    git_dir = git_dir.strip()
+    if not os.path.isabs(git_dir):
+        git_dir = os.path.join(repo, git_dir)
+    lock_path = os.path.join(git_dir, "aihub-merge.lock")
+    locked = False
+    for _ in range(50):
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            locked = True
+            break
+        except FileExistsError:
+            _time.sleep(0.2)
+    if not locked:
+        raise OpFail("locked", "проект занят слиянием")
+    try:
+        code, out = _git(repo, "checkout", target)
+        if code != 0:
+            raise OpFail("git_failed", f"checkout {target}: {out[:200]}")
+        code, target_head = _git(repo, "rev-parse", "HEAD")
+        code, merged = _git(repo, "merge", "--ff-only", sha)
+        if code != 0:
+            return {"merged": False, "reason": "base_moved", "target": target,
+                    "target_head": target_head.strip(), "task_sha": sha,
+                    "message": "основная ветка сдвинулась: обновите базу и повторите проверки",
+                    "task_branch": branch}
+        code, head = _git(repo, "rev-parse", "HEAD")
+        head = head.strip()
+        if head != sha:
+            return {"merged": False, "reason": "sha_mismatch", "target_head": head,
+                    "task_sha": sha, "task_branch": branch}
+        return {"merged": True, "sha": head, "target": target, "task_branch": branch,
+                "previous_head": target_head.strip()}
+    finally:
+        try:
+            os.unlink(lock_path)
+        except OSError:
+            pass
+
+
+def op_setup_env(root: str, args: dict) -> dict:
+    """Команды подготовки среды проекта — в рабочей копии задачи, до кодера."""
+    repo = _repo_dir(root)
+    cmd = args.get("cmd") or []
+    if not isinstance(cmd, list) or not cmd or not all(isinstance(x, str) and x for x in cmd):
+        raise OpFail("bad_arg", "cmd: нужен непустой список строк")
+    timeout_s = max(1, min(600, int(args.get("timeout_s") or 180)))
+    try:
+        proc = subprocess.run(cmd, cwd=repo, capture_output=True, text=True,
+                              timeout=timeout_s, shell=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise OpFail("setup_failed", f"подготовка среды не выполнена: {exc}") from exc
+    out, err = (proc.stdout or "")[-4000:], (proc.stderr or "")[-2000:]
+    if proc.returncode != 0:
+        raise OpFail("setup_failed",
+                     f"подготовка среды вернула {proc.returncode}: {(err or out)[:300]}")
+    return {"ok": True, "exit_code": proc.returncode, "stdout_tail": out, "stderr_tail": err,
+            "cmd": cmd, "cwd": repo}
+
+
+def op_archive_artifacts(root: str, args: dict) -> dict:
+    """Журнал зарегистрированных артефактов запуска в ops/ARTIFACTS.md.
+
+    Переносятся только зарегистрированные артефакты; исходники и неизвестные
+    файлы не трогаются. Повтор по тому же запуску заменяет его раздел.
+    """
+    import hashlib
+
+    run_id = str(args.get("run_id") or "")
+    items = args.get("artifacts") or []
+    if not run_id or not isinstance(items, list):
+        raise OpFail("bad_arg", "run_id и artifacts обязательны")
+    if not items:
+        import glob as _glob
+        items = []
+        for pattern in ("ops/pr/*.md", "ops/INDEX.md", "ops/BACKUPS.md"):
+            for found in sorted(_glob.glob(os.path.join(root, pattern))):
+                items.append({"path": os.path.relpath(found, root).replace(os.sep, "/")})
+        zips = sorted(_glob.glob(os.path.join(root, "ops/backups/*.zip")),
+                      key=lambda f: os.path.getmtime(f), reverse=True)[:3]
+        for found in zips:
+            items.append({"path": os.path.relpath(found, root).replace(os.sep, "/")})
+    target = os.path.join(root, "ops", "ARTIFACTS.md")
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    head = "# Артефакты запусков\n\nЗарегистрированные артефакты и их версии. Исходники не переносятся: за них отвечает Git.\n"
+    text = ""
+    if os.path.isfile(target):
+        with open(target, encoding="utf-8") as fh:
+            text = fh.read()
+    else:
+        text = head
+    marker = f"## {run_id}"
+    block = [marker, "",
+             f"Коммит: `{args.get('sha') or '—'}` · ветка: `{args.get('branch') or '—'}`", "",
+             "| Артефакт | Версия | Ссылка |", "| --- | --- | --- |"]
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or "")
+        if not path:
+            continue
+        full = path if os.path.isabs(path) else os.path.join(root, path)
+        digest = str(item.get("sha256") or "")
+        if not digest and os.path.isfile(full):
+            h = hashlib.sha256()
+            with open(full, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(chunk)
+            digest = h.hexdigest()
+        block.append(f"| `{os.path.basename(path) or path}` | `{digest[:16] or '—'}` | `{path}` |")
+    block.append("")
+    if marker in text:
+        head_part, _, rest = text.partition(marker)
+        _, _, after = rest.partition("\n\n## ")
+        tail = ("\n\n## " + after) if after else ""
+        text = head_part.rstrip() + "\n\n" + "\n".join(block) + tail
+    else:
+        text = text.rstrip() + "\n\n" + "\n".join(block)
+    with open(target, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(text)
+    return {"path": "ops/ARTIFACTS.md", "run_id": run_id, "artifacts": len(items),
+            "digest": hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]}
+
+
+def op_publish_branch(root: str, args: dict) -> dict:
+    """Публикация ветки в настроенный remote — только если проект это разрешил."""
+    repo = _repo_dir(root)
+    branch = str(args.get("branch") or "")
+    remote = str(args.get("remote") or "origin")
+    if not branch:
+        raise OpFail("bad_arg", "branch обязателен")
+    code, url = _git(repo, "remote", "get-url", remote)
+    if code != 0 or not url.strip():
+        raise OpFail("no_remote", f"remote {remote} не настроен")
+    code, out = _git(repo, "push", "-u", remote, branch)
+    if code != 0:
+        raise OpFail("push_failed", f"git push: {(out or '')[:300]}")
+    return {"pushed": True, "remote": remote, "branch": branch, "url": url.strip(),
+            "output": (out or "")[-1000:]}
 
 
 def op_refresh_index(root: str, args: dict) -> dict:
@@ -1379,6 +1617,12 @@ HANDLERS = {
     "search_git": op_search_git,
     "read_at": op_read_at,
     "describe_files": op_describe_files,
+    "task_start": op_task_start,
+    "verify_task": op_verify_task,
+    "task_merge": op_task_merge,
+    "setup_env": op_setup_env,
+    "archive_artifacts": op_archive_artifacts,
+    "publish_branch": op_publish_branch,
     "inspect": op_inspect,
     "snapshot": op_snapshot,
     "list_files": op_list_files,

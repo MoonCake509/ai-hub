@@ -124,6 +124,48 @@ def build_taskflow(project: dict, run: dict) -> str:
     return "\n".join(lines)
 
 
+def build_end(project: dict, run: dict) -> str:
+    """Итог последней принятой работы: версия, ветка, слияние, шаги."""
+    tasks = run.get("tasks") or []
+    merged = str(run.get("merged_sha") or "").strip()
+    candidate = str(run.get("candidate_sha") or "").strip()
+    version = merged or candidate or _short(project.get("head_sha"))
+    lines = [
+        f"# Итог последней работы — {project.get('name') or project.get('id')}",
+        "",
+        f"Версия: `{version}`  ",
+        f"Ветка: `{run.get('task_branch') or run.get('branch') or project.get('branch') or 'main'}` · "
+        f"состояние: {_label(run.get('state'))} · слияние: {run.get('merge_state') or '—'}",
+        "",
+        "## Что принято",
+        "",
+        str(run.get("goal") or ""),
+        "",
+        "## Шаги",
+        "",
+        "| Шаг | Роль | Статус |",
+        "| --- | --- | --- |",
+    ]
+    for task in tasks:
+        lines.append(f"| `{task.get('key')}` | {task.get('role')} | {_label(task.get('state'))} |")
+    receipt = run.get("check_receipt") if isinstance(run.get("check_receipt"), dict) else {}
+    rows = _check_rows(receipt)
+    lines += ["", "## Проверки", ""]
+    if rows:
+        lines += ["| Проверка | Итог | Код | Команда |", "| --- | --- | --- | --- |"] + rows
+    else:
+        lines.append("Проверки не зафиксированы.")
+    lines += ["", "## Слияние", ""]
+    if merged:
+        lines.append(f"Проверенный коммит `{merged}` слит в основную ветку fast-forward.")
+    elif run.get("merge_state"):
+        lines.append(f"Слияние не выполнено: {run.get('merge_state')}.")
+    else:
+        lines.append("Слияние ещё не выполнялось.")
+    lines += ["", f"Артефакты запуска: `ops/ARTIFACTS.md` (прогон `{run.get('id')}`).", ""]
+    return "\n".join(lines)
+
+
 def build_pr_drafts(project: dict, run: dict) -> dict[str, str]:
     """Один черновик на шаг: роль, задание, проверки, изменения, ревью."""
     drafts: dict[str, str] = {}
@@ -214,7 +256,8 @@ def sync_project(project_id: str, run_id: str | None = None, timeout_s: int = 12
     if not run:
         return {"ok": False, "error": "run not found"}
     files = {"ops/TASKFLOW.md": build_taskflow(project, run),
-             "ops/ENVIRONMENTS.md": build_environments(project, run)}
+             "ops/ENVIRONMENTS.md": build_environments(project, run),
+             "ops/END.md": build_end(project, run)}
     files.update(build_pr_drafts(project, run))
     reports = [{"path": path, "content": content} for path, content in sorted(files.items())]
     root = str(project.get("workdir") or "").strip()

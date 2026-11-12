@@ -40,6 +40,12 @@ OPS = {
     "apply_patch": "проверка write_set/preimages, применение, receipt и tree digest",
     "run_checks": "утверждённый check plan в тестовой среде",
     "package": "проверенный review bundle и manifest",
+    "task_start": "отдельная рабочая копия задачи от зафиксированного коммита",
+    "verify_task": "сверка рабочей папки и ветки задания перед записью",
+    "task_merge": "слияние проверенного коммита в основную ветку через --ff-only",
+    "setup_env": "команды подготовки среды в рабочей копии задачи",
+    "archive_artifacts": "журнал зарегистрированных артефактов запуска",
+    "publish_branch": "публикация ветки в настроенный remote",
 }
 
 # Операции, которые меняют рабочее дерево пользователя: только они берут
@@ -48,7 +54,8 @@ OPS = {
 WRITES_ROOT = {"apply_patch"}
 # Операции, меняющие управляемое состояние: им нужен idempotency key по умолчанию.
 MUTATING = {"snapshot", "apply_patch", "package", "init_project", "write_reports",
-            "create_backup", "refresh_index"}
+            "create_backup", "refresh_index", "task_start", "task_merge", "setup_env",
+            "archive_artifacts", "publish_branch"}
 
 MAX_LIST = 200
 MAX_READ_FILES = 8
@@ -183,7 +190,9 @@ def validate(op: str, args: dict | None) -> dict:
                            "base_tree_digest", "name", "branch", "author_name",
                            "author_email", "template_version", "template_files",
                            "repo_subdir", "reports", "label", "host",
-                           "q", "path", "sha256", "length"}
+                           "q", "path", "sha256", "length",
+                           "run_id", "head_sha", "base_sha", "sha", "target", "cmd", "timeout_s",
+                           "artifacts", "remote"}
     if unknown:
         raise OpError("bad_arg", "лишние поля: " + ", ".join(sorted(unknown)))
     root = canon(_str(args.get("root"), "root", 400))
@@ -212,6 +221,61 @@ def validate(op: str, args: dict | None) -> dict:
         clean["path"] = rel
         clean["sha256"] = _str(args.get("sha256"), "sha256", 64)
         clean["length"] = _int(args.get("length", 64 * 1024), 1, MAX_READ_BYTES, "length")
+        return clean
+
+    if op == "task_start":
+        clean["run_id"] = _str(args.get("run_id"), "run_id", 64)
+        clean["branch"] = _str(args.get("branch"), "branch", 120)
+        clean["base_sha"] = _str(args.get("base_sha"), "base_sha", 64)
+        if not clean["run_id"] or not clean["branch"]:
+            raise OpError("bad_arg", "run_id и branch обязательны")
+        return clean
+
+    if op == "verify_task":
+        clean["branch"] = _str(args.get("branch"), "branch", 120)
+        clean["head_sha"] = _str(args.get("head_sha"), "head_sha", 64)
+        return clean
+
+    if op == "task_merge":
+        clean["branch"] = _str(args.get("branch"), "branch", 120)
+        clean["sha"] = _str(args.get("sha"), "sha", 64)
+        clean["target"] = _str(args.get("target"), "target", 120) or "main"
+        if not clean["branch"] or not clean["sha"]:
+            raise OpError("bad_arg", "branch и sha обязательны")
+        return clean
+
+    if op == "setup_env":
+        cmd = args.get("cmd")
+        if not isinstance(cmd, list) or not cmd or len(cmd) > 20 \
+                or not all(isinstance(x, str) and x.strip() for x in cmd):
+            raise OpError("bad_arg", "cmd: непустой список строк")
+        clean["cmd"] = cmd
+        clean["timeout_s"] = _int(args.get("timeout_s", 180), 1, 600, "timeout_s")
+        return clean
+
+    if op == "archive_artifacts":
+        clean["run_id"] = _str(args.get("run_id"), "run_id", 64)
+        clean["sha"] = _str(args.get("sha"), "sha", 64)
+        clean["branch"] = _str(args.get("branch"), "branch", 120)
+        items = args.get("artifacts") or []
+        if not clean["run_id"] or not isinstance(items, (list, type(None))) or len(items or []) > 50:
+            raise OpError("bad_arg", "run_id обязателен, artifacts — до 50")
+        rows = []
+        for item in items:
+            if not isinstance(item, dict):
+                raise OpError("bad_arg", "artifacts[]: ожидался объект")
+            path = _str(item.get("path"), "path", 400)
+            if not path:
+                raise OpError("bad_arg", "artifacts[].path: путь обязателен")
+            rows.append({"path": path, "sha256": _str(item.get("sha256"), "sha256", 64)})
+        clean["artifacts"] = rows
+        return clean
+
+    if op == "publish_branch":
+        clean["branch"] = _str(args.get("branch"), "branch", 120)
+        clean["remote"] = _str(args.get("remote"), "remote", 100) or "origin"
+        if not clean["branch"]:
+            raise OpError("bad_arg", "branch обязателен")
         return clean
 
     if op == "create_backup":

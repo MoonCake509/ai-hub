@@ -1847,6 +1847,27 @@ async def run_create(request: Request) -> JSONResponse:
         if exc.code in {"idempotency_conflict", "runner_unavailable"}:
             raise HTTPException(status_code=409, detail=exc.as_dict()) from None
         raise HTTPException(status_code=400, detail=exc.as_dict()) from None
+    if not result.get("existing"):
+        # Отдельная рабочая копия задачи от зафиксированного SHA: кодер и все
+        # проверки работают в ней, основная ветка до приёмки не меняется.
+        try:
+            copy = await asyncio.to_thread(runs_ctrl.start_task_copy, project_id,
+                                           result["run_id"])
+        except runs_ctrl.RunError as exc:
+            raise HTTPException(status_code=409, detail={
+                "code": exc.code, "message": str(exc), "run_id": result["run_id"]}) from None
+        result["task_root"] = copy.get("task_root")
+        result["task_branch"] = copy.get("branch")
+        result["base_sha"] = copy.get("base_sha")
+        settings = project.get("settings") if isinstance(project.get("settings"), dict) else {}
+        setup = settings.get("env_setup") if isinstance(settings.get("env_setup"), dict) else {}
+        if setup.get("cmd"):
+            prepared = await asyncio.to_thread(runs_ctrl.setup_env, result["run_id"], setup)
+            if not prepared.get("ok"):
+                raise HTTPException(status_code=409, detail={
+                    "code": "setup_failed", "message": prepared.get("error"),
+                    "run_id": result["run_id"]})
+            result["env_setup"] = "ok"
     # Идентичный повтор с тем же ключом возвращает прежний запуск (200), новый
     # запрос — 202. Расхождение содержимого под тем же ключом — 409 выше.
     status = 200 if result.get("existing") else 202

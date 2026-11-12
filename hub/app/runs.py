@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 import uuid
 
 from . import db, flow_gates, packets, templates
@@ -528,6 +529,8 @@ def dispatch(run_id: str, resolve_agent, max_queue: int = 50) -> dict:
                     event(conn, run_id, task["id"], "task_waiting_input",
                           {"reason": role_block})
                     continue
+                # Сверку папки и ветки делает воркер перед запуском агента:
+                # несовпадение останавливает шаг до изменения файлов.
                 assignment = dict(assignments.get(task["key"]) or {})
                 agent_id = assignment.get("agent_id") or task.get("agent") or ""
                 bridge_agent, error = resolve_agent(agent_id)
@@ -578,6 +581,9 @@ def dispatch(run_id: str, resolve_agent, max_queue: int = 50) -> dict:
                     "project_host_id": project_snapshot.get("project_host_id") or "",
                     "project_workdir": project_snapshot.get("project_workdir") or "",
                     "workdir": project_snapshot.get("project_workdir") or "",
+                    "task_branch": run.get("task_branch") or "",
+                    "expect_head": (run.get("candidate_sha") or "")
+                                   if (task.get("role") or "") in ("tester", "reviewer") else "",
                     "packet_id": (packet or {}).get("id") or task.get("context_id"),
                     "packet_revision": int((packet or {}).get("revision") or 0) or None,
                     "candidate_digest": run.get("candidate_digest"),
@@ -830,17 +836,97 @@ def on_task_result(job_id: str, ok: bool, error: str | None = None) -> dict | No
     Отчёты пишутся после фиксации состояния в БД и вне транзакции: сбой отчёта
     не откатывает шаг, а сам шаг виден в журнале сразу.
     """
+    if not ok and _retry_lost_job(job_id):
+        try:
+            run = get_run(str((db._one(db.connect(), db._qualify(
+                "select run_id from aihub.run_tasks where job_id = :j"), j=job_id) or {})
+                .get("run_id") or ""))
+            if run:
+                from . import reports as reports_ctrl
+                reports_ctrl.sync_quiet(str(run["project_id"]))
+        except Exception:  # noqa: BLE001
+            pass
+        return None
     result = _apply_task_result(job_id, ok, error)
     if result:
         try:
             run = get_run(str(result.get("run_id") or ""))
             project_id = (run or {}).get("project_id")
+            if run:
+                _after_step(run, job_id)
             if project_id:
                 from . import reports as reports_ctrl
                 reports_ctrl.sync_quiet(str(project_id))
         except Exception:  # noqa: BLE001
             pass
     return result
+
+
+def _retry_lost_job(job_id: str) -> bool:
+    """Потерянная аренда (unknown/timeout) не приговор: шаг тестера/ревьюера
+    возвращается в очередь, пока попыток меньше двух. Файлы не меняются, Sha
+    кандидата остаётся прежним, поэтому повтор безопасен.
+    """
+    job = db.get_job(job_id) or {}
+    if job.get("status") not in ("unknown", "timeout"):
+        return False
+    with db._lock:
+        conn = db.connect()
+        row = db._one(conn, db._qualify(
+            "select t.id, t.run_id, t.key, t.role, t.attempt from aihub.run_tasks t"
+            " where t.job_id = :j limit 1"), j=job_id)
+        if not row:
+            return False
+        role = row.get("role") or ""
+        if role not in ("tester", "reviewer"):
+            return False
+        if int(row.get("attempt") or 0) >= 2:
+            return False
+        db._one(conn, db._qualify(
+            "update aihub.run_tasks set state = 'pending', job_id = null, error = null,"
+            " updated_at = now() where id = :i and state = 'dispatched' returning id"),
+            i=row["id"])
+        event(conn, row["run_id"], row["id"], "task_retry",
+              {"reason": f"задание {job.get('status')}: аренда потеряна, шаг повторяется",
+               "attempt": int(row.get("attempt") or 0) + 1})
+    return True
+
+
+def _after_step(run: dict, job_id: str) -> None:
+    """Фиксирует коммит кандидата и закрывает запуск слиянием принятого SHA."""
+    if not run.get("task_root"):
+        return
+    row = db._one(db.connect(), db._qualify(
+        "select role, key from aihub.run_tasks where job_id = :j limit 1"), j=job_id)
+    role = (row or {}).get("role") or ""
+    run_id = run["id"]
+    if role == "coder" and not run.get("candidate_sha"):
+        final = _task_op(run, db.get_project(run["project_id"]) or {}, "verify_task",
+                         {"branch": run.get("task_branch") or "", "head_sha": ""},
+                         wait_s=30, key=f"run:{run_id}:head:{int(time.time())}")
+        head_sha = ((final.get("result") or {}).get("head_sha") or "").strip()
+        if final.get("status") == "succeeded" and head_sha:
+            db.set_run_candidate_sha(run_id, head_sha)
+            event_ref = "commit_missing" if head_sha == (run.get("base_sha") or "") else "commit_ready"
+            _event(run_id, None, event_ref,
+                   {"sha": head_sha, "base_sha": run.get("base_sha")})
+    fresh = get_run(run_id) or {}
+    if fresh.get("state") != "done" or fresh.get("merge_state"):
+        return
+    project = db.get_project(fresh["project_id"]) or {}
+    merged = merge_task(run_id)
+    fresh = get_run(run_id) or fresh
+    if merged.get("merged"):
+        try:
+            _archive_run(fresh, project)
+        except Exception as exc:  # noqa: BLE001 — журнал не должен ронять приёмку
+            _event(run_id, None, "artifacts_failed", {"reason": str(exc)[:300]})
+        try:
+            from . import reports as reports_ctrl
+            reports_ctrl.sync_project(run["project_id"])
+        except Exception as exc:  # noqa: BLE001 — отчёты не должны ронять приёмку
+            _event(run_id, None, "reports_failed", {"reason": str(exc)[:300]})
+        publish_run(fresh, project)
 
 def _restart_from_coder(conn, task: dict, decision: dict,
                         feedback: dict | None = None) -> None:
@@ -958,9 +1044,10 @@ def _advance_pipeline(conn, run: dict) -> None:
             return
         try:
             from . import workspace
+            project_snapshot = _as_json(run.get("project_snapshot"), {}) or {}
             job = workspace.create_op_job(
                 "run_checks",
-                {"root": project.get("workdir") or "",
+                {"root": project_snapshot.get("project_workdir") or project.get("workdir") or "",
                  "snapshot_id": run.get("candidate_snapshot_id") or "",
                  "checks": checks},
                 project.get("host_id") or "", run["project_id"],
@@ -1042,6 +1129,230 @@ def _infra_fail(conn, run: dict, pipeline: dict, reason: str, save,
 def workspace_job(job_id: str) -> dict | None:
     from . import workspace
     return workspace.job_result(job_id)
+
+
+def _event(run_id: str, task_id: str | None, name: str, payload: dict | None = None) -> None:
+    """Событие запуска вне транзакции шага: сбой журнала не отменяет результат."""
+    try:
+        with db._lock:
+            conn = db.connect()
+            event(conn, run_id, task_id, name, payload)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _wait_job(job_id: str, wait_s: int = 60) -> dict:
+    deadline = time.time() + max(1, wait_s)
+    final: dict = {}
+    while time.time() < deadline:
+        try:
+            final = workspace_job(job_id) or {}
+        except Exception as exc:  # noqa: BLE001
+            return {"status": "unknown", "error": str(exc)}
+        if final.get("status") in ("succeeded", "failed", "cancelled", "timeout", "unknown"):
+            return final
+        time.sleep(0.5)
+    return final or {"status": "timeout"}
+
+
+def _task_op(run: dict, project: dict, op: str, args: dict, wait_s: int = 60,
+             key: str | None = None, root: str | None = None) -> dict:
+    """Операция воркера над рабочей копией задачи. Возвращает финальное задание."""
+    from . import workspace
+
+    try:
+        job = workspace.create_op_job(
+            op, {**args, "root": root or run.get("task_root") or project.get("workdir") or ""},
+            str(project.get("host_id") or "laptop"), run.get("project_id"),
+            key or f"run:{run.get('id')}:{op}:{int(time.time())}")
+    except workspace.OpError as exc:
+        return {"status": "failed", "error": str(exc), "code": exc.code}
+    final = _wait_job(job["job"]["id"], wait_s)
+    final["job_id"] = job["job"]["id"]
+    return final
+
+
+def start_task_copy(project_id: str, run_id: str) -> dict:
+    """Создаёт отдельную рабочую копию задачи от зафиксированного SHA.
+
+    Копия — git worktree `runs/<run>/repo` на ветке `task/<run8>`; журналы ops/
+    в неё копируются на момент старта. Основная ветка не меняется до приёмки.
+    Ошибка подготовки — отказ запуска, кодер к файлам не допускается.
+    """
+    run = get_run(run_id)
+    project = db.get_project(project_id) or {}
+    if not run:
+        raise RunError("not_found", "запуск не найден")
+    if (run.get("task_root") or "").strip():
+        return {"task_root": run["task_root"], "branch": run.get("task_branch"),
+                "base_sha": run.get("base_sha"), "existing": True}
+    main_root = (project.get("workdir") or "").strip()
+    host = str(project.get("host_id") or "laptop")
+    if not main_root:
+        raise RunError("no_workdir", "У проекта не указан рабочий каталог.")
+    branch = f"task/{run_id[:8]}"
+    from . import workspace
+
+    try:
+        job = workspace.create_op_job(
+            "task_start", {"root": main_root, "run_id": run_id, "branch": branch,
+                           "base_sha": str(run.get("base_sha") or "")},
+            host, project_id, f"run:{run_id}:task-start")
+    except workspace.OpError as exc:
+        raise RunError("task_copy_failed", f"рабочая копия задачи не создана: {exc}") from None
+    final = _wait_job(job["job"]["id"], 180)
+    result = final.get("result") or {}
+    if final.get("status") != "succeeded":
+        raise RunError("task_copy_failed",
+                       f"рабочая копия задачи не создана: {final.get('error') or final.get('status')}")
+    db.set_run_task(run_id, result["task_root"], result.get("branch") or branch,
+                    result.get("base_sha") or "", result.get("head_sha") or "")
+    _event(run_id, None, "task_copy_ready",
+          {"task_root": result["task_root"], "branch": branch,
+           "base_sha": result.get("base_sha"), "head_sha": result.get("head_sha")})
+    return {**result, "existing": False}
+
+
+def _verify_task_copy(run: dict, task: dict) -> str | None:
+    """Сверка папки/ветки (и коммита кандидата) перед выдачей шага.
+
+    Возвращает причину остановки или None. Несовпадение — шаг не выполняется,
+    файлы не меняются.
+    """
+    root = (run.get("task_root") or "").strip()
+    if not root:
+        return None
+    role = task.get("role") or ""
+    want_head = (run.get("candidate_sha") or "") if role in ("tester", "reviewer") else ""
+    final = _task_op(run, db.get_project(run["project_id"]) or {}, "verify_task",
+                     {"branch": run.get("task_branch") or "", "head_sha": want_head},
+                     wait_s=120, key=f"run:{run['id']}:verify:{task['key']}:{task.get('attempt') or 0}")
+    if final.get("status") != "succeeded":
+        return f"рабочая копия задачи не подтверждена: {final.get('error') or final.get('status')}"[:300]
+    result = final.get("result") or {}
+    if want_head and result.get("head_sha") != want_head:
+        return (f"коммит задания {want_head[:12]}, в копии {str(result.get('head_sha'))[:12]}"
+                " — шаг остановлен до изменения файлов")
+    return None
+
+
+def setup_env(run_id: str, setup: dict) -> dict:
+    """Подготовка среды в рабочей копии задачи до запуска кодера."""
+    run = get_run(run_id)
+    if not run or not run.get("task_root"):
+        return {"ok": False, "reason": "no_task_copy"}
+    cmd = setup.get("cmd") if isinstance(setup, dict) else None
+    if not isinstance(cmd, list) or not cmd:
+        return {"ok": True, "skipped": True}
+    project = db.get_project(run["project_id"]) or {}
+    final = _task_op(run, project, "setup_env",
+                     {"cmd": cmd, "timeout_s": int(setup.get("timeout_s") or 180)},
+                     wait_s=int(setup.get("timeout_s") or 180) + 30,
+                     key=f"run:{run_id}:setup")
+    result = final.get("result") or {}
+    ok = final.get("status") == "succeeded" and result.get("ok") is True
+    _event(run_id, None, "env_setup_done" if ok else "env_setup_failed",
+           {"ok": ok, "cmd": cmd, "exit_code": result.get("exit_code"),
+            "error": (final.get("error") or "")[:300]})
+    return {"ok": ok, "error": final.get("error"), "result": result}
+
+
+def merge_task(run_id: str) -> dict:
+    """Слияние проверенного коммита в основную ветку через --ff-only.
+
+    Сливается ровно тот SHA, который прошёл тест и ревью. Если основная ветка
+    сдвинулась, слияние не выполняется: ветка задачи сохраняется, запуск
+    помечается `base_moved` с требованием обновить базу и повторить проверки.
+    """
+    from . import workspace
+
+    run = get_run(run_id)
+    if not run:
+        return {"merged": False, "reason": "not_found"}
+    project = db.get_project(run["project_id"]) or {}
+    root = (run.get("task_root") or "").strip()
+    sha = (run.get("candidate_sha") or "").strip()
+    if not root or not sha:
+        db.set_run_merge(run_id, "no_candidate")
+        return {"merged": False, "reason": "no_candidate"}
+    if sha == (run.get("base_sha") or ""):
+        db.set_run_merge(run_id, "no_commit")
+        _event(run_id, None, "merge_blocked",
+               {"reason": "no_commit", "message": "кодер не создал коммит в ветке задачи"})
+        return {"merged": False, "reason": "no_commit"}
+    target = str(project.get("branch") or "main")
+    try:
+        job = workspace.create_op_job(
+            "task_merge", {"root": root, "branch": run.get("task_branch") or "",
+                           "sha": sha, "target": target},
+            str(project.get("host_id") or "laptop"), run["project_id"],
+            f"run:{run_id}:merge:{sha[:12]}")
+    except workspace.OpError as exc:
+        db.set_run_merge(run_id, "error")
+        _event(run_id, None, "merge_failed", {"reason": str(exc)[:300]})
+        return {"merged": False, "reason": "op_failed", "error": str(exc)}
+    final = _wait_job(job["job"]["id"], 180)
+    result = final.get("result") or {}
+    if final.get("status") != "succeeded":
+        db.set_run_merge(run_id, "error")
+        _event(run_id, None, "merge_failed",
+              {"reason": (final.get("error") or final.get("status") or "")[:300]})
+        return {"merged": False, "reason": "op_failed", "error": final.get("error")}
+    # Вердикт — по факту слияния: --ff-only уже гарантирует, что целевая ветка
+    # была предком кандидата. `previous_head` не участвует в сверке, иначе сбой
+    # чтения HEAD до слияния помечает успешное слияние как base_moved.
+    if result.get("merged") and str(result.get("sha") or "") == sha:
+        db.set_run_merge(run_id, "merged", sha)
+        _event(run_id, None, "merge_done",
+              {"sha": sha, "target": target, "branch": run.get("task_branch"),
+               "previous_head": result.get("previous_head")})
+        return {"merged": True, "sha": sha, "target": target}
+    reason = str(result.get("reason") or "not_merged")
+    db.set_run_merge(run_id, reason)
+    _event(run_id, None, "merge_blocked",
+          {"reason": reason, "message": result.get("message"),
+           "target_head": result.get("target_head"), "task_sha": sha,
+           "branch": run.get("task_branch")})
+    return {"merged": False, "reason": reason, **result}
+
+
+def _archive_run(run: dict, project: dict) -> dict:
+    """Регистрирует артефакты принятого запуска в ops/ARTIFACTS.md."""
+    # Журнал артефактов — в ops/ проекта, а не в копии задачи: копия удаляется.
+    final = _task_op(run, project, "archive_artifacts",
+                     {"run_id": run["id"], "sha": run.get("merged_sha") or run.get("candidate_sha") or "",
+                      "branch": run.get("task_branch") or ""},
+                     wait_s=60, key=f"run:{run['id']}:artifacts",
+                     root=str(project.get("workdir") or ""))
+    if final.get("status") != "succeeded":
+        _event(run["id"], None, "artifacts_failed",
+              {"reason": (final.get("error") or final.get("status") or "")[:300]})
+        return {}
+    result = final.get("result") or {}
+    _event(run["id"], None, "artifacts_registered",
+          {"path": result.get("path"), "artifacts": result.get("artifacts")})
+    return result
+
+
+def publish_run(run: dict, project: dict) -> dict:
+    """Публикация ветки задачи в remote — только если проект это разрешил."""
+    settings = _as_json(project.get("settings"), {}) or {}
+    policy = settings.get("publish") if isinstance(settings.get("publish"), dict) else {}
+    remote = str(settings.get("git_remote") or policy.get("remote") or "").strip()
+    allowed = policy.get("allowed") is True or settings.get("allow_publish") is True
+    if not remote or not allowed:
+        return {"published": False, "reason": "disabled"}
+    final = _task_op(run, project, "publish_branch",
+                     {"branch": run.get("task_branch") or "", "remote": remote},
+                     wait_s=120, key=f"run:{run['id']}:publish")
+    if final.get("status") != "succeeded":
+        _event(run["id"], None, "publish_failed",
+              {"reason": (final.get("error") or final.get("status") or "")[:300]})
+        return {"published": False, "reason": "failed", "error": final.get("error")}
+    result = final.get("result") or {}
+    _event(run["id"], None, "published",
+          {"remote": remote, "branch": run.get("task_branch"), "url": result.get("url")})
+    return {"published": True, **result}
 
 
 def _start_candidate_snapshot(conn, run: dict) -> None:

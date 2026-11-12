@@ -356,6 +356,30 @@ def run_workspace_job(job: dict, base: str) -> dict:
     return payload
 
 
+def task_precheck(job: dict) -> str | None:
+    """Сверка рабочей папки и ветки задания до запуска агента.
+
+    Копия задачи создаётся хабом; воркер обязан убедиться, что задание
+    выполняется в ней и на ожидаемой ветке (и коммите для тестера/ревьюера).
+    Несовпадение — шаг не начинается, файлы не меняются.
+    """
+    if workspace_host is None:
+        return None
+    root = str(job.get("workdir") or job.get("project_workdir") or "")
+    branch = str(job.get("task_branch") or "")
+    if not root or not branch:
+        return None
+    head = str(job.get("expect_head") or "")
+    try:
+        workspace_host.run_job("verify_task", {"root": root, "branch": branch,
+                                               "head_sha": head})
+    except workspace_host.OpFail as exc:
+        return f"шаг остановлен до изменения файлов: {exc}"
+    except Exception as exc:  # noqa: BLE001
+        return f"сверка рабочей копии не удалась: {exc}"
+    return None
+
+
 def main() -> int:
     if "--heartbeat-once" in sys.argv:
         base = hub_url()
@@ -435,6 +459,18 @@ def main() -> int:
         requested_model = job.get("requested_model")
         requested_profile = job.get("requested_profile")
         workdir = job.get("workdir") or None
+        blocked = task_precheck(job)
+        if blocked:
+            log(f"job {job_id} stopped: {blocked}")
+            payload = {"job_id": job_id, "attempt_id": attempt_id, "ok": False,
+                       "error": blocked}
+            path = outbox_path(job_id, attempt_id)
+            with open(path + ".tmp", "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False)
+            os.replace(path + ".tmp", path)
+            deliver(path)
+            drain_outbox()
+            continue
         # Вложения задания: содержимое приходит с хабом; раскладываем во временный каталог,
         # чтобы Codex мог открыть файлы, и перечисляем пути в промпте.
         attachments = job.get("attachments") or []

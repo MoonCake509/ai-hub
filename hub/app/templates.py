@@ -111,7 +111,10 @@ ROLES = {
         "prompt": (
             "Ты планировщик. Разложи задачу на шаги. Ответь JSON: "
             '{"tasks":[{"key":"...","title":"...","files":["..."],"acceptance":"..."}],'
-            '"risks":["..."]}. Без пояснений вне JSON.'
+            '"risks":["..."]}. Без пояснений вне JSON. '
+            "Не включай в план слияние в основную ветку, push или переключение "
+            "основной рабочей копии: слияние проверенного коммита выполняет хаб "
+            "после тестов и ревью."
         ),
     },
     "coder": {
@@ -124,7 +127,9 @@ ROLES = {
         "prompt": (
             "Ты кодер. Выполни план. Ответь JSON: "
             '{"summary":"что сделано","files":["изменённые пути"],"notes":"..."}. '
-            "Меняй только то, что нужно для плана."
+            "Меняй только то, что нужно для плана. Работай только в своей рабочей "
+            "копии на ветке задания: не сливай в основную ветку, не делай push и не "
+            "переключай основную копию. Оставь изменения одним коммитом в ветке задания."
         ),
     },
     "tester": {
@@ -167,7 +172,9 @@ ROLES = {
         "prompt": (
             "Ты архивариус. Зафиксируй итог. Ответь JSON: "
             '{"summary":"...","artifacts":[{"path":"...","kind":"..."}],'
-            '"decisions":["..."]}. Исходники не меняй.'
+            '"decisions":["..."]}. Исходники не меняй. '
+            "Не сливай ветку задания в основную, не делай push и не переключай "
+            "основную рабочую копию: слияние проверенного коммита выполняет хаб."
         ),
     },
 }
@@ -182,12 +189,16 @@ CHAIN = [
 
 # Каждой роли — свой вход: у планировщика контракты и точка входа, у тестировщика
 # тесты, у ревьюера изменение, у архивариуса всё итоговое.
+# Тестер, ревьюер и архивариус работают в рабочей копии задачи и получают
+# receipt проверок и digest кандидата отдельными секциями задания. Пакет
+# контекста, собранный из основной копии на базовом SHA, для них вреден: он
+# показывал бы код до изменений. Поэтому контекст у этих шагов пустой.
 CONTEXT = {
     "planner": {"paths": ["docs/*", "*.md"], "budget_tokens": 3000},
     "coder": {"paths": ["src/*"], "budget_tokens": 6000},
-    "tester": {"paths": ["tests/*"], "budget_tokens": 4000},
-    "reviewer": {"paths": ["src/*"], "budget_tokens": 4000},
-    "archivist": {"paths": ["docs/*"], "budget_tokens": 2000},
+    "tester": {},
+    "reviewer": {},
+    "archivist": {},
 }
 
 
@@ -198,6 +209,15 @@ def template(project_entry: str = "", contracts: list[str] | None = None,
     for index, item in enumerate(CHAIN):
         role = ROLES[item["role"]]
         spec = dict(CONTEXT[item["role"]])
+        context = {}
+        if spec:
+            context = {
+                "goal": role["goal"],
+                "entry": project_entry if index == 0 and project_entry else "",
+                "contracts": list(contracts or []) if index == 0 else [],
+                "paths": spec["paths"],
+                "budget_tokens": spec["budget_tokens"],
+            }
         steps.append({
             "key": item["key"],
             "role": item["role"],
@@ -205,13 +225,7 @@ def template(project_entry: str = "", contracts: list[str] | None = None,
             "prompt": role["prompt"],
             "depends_on": list(item["depends_on"]),
             "output": role["output"],
-            "context": {
-                "goal": role["goal"],
-                "entry": project_entry if index == 0 and project_entry else "",
-                "contracts": list(contracts or []) if index == 0 else [],
-                "paths": spec["paths"],
-                "budget_tokens": spec["budget_tokens"],
-            },
+            "context": context,
         })
     return {"id": FIVE_ROLES_ID, "version": FIVE_ROLES_VERSION, "steps": steps}
 

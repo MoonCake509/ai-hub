@@ -70,6 +70,51 @@ if not SCHEMA.replace("_", "").isalnum():
     raise ValueError(f"недопустимое имя схемы: {SCHEMA!r}")
 
 
+def set_run_task(run_id: str, task_root: str, branch: str, base_sha: str,
+                 head_sha: str = "") -> None:
+    """Фиксирует рабочую копию задачи и переводит снимок запуска на неё.
+
+    Контекст-пакеты по-прежнему читаются из основной копии на зафиксированном
+    SHA; задания кодера/тестера/ревьюера получают рабочую папку задачи.
+    """
+    with _lock:
+        conn = connect()
+        with transaction(conn):
+            row = _one(conn, _qualify(
+                "select project_snapshot from aihub.runs where id = :i for update"), i=run_id)
+            raw = (row or {}).get("project_snapshot")
+            if isinstance(raw, dict):
+                snapshot = dict(raw)
+            elif isinstance(raw, str) and raw.strip():
+                snapshot = json.loads(raw)
+            else:
+                snapshot = {}
+            snapshot["main_workdir"] = snapshot.get("main_workdir") or snapshot.get("project_workdir")
+            snapshot["project_workdir"] = task_root
+            _one(conn, _qualify(
+                "update aihub.runs set task_root = :t, task_branch = :b, base_sha = :s,"
+                " project_snapshot = :ps::jsonb,"
+                " updated_at = now() where id = :i returning id"),
+                t=task_root, b=branch, s=base_sha,
+                ps=json.dumps(snapshot, ensure_ascii=False), i=run_id)
+
+
+def set_run_candidate_sha(run_id: str, sha: str) -> None:
+    with _lock:
+        conn = connect()
+        _one(conn, _qualify(
+            "update aihub.runs set candidate_sha = :s, updated_at = now()"
+            " where id = :i returning id"), s=sha, i=run_id)
+
+
+def set_run_merge(run_id: str, state: str, merged_sha: str = "") -> None:
+    with _lock:
+        conn = connect()
+        _one(conn, _qualify(
+            "update aihub.runs set merge_state = :m, merged_sha = nullif(:s, ''),"
+            " updated_at = now() where id = :i returning id"), m=state, s=merged_sha, i=run_id)
+
+
 def _qualify(sql: str) -> str:
     """Переводит литералы схемы `aihub.` на активную схему.
 
@@ -345,6 +390,13 @@ DDL = [
     "alter table aihub.runs add column if not exists candidate_snapshot_id text",
     "alter table aihub.runs add column if not exists check_receipt jsonb",
     "alter table aihub.runs add column if not exists pipeline jsonb not null default '{}'",
+    # FLOW-P8: отдельная рабочая копия задачи и слияние проверенного коммита.
+    "alter table aihub.runs add column if not exists task_root text",
+    "alter table aihub.runs add column if not exists task_branch text",
+    "alter table aihub.runs add column if not exists base_sha text",
+    "alter table aihub.runs add column if not exists candidate_sha text",
+    "alter table aihub.runs add column if not exists merge_state text",
+    "alter table aihub.runs add column if not exists merged_sha text",
     "alter table aihub.runs add column if not exists cancel_info jsonb",
     # FLOW-P1: контекст, результат, назначение и receipt фиксируются на задаче.
     "alter table aihub.run_tasks add column if not exists assignment jsonb not null default '{}'",

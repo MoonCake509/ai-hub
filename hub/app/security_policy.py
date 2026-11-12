@@ -34,6 +34,9 @@ DENY_DIRS = {
 }
 
 
+EXAMPLE_ENV = {".env.example", ".env.sample", ".env.template"}
+
+
 def denied_reason(rel: str) -> str | None:
     """Причина отказа для относительного пути проекта, None если путь разрешён."""
     parts = [p.lower() for p in re.split(r"[\\/]+", rel or "") if p]
@@ -43,6 +46,8 @@ def denied_reason(rel: str) -> str | None:
         if part in DENY_DIRS:
             return f"служебный каталог {part}"
     name = parts[-1]
+    if name in EXAMPLE_ENV:
+        return None
     if name == ".env" or name.startswith(".env."):
         return "файл окружения"
     if name in SECRET_NAMES or name.startswith("id_rsa"):
@@ -66,6 +71,8 @@ def is_secret(rel: str) -> bool:
     """
     name = rel.rsplit("/", 1)[-1]
     low_rel, low_name = rel.lower(), name.lower()
+    if low_name in EXAMPLE_ENV:
+        return False
     if low_name == ".env" or low_name.startswith(".env."):
         return True
     if low_name in SECRET_NAMES or low_name.startswith("id_rsa"):

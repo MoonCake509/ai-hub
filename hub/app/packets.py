@@ -1001,7 +1001,7 @@ def start_recheck(packet_id: str) -> dict:
     return {"packet_id": packet_id, "state": "probing", "job_id": job["job"]["id"]}
 
 
-RETRY_STATES = {"no_index", "embed_failed", "verify_failed"}
+RETRY_STATES = {"no_index", "embed_failed", "verify_failed", "empty"}
 
 
 def retry_semantic(limit: int = 5, min_age_s: int = 10) -> int:
@@ -1014,7 +1014,8 @@ def retry_semantic(limit: int = 5, min_age_s: int = 10) -> int:
         conn = db.connect()
         rows = db._rows(conn, db._qualify(
             "select id, revision, manifest, request from aihub.context_packets"
-            " where state = 'sealed' and manifest->'semantic'->>'state' = any(:states)"
+            " where state = 'sealed' and manifest ? 'base_digest'"
+            " and manifest->'semantic'->>'state' = any(:states)"
             " and updated_at < now() - make_interval(secs => :age) order by updated_at limit :l"),
             states=list(RETRY_STATES), age=int(min_age_s), l=int(limit))
     retried = 0

@@ -87,7 +87,7 @@ def search(project_id: str, vectors: dict[str, list[float]], sha: str = "",
     conn = db.connect()
     if sha:
         rows = db._rows(conn, db._qualify(
-            "select path, start_line, end_line, kind, text, vector, sha from aihub.semantic_chunks"
+            "select path, start_line, end_line, kind, text, vector, sha, model from aihub.semantic_chunks"
             " where project_id = :p and sha = :s"), p=project_id, s=sha)
     else:
         latest = db._one(conn, db._qualify(
@@ -97,7 +97,7 @@ def search(project_id: str, vectors: dict[str, list[float]], sha: str = "",
             return {"sha": "", "matches": [], "indexed": False}
         sha = latest["sha"]
         rows = db._rows(conn, db._qualify(
-            "select path, start_line, end_line, kind, text, vector, sha from aihub.semantic_chunks"
+            "select path, start_line, end_line, kind, text, vector, sha, model from aihub.semantic_chunks"
             " where project_id = :p and sha = :s"), p=project_id, s=sha)
     scored = []
     for row in rows:

@@ -714,7 +714,7 @@ def lease_job(worker: str, lease_seconds: int = 300, agents: str = "",
                       and protocol <= :cp
                       and kind = any(string_to_array(:kinds, ','))
                       and (:agents = '' or agent_id = any(string_to_array(:agents, ',')))
-                    order by created_at
+                    order by (kind = 'workspace') desc, created_at
                     limit :n""",
                 cp=int(client_protocol), kinds=kinds or "agent", agents=agents,
                 n=CANDIDATES,

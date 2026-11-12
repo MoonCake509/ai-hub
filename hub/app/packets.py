@@ -29,7 +29,7 @@ from . import context, db, security_policy
 
 LIST_PAGE = 200
 
-STATES = ("probing", "sealed", "materializing", "materialized", "conflict", "failed")
+STATES = ("probing", "semantic", "sealed", "materializing", "materialized", "conflict", "failed")
 
 # Версия формата digest пакета. Смена контракта инвалидирует старые digest.
 PACKET_FORMAT_VERSION = 2
@@ -313,16 +313,12 @@ def seal(packet_id: str, entries: list[dict], recheck: bool = False,
     items, used, stats = select(entries, request.get("requested") or [], int(row["budget_bytes"]))
     evidence = evidence_ if evidence_ is not None else []
     semantic = {"state": semantic_state or ("collected" if evidence else "empty")}
-    if evidence_ is None and request.get("sha") and (request.get("kind") == "context"
-                                                     or request.get("requested") is not None):
-        from . import semantic as semantic_module
-        project = db.get_project(row.get("project_id") or "") or {}
-        try:
-            evidence, semantic = semantic_module.collect_evidence(
-                project, str(request.get("sha") or ""), str(request.get("goal") or ""),
-                int(request.get("budget_tokens") or 2000))
-        except Exception as exc:  # noqa: BLE001 — контекст не блокирует приёмку
-            evidence, semantic = [], {"state": "failed", "reason": str(exc)[:300]}
+    if evidence_ is None and _semantic_required(request):
+        # Ожидание воркера вынесено из тика: пакет получает состояние semantic,
+        # evidence собирается этапами (индекс → вектор → поиск → сверка blob'ов),
+        # и только после этого фиксируется ревизия с digest.
+        return _start_semantic(packet_id, {"mode": "seal", "entries": entries,
+                                           "recheck": bool(recheck)}, row, request)
     new_digest = digest(items, evidence=evidence)
 
     if recheck and row.get("digest"):
@@ -529,6 +525,230 @@ def _store_built(packet_id: str, built: dict, contents: dict[str, str] | None = 
         _write_evidence(conn, packet_id, revision, evidence)
 
 
+def _semantic_required(request: dict) -> bool:
+    """Нужен ли проверяемый семантический контекст для этого пакета."""
+    return bool(request.get("sha")) and (request.get("kind") == "context"
+                                         or request.get("requested") is not None)
+
+
+def _draft_put(packet_id: str, draft: dict) -> None:
+    with db._lock:
+        conn = db.connect()
+        db._one(conn, db._qualify(
+            "insert into aihub.context_packet_drafts(packet_id, draft) values (:i, :d::jsonb)"
+            " on conflict (packet_id) do update set draft = :d::jsonb, updated_at = now()"
+            " returning packet_id"), i=packet_id, d=json.dumps(draft, ensure_ascii=False))
+
+
+def _draft_get(packet_id: str) -> dict | None:
+    with db._lock:
+        conn = db.connect()
+        row = db._one(conn, db._qualify(
+            "select draft from aihub.context_packet_drafts where packet_id = :i"), i=packet_id)
+    if not row:
+        return None
+    draft = row["draft"]
+    return json.loads(draft) if isinstance(draft, str) else draft
+
+
+def _draft_drop(packet_id: str) -> None:
+    with db._lock:
+        conn = db.connect()
+        conn.run(db._qualify(
+            "delete from aihub.context_packet_drafts where packet_id = :i"), i=packet_id)
+
+
+def _set_semantic_job(packet_id: str, job_id: str | None, op: str | None) -> None:
+    with db._lock:
+        conn = db.connect()
+        db._one(conn, db._qualify(
+            "update aihub.context_packets set state = 'semantic', provider_job_id = :j,"
+            " provider_op = :o, updated_at = now() where id = :i returning id"),
+            j=job_id, o=op, i=packet_id)
+
+
+def _enqueue_semantic(packet_id: str, project: dict, draft: dict, op: str, args: dict) -> None:
+    from . import workspace
+    job = workspace.create_op_job(op, args, project.get("host_id") or "", project.get("id") or "")
+    draft["stage"] = op
+    draft["last_args"] = args
+    if op == "semantic_embed":
+        draft["kind"] = str(args.get("kind") or "")
+    _draft_put(packet_id, draft)
+    _set_semantic_job(packet_id, job["job"]["id"], op)
+
+
+def _start_semantic(packet_id: str, draft: dict, row: dict, request: dict) -> dict:
+    """Первая стадия: индекс нужного SHA уже есть или его надо собрать."""
+    from . import semantic as semantic_module
+    project = db.get_project(row.get("project_id") or "") or {}
+    sha = str(request.get("sha") or "")
+    draft.update({"sha": sha, "goal": str(request.get("goal") or ""),
+                  "budget_tokens": int(request.get("budget_tokens") or 2000),
+                  "vectors": {}, "attempts": 0, "models": {},
+                  "kinds": semantic_module.kinds(project.get("id") or "", sha)})
+    _draft_put(packet_id, draft)
+    if draft["kinds"]:
+        draft["models"] = semantic_module.models(project.get("id") or "", sha)
+        _enqueue_semantic(packet_id, project, draft, "semantic_embed",
+                          {"root": project.get("workdir") or "", "text": draft["goal"][:2000],
+                           "kind": draft["kinds"][0]})
+    else:
+        _enqueue_semantic(packet_id, project, draft, "semantic_index",
+                          {"root": project.get("workdir") or "", "sha": sha,
+                           "project_id": project.get("id") or "", "upload": True})
+    return {"packet_id": packet_id, "state": "semantic", "sha": sha,
+            "stage": draft["stage"]}
+
+
+def _semantic_finalize(packet_id: str, project: dict, draft: dict,
+                       evidence: list[dict] | None = None,
+                       semantic: dict | None = None) -> None:
+    """Пакет фиксируется только теперь: evidence входит в digest ревизии."""
+    evidence = evidence or []
+    semantic = semantic or {"state": "collected" if evidence else "empty",
+                            "sha": draft.get("sha") or ""}
+    _draft_drop(packet_id)
+    if draft.get("mode") == "seal":
+        seal(packet_id, draft.get("entries") or [], recheck=bool(draft.get("recheck")),
+             evidence_=evidence, semantic_state=semantic.get("state") or "empty")
+    else:
+        _store_built(packet_id, draft["built"], draft.get("contents") or {},
+                     evidence=evidence, semantic=semantic)
+
+
+def _semantic_fail_or_retry(packet_id: str, project: dict, draft: dict, op: str,
+                            reason: str, state: str) -> None:
+    """Временная ошибка воркера повторяется ограниченно, затем пакет блокируется."""
+    attempts = int(draft.get("attempts") or 0) + 1
+    draft["attempts"] = attempts
+    limit = 3
+    if attempts < limit:
+        _enqueue_semantic(packet_id, project, draft, op,
+                          draft.get("last_args") or _semantic_args(project, draft, op))
+        return
+    _semantic_finalize(packet_id, project, draft, [], {"state": state, "sha": draft.get("sha") or "",
+                                                       "reason": reason[:300]})
+
+
+def _semantic_args(project: dict, draft: dict, op: str) -> dict:
+    root = project.get("workdir") or ""
+    if op == "semantic_index":
+        return {"root": root, "sha": draft.get("sha") or "",
+                "project_id": project.get("id") or "", "upload": True}
+    if op == "semantic_verify":
+        return {"root": root, "sha": draft.get("sha") or "",
+                "items": draft.get("candidates") or []}
+    return {"root": root, "text": str(draft.get("goal") or "")[:2000],
+            "kind": str(draft.get("kind") or (draft.get("kinds") or ["code"])[0])}
+
+
+def _advance_semantic(packet_id: str, op: str, job: dict) -> None:
+    """Продвигает этапы: индекс → вектор → поиск в хабе → сверка blob'ов."""
+    from . import semantic as semantic_module
+    draft = _draft_get(packet_id)
+    row = _packet_row(packet_id)
+    if not draft or not row:
+        fail(packet_id, "черновик семантического контекста потерян")
+        return
+    project = db.get_project(row.get("project_id") or "") or {}
+    ok = job.get("status") == "succeeded"
+    result = job.get("result") or {}
+    if op == "semantic_index":
+        if not ok:
+            _semantic_fail_or_retry(packet_id, project, draft, "semantic_index",
+                                    str(job.get("error") or job.get("status")), "no_index")
+            return
+        kinds_here = semantic_module.kinds(project.get("id") or "", draft.get("sha") or "")
+        if not kinds_here:
+            _semantic_finalize(packet_id, project, draft, [], {
+                "state": "no_index", "sha": draft.get("sha") or "",
+                "reason": "индекс пуст после сборки"})
+            return
+        draft["kinds"] = kinds_here
+        draft["models"] = semantic_module.models(project.get("id") or "", draft.get("sha") or "")
+        _enqueue_semantic(packet_id, project, draft, "semantic_embed",
+                          {"root": project.get("workdir") or "", "text": str(draft.get("goal") or "")[:2000],
+                           "kind": kinds_here[0]})
+        return
+    if op == "semantic_embed":
+        if not ok:
+            _semantic_fail_or_retry(packet_id, project, draft, "semantic_embed",
+                                    str(job.get("error") or job.get("status")), "embed_failed")
+            return
+        vector = result.get("vector")
+        kind = str(draft.get("kind") or "")
+        if not kind:
+            kinds = draft.get("kinds") or []
+            kind = kinds[0] if kinds else "code"
+        if isinstance(vector, list) and vector:
+            draft.setdefault("vectors", {})[kind] = [float(x) for x in vector]
+        remaining = [k for k in (draft.get("kinds") or []) if k not in draft["vectors"]]
+        if remaining:
+            _enqueue_semantic(packet_id, project, draft, "semantic_embed",
+                              {"root": project.get("workdir") or "",
+                               "text": str(draft.get("goal") or "")[:2000], "kind": remaining[0]})
+            return
+        if not draft["vectors"]:
+            _semantic_finalize(packet_id, project, draft, [], {"state": "no_vectors",
+                                                               "sha": draft.get("sha") or ""})
+            return
+        found = semantic_module.search(project.get("id") or "", draft["vectors"],
+                                       draft.get("sha") or "", limit=12,
+                                       models_map=draft.get("models") or None)
+        candidates: list[dict] = []
+        for hit in found.get("matches") or []:
+            if float(hit.get("score") or 0) <= 0:
+                continue
+            item = {"path": hit["path"], "start_line": int(hit["start_line"]),
+                    "end_line": int(hit["end_line"]), "kind": hit.get("kind") or "code",
+                    "score": float(hit.get("score") or 0)}
+            if any(semantic_module._overlaps(item, seen) for seen in candidates):
+                continue
+            candidates.append(item)
+            if len(candidates) >= semantic_module.EVIDENCE_LIMIT * 2:
+                break
+        if not candidates:
+            _semantic_finalize(packet_id, project, draft, [], {"state": "empty",
+                                                               "sha": draft.get("sha") or ""})
+            return
+        draft["candidates"] = candidates
+        _enqueue_semantic(packet_id, project, draft, "semantic_verify",
+                          {"root": project.get("workdir") or "", "sha": draft.get("sha") or "",
+                           "items": candidates})
+        return
+    if op == "semantic_verify":
+        if not ok:
+            _semantic_fail_or_retry(packet_id, project, draft, "semantic_verify",
+                                    str(job.get("error") or job.get("status")), "verify_failed")
+            return
+        by_key = {(c["path"], int(c["start_line"]), int(c["end_line"])): c["score"]
+                  for c in draft.get("candidates") or []}
+        models_map = draft.get("models") or {}
+        evidence: list[dict] = []
+        used = 0
+        limit_tokens = max(0, min(semantic_module.EVIDENCE_TOKENS, int(draft.get("budget_tokens") or 0)))
+        for item in result.get("verified") or []:
+            tokens = max(1, len(str(item.get("text") or "")) // 4)
+            if limit_tokens == 0 or used + tokens > limit_tokens:
+                continue
+            used += tokens
+            item["score"] = by_key.get((item["path"], int(item["start_line"]),
+                                        int(item["end_line"])), 0.0)
+            item["model"] = models_map.get(str(item.get("kind") or "code"), "")
+            evidence.append(item)
+            if len(evidence) >= semantic_module.EVIDENCE_LIMIT:
+                break
+        semantic = {"state": "collected" if evidence else "rejected",
+                    "sha": draft.get("sha") or "", "kinds": draft.get("kinds") or [],
+                    "query_sha256": hashlib.sha256(
+                        str(draft.get("goal") or "").encode("utf-8")).hexdigest()[:16],
+                    "candidates": len(draft.get("candidates") or []),
+                    "verified": len(evidence),
+                    "dropped": len(result.get("dropped") or []), "tokens": used}
+        _semantic_finalize(packet_id, project, draft, evidence, semantic)
+
+
 def verified_contents(packet_id: str, revision: int) -> list[dict]:
     """Returns only the selected UTF-8 bytes verified for an immutable revision."""
     with db._lock:
@@ -572,7 +792,7 @@ def _poll_active_locked(limit: int = 20) -> int:
         conn = db.connect()
         rows = db._rows(conn, db._qualify(
             "select id, state, provider_job_id, provider_op from aihub.context_packets"
-            " where state in ('probing', 'materializing') and provider_job_id is not null"
+            " where state in ('probing', 'materializing', 'semantic') and provider_job_id is not null"
             " order by updated_at limit :l"), l=int(limit))
     moved = 0
     for row in rows:
@@ -584,6 +804,12 @@ def _poll_active_locked(limit: int = 20) -> int:
             continue
         moved += 1
         op = row.get("provider_op")
+        if row["state"] == "semantic":
+            if op in ("semantic_index", "semantic_embed", "semantic_verify"):
+                _advance_semantic(row["id"], str(op), job)
+            else:
+                fail(row["id"], f"неизвестный этап семантики: {op}")
+            continue
         if job["status"] != "succeeded":
             fail(row["id"], f"задание {op} завершилось статусом {job['status']}: {job.get('error') or ''}"[:400])
             continue
@@ -665,20 +891,13 @@ def _poll_active_locked(limit: int = 20) -> int:
             except context.ContextError as exc:
                 fail(row["id"], exc.message)
                 continue
-            collected_evidence: list[dict] = []
-            semantic_state: dict = {}
-            if request.get("sha"):
-                from . import semantic as semantic_module
-                project = db.get_project(packet_row.get("project_id") or "") or {}
-                try:
-                    collected_evidence, semantic_state = semantic_module.collect_evidence(
-                        project, str(request.get("sha") or ""),
-                        str(request.get("goal") or ""),
-                        int(request.get("budget_tokens") or 2000))
-                except Exception as exc:  # noqa: BLE001 — поиск не блокирует сборку
-                    semantic_state = {"state": "failed", "reason": str(exc)[:300]}
-            _store_built(row["id"], built, contents, evidence=collected_evidence,
-                         semantic=semantic_state)
+            if _semantic_required(request):
+                # Сборка evidence идёт этапами после сверки файлов: тик не ждёт воркер.
+                _start_semantic(row["id"], {"mode": "built", "built": built,
+                                            "contents": contents}, packet_row, request)
+                continue
+            _store_built(row["id"], built, contents, evidence=[],
+                         semantic={"state": "skipped"})
         elif op == "materialize":
             # Материализация выполняется синхронно в _materialize_sync: тик не
             # должен принимать результат порции параллельно с её сверкой.
@@ -1005,50 +1224,10 @@ RETRY_STATES = {"no_index", "embed_failed", "verify_failed", "empty"}
 
 
 def retry_semantic(limit: int = 5, min_age_s: int = 10) -> int:
-    """Повторная сборка семантического контекста для уже запечатанных пакетов.
+    """Совместимость: повтор теперь делает сам конвейер (см. _semantic_fail_or_retry).
 
-    Код не выдаётся, пока состояние retryable; этот проход даёт ему шанс дойти до
-    collected без ручного вмешательства. Ревизия при этом растёт, история цела.
+    Синхронный повтор внутри тика больше не нужен: пакет в состоянии semantic
+    продвигается этапами, а временные ошибки воркера повторяются до трёх раз.
+    Возвращает 0, чтобы вызывающий sweeper не ждал воркер.
     """
-    with db._lock:
-        conn = db.connect()
-        rows = db._rows(conn, db._qualify(
-            "select id, revision, manifest, request from aihub.context_packets"
-            " where state = 'sealed' and manifest ? 'base_digest'"
-            " and manifest->'semantic'->>'state' = any(:states)"
-            " and updated_at < now() - make_interval(secs => :age) order by updated_at limit :l"),
-            states=list(RETRY_STATES), age=int(min_age_s), l=int(limit))
-    retried = 0
-    for row in rows:
-        manifest = row.get("manifest") or {}
-        request = row.get("request") or {}
-        if isinstance(manifest, str):
-            manifest = json.loads(manifest)
-        if isinstance(request, str):
-            request = json.loads(request)
-        base = manifest.get("base_digest")
-        if not base or not request.get("sha"):
-            continue
-        project = db.get_project(request.get("project_id") or "") or db.get_project(
-            (_packet_row(row["id"]) or {}).get("project_id") or "")
-        if not project:
-            continue
-        revision = int(row.get("revision") or 1)
-        contents = {item["path"]: item["content"]
-                    for item in verified_contents(row["id"], revision)}
-        built = {key: value for key, value in manifest.items()
-                 if key not in ("semantic", "base_digest", "previous_digest")}
-        built["digest"] = base
-        from . import semantic as semantic_module
-        try:
-            evidence, state = semantic_module.collect_evidence(
-                project, str(request.get("sha") or ""), str(request.get("goal") or ""),
-                int(request.get("budget_tokens") or 2000))
-        except Exception as exc:  # noqa: BLE001
-            evidence, state = [], {"state": "verify_failed", "reason": str(exc)[:300]}
-        try:
-            _store_built(row["id"], built, contents, evidence=evidence, semantic=state)
-            retried += 1
-        except Exception as exc:  # noqa: BLE001 — пакет не должен зависнуть
-            fail(row["id"], f"повторная сборка контекста: {exc}"[:300])
-    return retried
+    return 0

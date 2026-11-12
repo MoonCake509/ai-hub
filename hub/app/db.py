@@ -383,6 +383,15 @@ DDL = [
         primary key (packet_id, revision, position)
     )""",
     "create index if not exists context_packet_evidence_sha on aihub.context_packet_evidence(packet_id, revision)",
+    # P-09: черновик пакета на время асинхронной сборки семантического контекста.
+    # Файлы и digest фиксируются только после проверки evidence, поэтому до
+    # финализации пакет не имеет ревизии и не может быть выдан роли.
+    """create table if not exists aihub.context_packet_drafts (
+        packet_id text primary key references aihub.context_packets(id) on delete cascade,
+        draft jsonb not null default '{}',
+        created_at timestamptz not null default now(),
+        updated_at timestamptz not null default now()
+    )""",
     # FLOW-P1: история ревизий пакетов — ревизии неизменяемы, текущие items лишь указатель.
     """create table if not exists aihub.context_packet_revisions (
         packet_id text not null references aihub.context_packets(id) on delete cascade,

@@ -40,15 +40,19 @@ except Exception as _ws_exc:  # noqa: BLE001
     workspace_host = None
     log(f"workspace ops disabled: {_ws_exc}")
 
-KINDS = ["agent"] + (["workspace"] if workspace_host is not None else [])
+# Один процесс может обслуживать обе очереди, либо только одну: длинные
+# задания ролей не должны задерживать короткие операции над рабочим каталогом.
+_ONLY = [k.strip() for k in os.environ.get("AIHUB_WORKER_KINDS", "").split(",") if k.strip()]
+KINDS = [k for k in (["agent"] + (["workspace"] if workspace_host is not None else []))
+         if not _ONLY or k in _ONLY]
 # Служебный агент workspace: хаб адресует ему control-задания, а фильтр
 # аренды отбирает их по списку агентов поллера.
-POLL_AGENTS = list(AGENTS) + (["workspace"] if workspace_host is not None else [])
+POLL_AGENTS = (list(AGENTS) if "agent" in KINDS else []) + (["workspace"] if "workspace" in KINDS else [])
 
 HUB_FILE = os.path.join(HERE, "hub.txt")
 OUTBOX = os.path.join(HERE, "outbox")
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "3"))
-WORKER = os.environ.get("COMPUTERNAME", "laptop")
+WORKER = os.environ.get("AIHUB_WORKER_NAME") or os.environ.get("COMPUTERNAME", "laptop")
 os.makedirs(OUTBOX, exist_ok=True)
 
 
@@ -201,12 +205,14 @@ def heartbeat_loop(base: str, attempt_id: str, lease: int, stop: threading.Event
             return
 
 
-LOCK_PATH = os.path.join(HERE, "worker.lock")
+# Блокировка на процесс-роль: основной и workspace-only работают рядом.
+_LOCK_NAME = "worker.lock" if not _ONLY else "worker-" + WORKER.replace("\\", "-") + ".lock"
+LOCK_PATH = os.path.join(HERE, _LOCK_NAME)
 _lock_handle = None
 
 
 def acquire_single_instance() -> bool:
-    """Один воркер на хост. Блокировка ОС снимается сама, когда процесс умирает, — чистить lock не нужно."""
+    """Один воркер на роль. Блокировка ОС снимается сама, когда процесс умирает, — чистить lock не нужно."""
     global _lock_handle
     try:
         _lock_handle = open(LOCK_PATH, "a+")

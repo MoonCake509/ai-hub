@@ -477,6 +477,10 @@ def _gate_context(conn, run: dict, task: dict) -> tuple[str | None, dict | None]
         if not packet:
             return "пакет контекста не найден", None
         if packet["state"] == "sealed":
+            semantic_state = ((packet.get("manifest") or {}).get("semantic") or {}).get("state")
+            if ((task.get("role") or "") == "coder"
+                    and semantic_state in ("embed_failed", "verify_failed", "no_index")):
+                return (f"семантический контекст не собран: {semantic_state}"), None
             selected = [item for item in (packet.get("items") or []) if item.get("selected")]
             saved = packets.verified_contents(packet["id"], int(packet.get("revision") or 1))
             if selected and not saved:
@@ -509,7 +513,9 @@ def _gate_context(conn, run: dict, task: dict) -> tuple[str | None, dict | None]
                 sha=str(run.get("base_sha") or ""))
         elif context_spec.get("paths"):
             ctx = packets.start(project, list(context_spec["paths"]),
-                                int(context_spec.get("budget_tokens") or 2000) * 4)
+                                int(context_spec.get("budget_tokens") or 2000) * 4,
+                                sha=str(run.get("base_sha") or ""),
+                                goal=context_spec.get("goal") or run.get("goal") or "")
         else:
             return "в контексте шага нет ни entry, ни paths", None
     except Exception as exc:  # noqa: BLE001
@@ -612,6 +618,14 @@ def dispatch(run_id: str, resolve_agent, max_queue: int = 50) -> dict:
                                   "content": item["content"]} for item in context_files],
                                 ensure_ascii=False))
                     evidence = packets.evidence(packet["id"], int(packet.get("revision") or 1))
+                    base_sha = str(run.get("base_sha") or "")
+                    stale = [item for item in evidence if str(item.get("sha") or "") != base_sha]
+                    if stale:
+                        evidence = [item for item in evidence if str(item.get("sha") or "") == base_sha]
+                        event(conn, run_id, task["id"], "semantic_context_rejected",
+                              {"packet_id": packet["id"], "stale": len(stale),
+                               "evidence_sha": str(stale[0].get("sha") or "")[:12],
+                               "run_sha": base_sha[:12]})
                     if evidence and (task.get("role") or "") == "coder":
                         sections.append(
                             "Семантический контекст (фрагменты коммита "

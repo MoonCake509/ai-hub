@@ -57,6 +57,22 @@ def kinds(project_id: str, sha: str = "") -> list[str]:
     return [row["kind"] for row in rows if row.get("kind")]
 
 
+def models(project_id: str, sha: str) -> dict[str, str]:
+    """Модель, которой построен индекс каждого вида фрагментов.
+
+    Запросный вектор обязан считаться той же моделью: смешивать пространства
+    разных моделей нельзя, иначе score бессмыслен.
+    """
+    conn = db.connect()
+    rows = db._rows(conn, db._qualify(
+        "select kind, model from aihub.semantic_chunks where project_id = :p and sha = :s"
+        " group by kind, model"), p=project_id, s=sha)
+    out: dict[str, str] = {}
+    for row in rows:
+        out.setdefault(str(row.get("kind") or "docs"), str(row.get("model") or ""))
+    return out
+
+
 def _cosine(left: list[float], right: list[float]) -> float:
     if len(left) != len(right):
         return -1.0
@@ -66,7 +82,7 @@ def _cosine(left: list[float], right: list[float]) -> float:
 
 
 def search(project_id: str, vectors: dict[str, list[float]], sha: str = "",
-           limit: int = 10) -> dict:
+           limit: int = 10, models_map: dict[str, str] | None = None) -> dict:
     """Топ фрагментов по косинусу. Каждый вид фрагментов сравнивается со своим вектором."""
     conn = db.connect()
     if sha:
@@ -92,6 +108,8 @@ def search(project_id: str, vectors: dict[str, list[float]], sha: str = "",
             continue
         query_vec = vectors.get(row.get("kind") or "docs")
         if not query_vec:
+            continue
+        if models_map is not None and str(row.get("model") or "") != models_map.get(str(row.get("kind") or "docs"), ""):
             continue
         score = _cosine(query_vec, [float(x) for x in vec])
         scored.append({"path": row["path"], "start_line": row["start_line"],
@@ -147,7 +165,19 @@ def collect_evidence(project: dict, sha: str, goal: str, budget_tokens: int = 20
     root = project.get("workdir") or ""
     kinds_here = kinds(project_id, sha)
     if not kinds_here:
-        return [], {"state": "no_index", "sha": sha}
+        # Индекс нужного SHA строится с ограниченным ожиданием: без него код не выдаётся.
+        try:
+            _op(project, "semantic_index",
+                {"root": root, "sha": sha, "project_id": project_id, "upload": True}, 300)
+        except Exception as exc:  # noqa: BLE001
+            return [], {"state": "no_index", "sha": sha, "reason": str(exc)[:300]}
+        kinds_here = kinds(project_id, sha)
+        if not kinds_here:
+            return [], {"state": "no_index", "sha": sha, "reason": "индекс пуст после сборки"}
+    try:
+        models_map = models(project_id, sha)
+    except Exception:  # noqa: BLE001 — в юнит-тестах БД нет; фильтр по модели тогда не применяется
+        models_map = {}
     vectors: dict[str, list[float]] = {}
     try:
         for kind in kinds_here:
@@ -160,7 +190,7 @@ def collect_evidence(project: dict, sha: str, goal: str, budget_tokens: int = 20
         return [], {"state": "embed_failed", "sha": sha, "reason": str(exc)[:300]}
     if not vectors:
         return [], {"state": "no_vectors", "sha": sha}
-    found = search(project_id, vectors, sha, limit=12)
+    found = search(project_id, vectors, sha, limit=12, models_map=models_map)
     candidates: list[dict] = []
     for hit in found.get("matches") or []:
         if float(hit.get("score") or 0) <= 0:
@@ -185,11 +215,12 @@ def collect_evidence(project: dict, sha: str, goal: str, budget_tokens: int = 20
     used_tokens = 0
     for item in checked.get("verified") or []:
         tokens = max(1, len(str(item.get("text") or "")) // 4)
-        if used_tokens + tokens > min(EVIDENCE_TOKENS, max(200, int(budget_tokens))):
+        limit_tokens = max(0, min(EVIDENCE_TOKENS, int(budget_tokens)))
+        if limit_tokens == 0 or used_tokens + tokens > limit_tokens:
             continue
         used_tokens += tokens
         item["score"] = by_key.get((item["path"], item["start_line"], item["end_line"]), 0.0)
-        item["model"] = "e5-mean"
+        item["model"] = models_map.get(str(item.get("kind") or "code"), "")
         verified.append(item)
         if len(verified) >= EVIDENCE_LIMIT:
             break

@@ -462,11 +462,21 @@ def _dsn() -> dict:
     }
 
 
+_tls = threading.local()
+
+
 def connect() -> pg8000.native.Connection:
-    global _conn
-    if _conn is None:
-        _conn = pg8000.native.Connection(**_dsn(), timeout=30)
-    return _conn
+    """Соединение на поток.
+
+    Одно общее соединение pg8000 не выдерживает параллельных вызовов из потоков
+    sweeper'а: смешиваются prepared statements, отсюда `portal "" does not exist`
+    и `bind message supplies N parameters`. Поток получает своё соединение.
+    """
+    conn = getattr(_tls, "conn", None)
+    if conn is None:
+        conn = pg8000.native.Connection(**_dsn(), timeout=30)
+        _tls.conn = conn
+    return conn
 
 
 def init() -> None:

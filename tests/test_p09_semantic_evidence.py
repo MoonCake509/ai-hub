@@ -22,6 +22,14 @@ def _evidence(path="app.py", start=1, end=3, oid="a" * 40, digest="b" * 64):
             "text_sha256": digest, "score": 0.5, "model": "e5-mean"}
 
 
+def test_shared_digest_helper_used_by_both_paths():
+    items = [{"path": "app.py", "size": 10, "sha256": "d" * 64, "selected": True}]
+    base = packets.digest(items)
+    raw = f"aihub-packet-v{packets.PACKET_FORMAT_VERSION}\n" + packets.canonical(items)
+    assert packets.digest(items, evidence=[_evidence()]) == packets.evidence_digest(raw, [_evidence()])
+    assert packets.evidence_digest(raw, []) == base
+
+
 def test_digest_changes_with_evidence():
     items = [{"path": "app.py", "size": 10, "sha256": "d" * 64, "selected": True}]
     plain = packets.digest(items)
@@ -30,10 +38,13 @@ def test_digest_changes_with_evidence():
     assert packets.digest(items, evidence=[_evidence()]) == with_ev, "digest детерминирован"
 
 
-def test_evidence_canonical_ignores_text_and_score():
+def test_evidence_canonical_ignores_text_but_covers_prompt_fields():
     left = _evidence()
-    right = dict(left, text="другой текст", score=0.9)
-    assert packets.evidence_canonical([left]) == packets.evidence_canonical([right])
+    same = dict(left, text="другой текст")
+    assert packets.evidence_canonical([left]) == packets.evidence_canonical([same]), "текст удостоверяет text_sha256"
+    for field, value in (("score", 0.9), ("sha", "f" * 40), ("model", "other")):
+        changed = dict(left, **{field: value})
+        assert packets.evidence_canonical([left]) != packets.evidence_canonical([changed]), field
 
 
 def test_evidence_canonical_responds_to_oid_and_hash():

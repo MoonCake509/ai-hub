@@ -107,6 +107,7 @@ async def _sweeper() -> None:
             # Quick-run deadlines are enforced even with no browser open.
             await asyncio.to_thread(quality.refresh_active_runs)
             await asyncio.to_thread(packets.poll_active)
+            await asyncio.to_thread(packets.retry_semantic)
             await asyncio.to_thread(runs_ctrl.poll_active, _resolve_run_agent)
         except Exception as exc:  # noqa: BLE001
             print(f"lease sweeper error: {exc}", flush=True)

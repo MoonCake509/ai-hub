@@ -88,22 +88,33 @@ def canonical(items: list[dict]) -> str:
 
 
 def evidence_canonical(evidence: list[dict]) -> str:
-    """Канонический вид семантического контекста: диапазоны и blob'ы, без текста."""
+    """Канонический вид семантического контекста.
+
+    В канон входит всё, что попадает кодеру и влияет на смысл: sha, диапазон, вид,
+    blob, хеш текста, модель и score. Текст не входит — его удостоверяет text_sha256.
+    """
     lines = []
     for item in sorted(evidence or [], key=lambda x: (str(x.get("path")), int(x.get("start_line") or 0))):
-        lines.append(f"{item.get('path')}|{int(item.get('start_line') or 0)}|{int(item.get('end_line') or 0)}"
-                     f"|{item.get('kind')}|{item.get('blob_oid')}|{item.get('text_sha256')}")
+        lines.append(f"{item.get('sha')}|{item.get('path')}|{int(item.get('start_line') or 0)}"
+                     f"|{int(item.get('end_line') or 0)}|{item.get('kind')}|{item.get('blob_oid')}"
+                     f"|{item.get('text_sha256')}|{item.get('model')}|{round(float(item.get('score') or 0), 4)}")
     return "\n".join(lines)
+
+
+def evidence_digest(base_digest: str, evidence: list[dict]) -> str:
+    """Единственная формула digest пакета с evidence — общая для seal и _store_built."""
+    body = str(base_digest)
+    canonical_evidence = evidence_canonical(evidence)
+    if canonical_evidence:
+        body += "\n--evidence--\n" + canonical_evidence
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
 def digest(items: list[dict], version: int = PACKET_FORMAT_VERSION,
            evidence: list[dict] | None = None) -> str:
     """Digest пакета: SHA выбранных файлов + evidence + версия формата."""
     body = f"aihub-packet-v{version}\n" + canonical(items)
-    ev = evidence_canonical(evidence or [])
-    if ev:
-        body += "\n--evidence--\n" + ev
-    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+    return evidence_digest(body, evidence or [])
 
 
 def select(entries: list[dict], requested: list[str], budget_bytes: int) -> tuple[list[dict], int, dict]:
@@ -302,7 +313,8 @@ def seal(packet_id: str, entries: list[dict], recheck: bool = False,
     items, used, stats = select(entries, request.get("requested") or [], int(row["budget_bytes"]))
     evidence = evidence_ if evidence_ is not None else []
     semantic = {"state": semantic_state or ("collected" if evidence else "empty")}
-    if evidence_ is None and request.get("sha") and request.get("kind") == "context":
+    if evidence_ is None and request.get("sha") and (request.get("kind") == "context"
+                                                     or request.get("requested") is not None):
         from . import semantic as semantic_module
         project = db.get_project(row.get("project_id") or "") or {}
         try:
@@ -431,10 +443,17 @@ def create_context(project: dict, goal: str, entry: str, contracts: list[str],
 
 
 def start(project: dict, requested: list[str], budget_bytes: int,
-          conversation_id: str | None = None) -> dict:
+          conversation_id: str | None = None, sha: str = "", goal: str = "") -> dict:
     """Создаёт пакет и ставит задание list_files на хост проекта."""
     from . import workspace
     packet = create(project["id"], requested, budget_bytes, conversation_id)
+    if sha or goal:
+        with db._lock:
+            conn = db.connect()
+            conn.run(db._qualify(
+                "update aihub.context_packets set request = request || :extra::jsonb where id = :i"),
+                extra=json.dumps({"sha": str(sha or ""), "goal": str(goal or "")}, ensure_ascii=False),
+                i=packet["packet_id"])
     job = workspace.create_op_job(
         "list_files",
         {"root": project.get("workdir") or "", "glob": "**/*", "limit": LIST_PAGE, "offset": 0},
@@ -464,11 +483,10 @@ def _store_built(packet_id: str, built: dict, contents: dict[str, str] | None = 
     ревизия, даже если выбранные файлы не изменились.
     """
     evidence = evidence or []
-    if evidence:
+    if evidence or "base_digest" not in built:
         built = dict(built)
-        built["digest"] = hashlib.sha256(
-            (str(built["digest"]) + "\n--evidence--\n" + evidence_canonical(evidence)).encode("utf-8")
-        ).hexdigest()
+        built["base_digest"] = str(built["digest"])
+        built["digest"] = evidence_digest(built["base_digest"], evidence)
     if semantic:
         built = dict(built)
         built["semantic"] = semantic
@@ -981,3 +999,55 @@ def start_recheck(packet_id: str) -> dict:
             " provider_op = 'recheck', updated_at = now() where id = :i returning id"),
             j=job["job"]["id"], i=packet_id)
     return {"packet_id": packet_id, "state": "probing", "job_id": job["job"]["id"]}
+
+
+RETRY_STATES = {"no_index", "embed_failed", "verify_failed"}
+
+
+def retry_semantic(limit: int = 5, min_age_s: int = 10) -> int:
+    """Повторная сборка семантического контекста для уже запечатанных пакетов.
+
+    Код не выдаётся, пока состояние retryable; этот проход даёт ему шанс дойти до
+    collected без ручного вмешательства. Ревизия при этом растёт, история цела.
+    """
+    with db._lock:
+        conn = db.connect()
+        rows = db._rows(conn, db._qualify(
+            "select id, revision, manifest, request from aihub.context_packets"
+            " where state = 'sealed' and manifest->'semantic'->>'state' = any(:states)"
+            " and updated_at < now() - make_interval(secs => :age) order by updated_at limit :l"),
+            states=list(RETRY_STATES), age=int(min_age_s), l=int(limit))
+    retried = 0
+    for row in rows:
+        manifest = row.get("manifest") or {}
+        request = row.get("request") or {}
+        if isinstance(manifest, str):
+            manifest = json.loads(manifest)
+        if isinstance(request, str):
+            request = json.loads(request)
+        base = manifest.get("base_digest")
+        if not base or not request.get("sha"):
+            continue
+        project = db.get_project(request.get("project_id") or "") or db.get_project(
+            (_packet_row(row["id"]) or {}).get("project_id") or "")
+        if not project:
+            continue
+        revision = int(row.get("revision") or 1)
+        contents = {item["path"]: item["content"]
+                    for item in verified_contents(row["id"], revision)}
+        built = {key: value for key, value in manifest.items()
+                 if key not in ("semantic", "base_digest", "previous_digest")}
+        built["digest"] = base
+        from . import semantic as semantic_module
+        try:
+            evidence, state = semantic_module.collect_evidence(
+                project, str(request.get("sha") or ""), str(request.get("goal") or ""),
+                int(request.get("budget_tokens") or 2000))
+        except Exception as exc:  # noqa: BLE001
+            evidence, state = [], {"state": "verify_failed", "reason": str(exc)[:300]}
+        try:
+            _store_built(row["id"], built, contents, evidence=evidence, semantic=state)
+            retried += 1
+        except Exception as exc:  # noqa: BLE001 — пакет не должен зависнуть
+            fail(row["id"], f"повторная сборка контекста: {exc}"[:300])
+    return retried

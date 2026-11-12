@@ -719,6 +719,7 @@ def op_archive_artifacts(root: str, args: dict) -> dict:
     файлы не трогаются. Повтор по тому же запуску заменяет его раздел.
     """
     import hashlib
+    import shutil
 
     run_id = str(args.get("run_id") or "")
     items = args.get("artifacts") or []
@@ -762,11 +763,18 @@ def op_archive_artifacts(root: str, args: dict) -> dict:
             raise OpFail("bad_arg", f"артефакт вне ops/: {path}")
         if not os.path.isfile(full):
             raise OpFail("bad_arg", f"артефакта нет: {rel}")
+        # Неизменяемая версия: изменяемые ops/pr/*.md и INDEX.md перезаписываются
+        # следующим запуском, и старые разделы журнала перестают быть правдой.
+        hist_rel = f"ops/artifacts/{run_id[:8]}/{rel}"
+        hist_full = os.path.join(root, hist_rel)
+        if not os.path.isfile(hist_full):
+            os.makedirs(os.path.dirname(hist_full), exist_ok=True)
+            shutil.copy2(full, hist_full)
         h = hashlib.sha256()
-        with open(full, "rb") as fh:
+        with open(hist_full, "rb") as fh:
             for chunk in iter(lambda: fh.read(1 << 20), b""):
                 h.update(chunk)
-        block.append(f"| `{os.path.basename(full)}` | `{h.hexdigest()[:16]}` | `{rel}` |")
+        block.append(f"| `{os.path.basename(full)}` | `{h.hexdigest()[:16]}` | `{hist_rel}` |")
     block.append("")
     if marker in text:
         head_part, _, rest = text.partition(marker)

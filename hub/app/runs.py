@@ -212,39 +212,54 @@ def create_run(project_id: str, template: dict, policy: dict | None = None,
             raise RunError("runner_unavailable",
                            "Воркер проекта не подтвердил готовность изолированного исполнителя проверок.")
     run_id = uuid.uuid4().hex
-    with db._lock:
-        conn = db.connect()
-        with db.transaction(conn):
-            db._one(conn, db._qualify(
-                "insert into aihub.runs(id, project_id, template_id, template_version, policy,"
-                " state, goal, criteria, assignments, project_snapshot, budgets, request_key,"
-                " idempotency_sha, created_at, updated_at)"
-                " values (:i, :p, :t, :v, :pol::jsonb, 'preparing', :g, :cr::jsonb, :asn::jsonb,"
-                "  :ps::jsonb, :b::jsonb, :rk, :sha, now(), now()) returning id"),
-                i=run_id, p=project_id, t=template_id, v=version,
-                pol=json.dumps(policy, ensure_ascii=False), g=goal,
-                cr=json.dumps(criteria, ensure_ascii=False),
-                asn=json.dumps(assignments, ensure_ascii=False),
-                ps=json.dumps(project_snapshot, ensure_ascii=False),
-                b=json.dumps(policy.get("budgets") or {}, ensure_ascii=False),
-                rk=request_key, sha=payload_sha)
-            for index, step in enumerate(steps):
-                step_context = step.get("context") or {}
+    try:
+        with db._lock:
+            conn = db.connect()
+            with db.transaction(conn):
                 db._one(conn, db._qualify(
-                    "insert into aihub.run_tasks(id, run_id, key, role, agent, prompt, depends_on,"
-                    " position, state, attempt, context, assignment, created_at, updated_at)"
-                    " values (:i, :r, :k, :role, :ag, :pr, :d, :pos, 'pending', 0,"
-                    "  :ctx::jsonb, :asn::jsonb, now(), now()) returning id"),
-                    i=uuid.uuid4().hex, r=run_id, k=step["key"], role=step.get("role") or "",
-                    ag=step.get("agent") or "", pr=step.get("prompt") or "",
-                    d=json.dumps(list(step.get("depends_on") or []), ensure_ascii=False),
-                    pos=index,
-                    ctx=json.dumps(step_context, ensure_ascii=False),
-                    asn=json.dumps(assignments.get(step["key"]) or {}, ensure_ascii=False))
-            event(conn, run_id, None, "run_created",
-                  {"template": template_id, "version": version, "steps": len(steps),
-                   "actor": actor, "goal": goal, "criteria": criteria,
-                   "request_key": request_key})
+                    "insert into aihub.runs(id, project_id, template_id, template_version, policy,"
+                    " state, goal, criteria, assignments, project_snapshot, budgets, request_key,"
+                    " idempotency_sha, created_at, updated_at)"
+                    " values (:i, :p, :t, :v, :pol::jsonb, 'preparing', :g, :cr::jsonb, :asn::jsonb,"
+                    "  :ps::jsonb, :b::jsonb, :rk, :sha, now(), now()) returning id"),
+                    i=run_id, p=project_id, t=template_id, v=version,
+                    pol=json.dumps(policy, ensure_ascii=False), g=goal,
+                    cr=json.dumps(criteria, ensure_ascii=False),
+                    asn=json.dumps(assignments, ensure_ascii=False),
+                    ps=json.dumps(project_snapshot, ensure_ascii=False),
+                    b=json.dumps(policy.get("budgets") or {}, ensure_ascii=False),
+                    rk=request_key, sha=payload_sha)
+                for index, step in enumerate(steps):
+                    step_context = step.get("context") or {}
+                    db._one(conn, db._qualify(
+                        "insert into aihub.run_tasks(id, run_id, key, role, agent, prompt, depends_on,"
+                        " position, state, attempt, context, assignment, created_at, updated_at)"
+                        " values (:i, :r, :k, :role, :ag, :pr, :d, :pos, 'pending', 0,"
+                        "  :ctx::jsonb, :asn::jsonb, now(), now()) returning id"),
+                        i=uuid.uuid4().hex, r=run_id, k=step["key"], role=step.get("role") or "",
+                        ag=step.get("agent") or "", pr=step.get("prompt") or "",
+                        d=json.dumps(list(step.get("depends_on") or []), ensure_ascii=False),
+                        pos=index,
+                        ctx=json.dumps(step_context, ensure_ascii=False),
+                        asn=json.dumps(assignments.get(step["key"]) or {}, ensure_ascii=False))
+                event(conn, run_id, None, "run_created",
+                      {"template": template_id, "version": version, "steps": len(steps),
+                       "actor": actor, "goal": goal, "criteria": criteria,
+                       "request_key": request_key})
+    except Exception:  # noqa: BLE001 — гонка первого POST по одному ключу
+        # Уникальный индекс не дал вставить второй запуск. Проигравший запрос
+        # обязан вернуть существующий запуск, а не 500 из драйвера БД.
+        if request_key:
+            existing = _run_by_key(request_key)
+            if existing:
+                if existing.get("idempotency_sha") == payload_sha:
+                    return {"run_id": existing["id"], "state": existing.get("state") or "preparing",
+                            "template_id": template_id, "template_version": version,
+                            "steps": len(steps), "existing": True}
+                raise RunError("idempotency_conflict",
+                               "request_key уже занят другим содержимым запуска",
+                               {"existing_run_id": existing["id"]}) from None
+        raise
     return {"run_id": run_id, "state": "preparing", "template_id": template_id,
             "template_version": version, "steps": len(steps), "existing": False}
 

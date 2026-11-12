@@ -28,3 +28,8 @@ tools/q.sh
 
 # стенд и архив живут внутри корня, но не в прод-репозитории
 workspace/
+
+# состояние воркера на машине
+agents/laptop/worker.lock
+agents/laptop/outbox/
+agents/laptop/inbox/

@@ -180,3 +180,19 @@ def test_archive_writes_actual_digest(tmp_path):
                                                        "sha256": "deadbeefdeadbeef"}]})
     text = (root / "ops" / "ARTIFACTS.md").read_text(encoding="utf-8")
     assert expected in text and "deadbeefdeadbeef" not in text
+
+
+def test_archive_uses_full_run_id_and_rejects_bad_id(tmp_path):
+    root = _project(tmp_path)
+    run_id = "ab12cd34" * 4
+    archived = wh.op_archive_artifacts(str(root), {"run_id": run_id, "sha": "deadbeef"})
+    assert archived["artifacts"] >= 2
+    hist = root / "ops" / "artifacts" / run_id / "ops" / "pr" / "plan.md"
+    assert hist.is_file(), "копия артефакта должна лежать под полным run_id"
+    for bad in ("ab12cd34", "../../etc", "zz" * 16):
+        try:
+            wh.op_archive_artifacts(str(root), {"run_id": bad})
+        except wh.OpFail as exc:
+            assert exc.code == "bad_arg"
+        else:
+            raise AssertionError(f"плохой run_id принят: {bad}")

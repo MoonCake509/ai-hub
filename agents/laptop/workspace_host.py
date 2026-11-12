@@ -721,10 +721,14 @@ def op_archive_artifacts(root: str, args: dict) -> dict:
     import hashlib
     import shutil
 
-    run_id = str(args.get("run_id") or "")
+    run_id = str(args.get("run_id") or "").strip()
     items = args.get("artifacts") or []
     if not run_id or not isinstance(items, list):
         raise OpFail("bad_arg", "run_id и artifacts обязательны")
+    # Полный идентификатор и только hex: префикс из восьми символов может
+    # совпасть у двух запусков, а «../» увёл бы копии за пределы ops/.
+    if not re.fullmatch(r"[0-9a-f]{32}", run_id):
+        raise OpFail("bad_arg", "run_id должен быть полным hex-идентификатором (32 символа)")
     if not items:
         import glob as _glob
         items = []
@@ -765,7 +769,7 @@ def op_archive_artifacts(root: str, args: dict) -> dict:
             raise OpFail("bad_arg", f"артефакта нет: {rel}")
         # Неизменяемая версия: изменяемые ops/pr/*.md и INDEX.md перезаписываются
         # следующим запуском, и старые разделы журнала перестают быть правдой.
-        hist_rel = f"ops/artifacts/{run_id[:8]}/{rel}"
+        hist_rel = f"ops/artifacts/{run_id}/{rel}"
         hist_full = os.path.join(root, hist_rel)
         if not os.path.isfile(hist_full):
             os.makedirs(os.path.dirname(hist_full), exist_ok=True)

@@ -219,7 +219,7 @@ def create_run(project_id: str, template: dict, policy: dict | None = None,
                 "insert into aihub.runs(id, project_id, template_id, template_version, policy,"
                 " state, goal, criteria, assignments, project_snapshot, budgets, request_key,"
                 " idempotency_sha, created_at, updated_at)"
-                " values (:i, :p, :t, :v, :pol::jsonb, 'active', :g, :cr::jsonb, :asn::jsonb,"
+                " values (:i, :p, :t, :v, :pol::jsonb, 'preparing', :g, :cr::jsonb, :asn::jsonb,"
                 "  :ps::jsonb, :b::jsonb, :rk, :sha, now(), now()) returning id"),
                 i=run_id, p=project_id, t=template_id, v=version,
                 pol=json.dumps(policy, ensure_ascii=False), g=goal,
@@ -245,8 +245,45 @@ def create_run(project_id: str, template: dict, policy: dict | None = None,
                   {"template": template_id, "version": version, "steps": len(steps),
                    "actor": actor, "goal": goal, "criteria": criteria,
                    "request_key": request_key})
-    return {"run_id": run_id, "state": "active", "template_id": template_id,
+    return {"run_id": run_id, "state": "preparing", "template_id": template_id,
             "template_version": version, "steps": len(steps), "existing": False}
+
+
+def activate_run(run_id: str) -> dict:
+    """Запуск становится активным только после копии задачи и подготовки среды.
+
+    До этого диспетчер его не видит: иначе возможна выдача кодера в основную
+    рабочую копию, пока task_root ещё не привязан.
+    """
+    with db._lock:
+        conn = db.connect()
+        with db.transaction(conn):
+            row = db._one(conn, db._qualify(
+                "select state from aihub.runs where id = :i for update"), i=run_id)
+            if not row:
+                raise RunError("not_found", "запуск не найден")
+            if row.get("state") != "preparing":
+                return {"run_id": run_id, "state": row.get("state"), "activated": False}
+            db._one(conn, db._qualify(
+                "update aihub.runs set state = 'active', updated_at = now()"
+                " where id = :i returning id"), i=run_id)
+            event(conn, run_id, None, "run_ready", {})
+    return {"run_id": run_id, "state": "active", "activated": True}
+
+
+def abort_run(run_id: str, reason: str) -> dict:
+    """Отказ до старта: запуск закрывается, кодер к файлам не допускается."""
+    reason = str(reason or "").strip()[:400]
+    with db._lock:
+        conn = db.connect()
+        with db.transaction(conn):
+            db._one(conn, db._qualify(
+                "update aihub.runs set state = 'failed', finished_at = now(),"
+                " updated_at = now(), cancel_info = :c::jsonb"
+                " where id = :i and state = 'preparing' returning id"),
+                i=run_id, c=json.dumps({"reason": reason}, ensure_ascii=False))
+            event(conn, run_id, None, "run_failed", {"reason": reason})
+    return {"run_id": run_id, "state": "failed"}
 
 
 def _run_by_key(request_key: str) -> dict | None:
@@ -582,6 +619,7 @@ def dispatch(run_id: str, resolve_agent, max_queue: int = 50) -> dict:
                     "project_workdir": project_snapshot.get("project_workdir") or "",
                     "workdir": project_snapshot.get("project_workdir") or "",
                     "task_branch": run.get("task_branch") or "",
+                    "task_copy": bool(run.get("task_root")),
                     "expect_head": (run.get("candidate_sha") or "")
                                    if (task.get("role") or "") in ("tester", "reviewer") else "",
                     "packet_id": (packet or {}).get("id") or task.get("context_id"),
@@ -917,15 +955,24 @@ def _after_step(run: dict, job_id: str) -> None:
     merged = merge_task(run_id)
     fresh = get_run(run_id) or fresh
     if merged.get("merged"):
+        # Порядок важен: отчёты перезаписывают ops/pr/*.md, поэтому артефакты
+        # регистрируются после них, с фактическими хешами; карта — по слитому HEAD.
+        try:
+            from . import reports as reports_ctrl
+            synced = reports_ctrl.sync_project(run["project_id"])
+            if synced.get("job"):
+                _wait_job(str(synced["job"]), 120)
+        except Exception as exc:  # noqa: BLE001 — отчёты не должны ронять приёмку
+            _event(run_id, None, "reports_failed", {"reason": str(exc)[:300]})
         try:
             _archive_run(fresh, project)
         except Exception as exc:  # noqa: BLE001 — журнал не должен ронять приёмку
             _event(run_id, None, "artifacts_failed", {"reason": str(exc)[:300]})
         try:
-            from . import reports as reports_ctrl
-            reports_ctrl.sync_project(run["project_id"])
-        except Exception as exc:  # noqa: BLE001 — отчёты не должны ронять приёмку
-            _event(run_id, None, "reports_failed", {"reason": str(exc)[:300]})
+            _task_op(fresh, project, "refresh_index", {}, wait_s=120,
+                     key=f"run:{run_id}:index", root=str(project.get("workdir") or ""))
+        except Exception as exc:  # noqa: BLE001
+            _event(run_id, None, "index_failed", {"reason": str(exc)[:300]})
         publish_run(fresh, project)
 
 def _restart_from_coder(conn, task: dict, decision: dict,
@@ -1213,29 +1260,6 @@ def start_task_copy(project_id: str, run_id: str) -> dict:
     return {**result, "existing": False}
 
 
-def _verify_task_copy(run: dict, task: dict) -> str | None:
-    """Сверка папки/ветки (и коммита кандидата) перед выдачей шага.
-
-    Возвращает причину остановки или None. Несовпадение — шаг не выполняется,
-    файлы не меняются.
-    """
-    root = (run.get("task_root") or "").strip()
-    if not root:
-        return None
-    role = task.get("role") or ""
-    want_head = (run.get("candidate_sha") or "") if role in ("tester", "reviewer") else ""
-    final = _task_op(run, db.get_project(run["project_id"]) or {}, "verify_task",
-                     {"branch": run.get("task_branch") or "", "head_sha": want_head},
-                     wait_s=120, key=f"run:{run['id']}:verify:{task['key']}:{task.get('attempt') or 0}")
-    if final.get("status") != "succeeded":
-        return f"рабочая копия задачи не подтверждена: {final.get('error') or final.get('status')}"[:300]
-    result = final.get("result") or {}
-    if want_head and result.get("head_sha") != want_head:
-        return (f"коммит задания {want_head[:12]}, в копии {str(result.get('head_sha'))[:12]}"
-                " — шаг остановлен до изменения файлов")
-    return None
-
-
 def setup_env(run_id: str, setup: dict) -> dict:
     """Подготовка среды в рабочей копии задачи до запуска кодера."""
     run = get_run(run_id)
@@ -1284,7 +1308,8 @@ def merge_task(run_id: str) -> dict:
     try:
         job = workspace.create_op_job(
             "task_merge", {"root": root, "branch": run.get("task_branch") or "",
-                           "sha": sha, "target": target},
+                           "sha": sha, "target": target,
+                           "base_sha": run.get("base_sha") or ""},
             str(project.get("host_id") or "laptop"), run["project_id"],
             f"run:{run_id}:merge:{sha[:12]}")
     except workspace.OpError as exc:
@@ -1301,7 +1326,10 @@ def merge_task(run_id: str) -> dict:
     # Вердикт — по факту слияния: --ff-only уже гарантирует, что целевая ветка
     # была предком кандидата. `previous_head` не участвует в сверке, иначе сбой
     # чтения HEAD до слияния помечает успешное слияние как base_moved.
-    if result.get("merged") and str(result.get("sha") or "") == sha:
+    base = str(run.get("base_sha") or "")
+    previous = str(result.get("previous_head") or "")
+    if (result.get("merged") and str(result.get("sha") or "") == sha
+            and (not base or previous == base)):
         db.set_run_merge(run_id, "merged", sha)
         _event(run_id, None, "merge_done",
               {"sha": sha, "target": target, "branch": run.get("task_branch"),

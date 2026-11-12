@@ -1854,6 +1854,7 @@ async def run_create(request: Request) -> JSONResponse:
             copy = await asyncio.to_thread(runs_ctrl.start_task_copy, project_id,
                                            result["run_id"])
         except runs_ctrl.RunError as exc:
+            await asyncio.to_thread(runs_ctrl.abort_run, result["run_id"], str(exc))
             raise HTTPException(status_code=409, detail={
                 "code": exc.code, "message": str(exc), "run_id": result["run_id"]}) from None
         result["task_root"] = copy.get("task_root")
@@ -1864,10 +1865,16 @@ async def run_create(request: Request) -> JSONResponse:
         if setup.get("cmd"):
             prepared = await asyncio.to_thread(runs_ctrl.setup_env, result["run_id"], setup)
             if not prepared.get("ok"):
+                await asyncio.to_thread(runs_ctrl.abort_run, result["run_id"],
+                                        str(prepared.get("error") or "env_setup failed"))
                 raise HTTPException(status_code=409, detail={
                     "code": "setup_failed", "message": prepared.get("error"),
                     "run_id": result["run_id"]})
             result["env_setup"] = "ok"
+        # Барьер: диспетчер выдаёт задачи только активному запуску, а активным
+        # он становится здесь — после копии задачи и подготовки среды.
+        activated = await asyncio.to_thread(runs_ctrl.activate_run, result["run_id"])
+        result["state"] = activated.get("state") or "active"
     # Идентичный повтор с тем же ключом возвращает прежний запуск (200), новый
     # запрос — 202. Расхождение содержимого под тем же ключом — 409 выше.
     status = 200 if result.get("existing") else 202

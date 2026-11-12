@@ -73,9 +73,9 @@ def build_taskflow(project: dict, run: dict) -> str:
         "",
         f"Прогон: `{run.get('id')}` · шаблон `{run.get('template_id')}` · состояние **{_label(run.get('state'))}**",
         "",
-        f"Ветка: `{run.get('branch') or project.get('branch') or '—'}` · "
-        f"база `{_short(project.get('head_sha'))}` · "
-        f"кандидат `{_short(run.get('candidate_digest'))}`",
+        f"Ветка: `{run.get('task_branch') or run.get('branch') or project.get('branch') or '—'}` · "
+        f"база `{_short(run.get('base_sha') or project.get('head_sha'))}` · "
+        f"кандидат `{_short(run.get('merged_sha') or run.get('candidate_sha') or run.get('candidate_digest'))}`",
         "",
         "## Шаги",
         "",
@@ -182,9 +182,9 @@ def build_pr_drafts(project: dict, run: dict) -> dict[str, str]:
             "",
             f"Прогон: `{run.get('id')}` · роль: {task.get('role')} · статус: {_label(task.get('state'))}",
             "",
-            f"База: `{_short(project.get('head_sha'))}`  ",
-            f"Кандидат: `{_short(run.get('candidate_digest'))}`  ",
-            f"Ветка: `{run.get('branch') or project.get('branch') or '—'}`",
+            f"База: `{_short(run.get('base_sha') or project.get('head_sha'))}`  ",
+            f"Кандидат: `{_short(run.get('merged_sha') or run.get('candidate_sha') or run.get('candidate_digest'))}`  ",
+            f"Ветка: `{run.get('task_branch') or run.get('branch') or project.get('branch') or '—'}`",
             "",
             "## Проверки",
             "",
@@ -225,8 +225,11 @@ def build_environments(project: dict, run: dict) -> str:
         ("git-репозиторий", str(project.get("host_id") or "—"),
          f"`{project.get('git_root') or project.get('workdir') or '—'}`", "подготовка проекта"),
         ("ветка / коммит", str(project.get("host_id") or "—"),
-         f"`{project.get('branch') or '—'}` / `{_short(project.get('index_sha') or project.get('head_sha'))}`",
-         "карта проекта"),
+         f"`{project.get('branch') or '—'}` / `{_short(run.get('merged_sha') or run.get('candidate_sha') or project.get('head_sha'))}`",
+         "принятый прогон"),
+        ("копия задачи", str(project.get("host_id") or "—"),
+         f"`{run.get('task_root') or '—'}` · `{run.get('task_branch') or '—'}`",
+         "копия запуска"),
     ]
     if isolation:
         rows.append(("проверки", str(project.get("host_id") or "—"),

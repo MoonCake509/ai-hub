@@ -503,7 +503,8 @@ INDEX_MAX_FILES = 2000
 
 
 SECRET_PATTERNS = (".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "id_rsa*",
-                   "id_ed25519*", "credentials*", "secrets*", "*token*", "*.kdbx")
+                   "id_ed25519*", "credentials*", "secrets*", "*token*", "*.kdbx",
+                   ".npmrc", ".netrc", ".git-credentials", "auth.json", "*.p8", "*.jks")
 
 
 def _is_secret_path(rel: str) -> bool:
@@ -549,9 +550,18 @@ def op_task_start(root: str, args: dict) -> dict:
     task_repo = os.path.join(task_root, "repo")
     if os.path.isdir(task_repo):
         code, head = _git(task_repo, "rev-parse", "HEAD")
+        if code != 0:
+            raise OpFail("git_failed", f"копия задачи без HEAD: {task_repo}")
         _, current = _git(task_repo, "rev-parse", "--abbrev-ref", "HEAD")
-        return {"task_root": task_root, "branch": current.strip() or branch,
-                "base_sha": base_sha, "head_sha": head.strip(), "created": False}
+        current, head = current.strip(), head.strip()
+        if current != branch:
+            raise OpFail("task_conflict",
+                         f"копия {task_root} на ветке {current}, ожидалась {branch}")
+        if base_sha and head != base_sha:
+            raise OpFail("task_conflict",
+                         f"копия {task_root} на {head[:12]}, база задания {base_sha[:12]}")
+        return {"task_root": task_root, "branch": current,
+                "base_sha": base_sha, "head_sha": head, "created": False}
     if not base_sha:
         code, head = _git(repo, "rev-parse", "HEAD")
         if code != 0:
@@ -560,6 +570,12 @@ def op_task_start(root: str, args: dict) -> dict:
     os.makedirs(os.path.join(root, "runs"), exist_ok=True)
     code, out = _git(repo, "rev-parse", "--verify", f"refs/heads/{branch}")
     if code == 0:
+        # Существующая ветка задания переиспользуется только от той же базы:
+        # иначе копия унаследует чужие коммиты прошлого прогона.
+        _, ref_head = _git(repo, "rev-parse", f"refs/heads/{branch}")
+        if base_sha and ref_head.strip() != base_sha:
+            raise OpFail("task_conflict",
+                         f"ветка {branch} уже на {ref_head.strip()[:12]}, база задания {base_sha[:12]}")
         code, out = _git(repo, "worktree", "add", task_repo, branch)
     else:
         code, out = _git(repo, "worktree", "add", "-b", branch, task_repo, base_sha)
@@ -570,8 +586,14 @@ def op_task_start(root: str, args: dict) -> dict:
         shutil.copytree(src_ops, os.path.join(task_root, "ops"), dirs_exist_ok=True,
                         ignore=shutil.ignore_patterns("backups", "runs"))
     code, head = _git(task_repo, "rev-parse", "HEAD")
+    if code != 0 or not head.strip():
+        raise OpFail("git_failed", f"копия задачи без HEAD: {task_repo}")
+    head = head.strip()
+    if base_sha and head != base_sha:
+        raise OpFail("task_conflict",
+                     f"копия начата с {head[:12]}, база задания {base_sha[:12]}")
     return {"task_root": task_root, "branch": branch, "base_sha": base_sha,
-            "head_sha": head.strip(), "created": True}
+            "head_sha": head, "created": True}
 
 
 def op_verify_task(root: str, args: dict) -> dict:
@@ -608,6 +630,7 @@ def op_task_merge(root: str, args: dict) -> dict:
     branch = str(args.get("branch") or "")
     sha = str(args.get("sha") or "")
     target = str(args.get("target") or "main")
+    base = str(args.get("base_sha") or "")
     if not branch or not sha:
         raise OpFail("bad_arg", "branch и sha обязательны")
     # Слияние выполняется в основной рабочей копии: целевая ветка может быть
@@ -640,6 +663,15 @@ def op_task_merge(root: str, args: dict) -> dict:
         if code != 0:
             raise OpFail("git_failed", f"checkout {target}: {out[:200]}")
         code, target_head = _git(repo, "rev-parse", "HEAD")
+        target_head = target_head.strip()
+        # Правило проекта: если основная ветка сдвинулась с базы запуска,
+        # слияние не выполняется — ветка задачи сохраняется для повторной проверки.
+        if base and target_head != base:
+            return {"merged": False, "reason": "base_moved", "target": target,
+                    "target_head": target_head, "task_sha": sha,
+                    "message": "основная ветка уже сдвинулась до слияния: "
+                               "обновите базу и повторите проверки",
+                    "task_branch": branch}
         code, merged = _git(repo, "merge", "--ff-only", sha)
         if code != 0:
             return {"merged": False, "reason": "base_moved", "target": target,
@@ -652,7 +684,7 @@ def op_task_merge(root: str, args: dict) -> dict:
             return {"merged": False, "reason": "sha_mismatch", "target_head": head,
                     "task_sha": sha, "task_branch": branch}
         return {"merged": True, "sha": head, "target": target, "task_branch": branch,
-                "previous_head": target_head.strip()}
+                "previous_head": target_head}
     finally:
         try:
             os.unlink(lock_path)
@@ -715,21 +747,26 @@ def op_archive_artifacts(root: str, args: dict) -> dict:
     block = [marker, "",
              f"Коммит: `{args.get('sha') or '—'}` · ветка: `{args.get('branch') or '—'}`", "",
              "| Артефакт | Версия | Ссылка |", "| --- | --- | --- |"]
+    ops_root = os.path.realpath(os.path.join(root, "ops"))
     for item in items:
         if not isinstance(item, dict):
             continue
-        path = str(item.get("path") or "")
+        path = str(item.get("path") or "").replace("\\", "/").strip()
         if not path:
             continue
-        full = path if os.path.isabs(path) else os.path.join(root, path)
-        digest = str(item.get("sha256") or "")
-        if not digest and os.path.isfile(full):
-            h = hashlib.sha256()
-            with open(full, "rb") as fh:
-                for chunk in iter(lambda: fh.read(1 << 20), b""):
-                    h.update(chunk)
-            digest = h.hexdigest()
-        block.append(f"| `{os.path.basename(path) or path}` | `{digest[:16] or '—'}` | `{path}` |")
+        full = os.path.realpath(path if os.path.isabs(path) else os.path.join(root, path))
+        rel = os.path.relpath(full, root).replace(os.sep, "/")
+        # Регистрируются только существующие файлы внутри ops/ проекта:
+        # запись версии артефакта, которого нет, — ложный журнал.
+        if os.path.commonpath([full, ops_root]) != ops_root:
+            raise OpFail("bad_arg", f"артефакт вне ops/: {path}")
+        if not os.path.isfile(full):
+            raise OpFail("bad_arg", f"артефакта нет: {rel}")
+        h = hashlib.sha256()
+        with open(full, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        block.append(f"| `{os.path.basename(full)}` | `{h.hexdigest()[:16]}` | `{rel}` |")
     block.append("")
     if marker in text:
         head_part, _, rest = text.partition(marker)

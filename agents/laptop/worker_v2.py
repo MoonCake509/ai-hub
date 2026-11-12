@@ -367,6 +367,13 @@ def task_precheck(job: dict) -> str | None:
         return None
     root = str(job.get("workdir") or job.get("project_workdir") or "")
     branch = str(job.get("task_branch") or "")
+    if job.get("task_copy"):
+        # Копия задачи обязательна: без неё задание выполнялось бы в основной
+        # рабочей копии. Это отказ, а не пропуск проверки.
+        if not root:
+            return "шаг остановлен: задание без рабочей копии задачи"
+        if not branch:
+            return "шаг остановлен: задание без ветки задачи"
     if not root or not branch:
         return None
     head = str(job.get("expect_head") or "")

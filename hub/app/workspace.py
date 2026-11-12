@@ -239,6 +239,7 @@ def validate(op: str, args: dict | None) -> dict:
     if op == "task_merge":
         clean["branch"] = _str(args.get("branch"), "branch", 120)
         clean["sha"] = _str(args.get("sha"), "sha", 64)
+        clean["base_sha"] = _str(args.get("base_sha"), "base_sha", 64)
         clean["target"] = _str(args.get("target"), "target", 120) or "main"
         if not clean["branch"] or not clean["sha"]:
             raise OpError("bad_arg", "branch и sha обязательны")

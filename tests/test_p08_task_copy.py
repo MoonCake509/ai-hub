@@ -72,7 +72,9 @@ def test_merge_ff_only_and_base_moved(tmp_path):
     _git(task_repo, "commit", "-q", "-m", "fix")
     sha = _git(task_repo, "rev-parse", "HEAD")
 
-    merged = wh.op_task_merge(str(res["task_root"]), {"branch": "task/cccccccc", "sha": sha})
+    merged = wh.op_task_merge(str(res["task_root"]),
+                              {"branch": "task/cccccccc", "sha": sha,
+                               "base_sha": res["base_sha"]})
     assert merged["merged"] is True and merged["sha"] == sha
     assert _git(root / "repo", "rev-parse", "HEAD") == sha
 
@@ -91,8 +93,11 @@ def test_merge_ff_only_and_base_moved(tmp_path):
     _git(root / "repo", "commit", "-q", "-m", "move main")
 
     blocked = wh.op_task_merge(str(other["task_root"]),
-                               {"branch": "task/dddddddd", "sha": other_sha})
+                               {"branch": "task/dddddddd", "sha": other_sha,
+                                "base_sha": other["base_sha"]})
     assert blocked["merged"] is False and blocked["reason"] == "base_moved"
+    # основная ветка не должна сдвинуться при отказе
+    assert _git(root / "repo", "rev-parse", "HEAD") != other_sha
     assert _git(root / "repo", "rev-parse", "task/dddddddd") == other_sha
 
 
@@ -120,3 +125,58 @@ def test_publish_requires_remote(tmp_path):
         assert exc.code == "no_remote"
     else:
         raise AssertionError("публикация без remote не отклонена")
+
+
+def test_task_start_refuses_copy_from_other_base(tmp_path):
+    root = _project(tmp_path)
+    base = _git(root / "repo", "rev-parse", "HEAD")
+    wh.op_task_start(str(root), {"run_id": "f" * 32, "branch": "task/ffffffff",
+                                 "base_sha": base})
+    try:
+        wh.op_task_start(str(root), {"run_id": "f" * 32, "branch": "task/ffffffff",
+                                     "base_sha": "0" * 40})
+    except wh.OpFail as exc:
+        assert exc.code == "task_conflict"
+    else:
+        raise AssertionError("копия задачи принята с чужой базой")
+
+
+def test_task_start_refuses_branch_from_other_base(tmp_path):
+    root = _project(tmp_path)
+    base = _git(root / "repo", "rev-parse", "HEAD")
+    wh.op_task_start(str(root), {"run_id": "1" * 32, "branch": "task/11111111",
+                                 "base_sha": base})
+    try:
+        wh.op_task_start(str(root), {"run_id": "2" * 32, "branch": "task/11111111",
+                                     "base_sha": base})
+    except wh.OpFail as exc:
+        # ветка уже занята worktree — Git откажет; главное, что копия не создана
+        assert exc.code in {"git_failed", "task_conflict"}
+    else:
+        raise AssertionError("ветка задачи переиспользована вторым запуском")
+
+
+def test_archive_rejects_missing_and_outside_ops(tmp_path):
+    root = _project(tmp_path)
+    (tmp_path / "secret.txt").write_text("x", encoding="utf-8")
+    for bad in ({"path": "ops/pr/missing.md"}, {"path": "../secret.txt"},
+                {"path": str(tmp_path / "secret.txt")}):
+        try:
+            wh.op_archive_artifacts(str(root), {"run_id": "9" * 32, "artifacts": [bad]})
+        except wh.OpFail as exc:
+            assert exc.code == "bad_arg"
+        else:
+            raise AssertionError(f"артефакт принят: {bad}")
+
+
+def test_archive_writes_actual_digest(tmp_path):
+    import hashlib
+    root = _project(tmp_path)
+    target = root / "ops" / "pr" / "plan.md"
+    target.write_text("# план v2\n", encoding="utf-8")
+    expected = hashlib.sha256(target.read_bytes()).hexdigest()[:16]
+    wh.op_archive_artifacts(str(root), {"run_id": "8" * 32,
+                                        "artifacts": [{"path": "ops/pr/plan.md",
+                                                       "sha256": "deadbeefdeadbeef"}]})
+    text = (root / "ops" / "ARTIFACTS.md").read_text(encoding="utf-8")
+    assert expected in text and "deadbeefdeadbeef" not in text

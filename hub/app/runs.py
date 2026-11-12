@@ -994,6 +994,19 @@ def _after_step(run: dict, job_id: str) -> None:
             _archive_run(fresh, project)
         except Exception as exc:  # noqa: BLE001 — журнал не должен ронять приёмку
             _event(run_id, None, "artifacts_failed", {"reason": str(exc)[:300]})
+        # Индекс для поиска строится по слитому коммиту: иначе после приёмки
+        # семантика продолжает отвечать по предыдущей версии.
+        try:
+            indexed = _task_op(fresh, project, "semantic_index",
+                               {"sha": str(fresh.get("merged_sha") or fresh.get("candidate_sha") or ""),
+                                "project_id": run["project_id"], "upload": True},
+                               wait_s=300, key=f"run:{run_id}:semantic",
+                               root=str(project.get("workdir") or ""))
+            _event(run_id, None, "semantic_indexed",
+                   {"sha": indexed.get("sha"), "chunks": indexed.get("chunks"),
+                    "stored": indexed.get("stored")})
+        except Exception as exc:  # noqa: BLE001 — поиск не должен ронять приёмку
+            _event(run_id, None, "semantic_failed", {"reason": str(exc)[:300]})
         publish_run(fresh, project)
 
 def _restart_from_coder(conn, task: dict, decision: dict,

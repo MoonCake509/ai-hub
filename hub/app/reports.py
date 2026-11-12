@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import time
 
 from . import db, runs as runs_ctrl, workspace
 
@@ -172,6 +173,35 @@ def build_pr_drafts(project: dict, run: dict) -> dict[str, str]:
     return drafts
 
 
+def build_environments(project: dict, run: dict) -> str:
+    """Среды и рабочие копии — только подтверждённые факты прогона."""
+    receipt = run.get("check_receipt") if isinstance(run.get("check_receipt"), dict) else {}
+    isolation = receipt.get("isolation") if isinstance(receipt.get("isolation"), dict) else {}
+    rows = [
+        ("рабочая копия", str(project.get("host_id") or "—"),
+         f"`{project.get('workdir') or '—'}`", "карточка проекта"),
+        ("git-репозиторий", str(project.get("host_id") or "—"),
+         f"`{project.get('git_root') or project.get('workdir') or '—'}`", "подготовка проекта"),
+        ("ветка / коммит", str(project.get("host_id") or "—"),
+         f"`{project.get('branch') or '—'}` / `{_short(project.get('index_sha') or project.get('head_sha'))}`",
+         "карта проекта"),
+    ]
+    if isolation:
+        rows.append(("проверки", str(project.get("host_id") or "—"),
+                     f"контейнер `{str(isolation.get('image') or '—')[:19]}…`, сеть `{isolation.get('network')}`",
+                     "receipt runner'а"))
+    if receipt.get("snapshot_id"):
+        rows.append(("снимок прогона", str(project.get("host_id") or "—"),
+                     f"`{receipt.get('snapshot_id')}`", "receipt runner'а"))
+    lines = [f"# Среды — {project.get('name') or 'Project'}", "",
+             "| Среда | Хост | Путь / версия | Источник сведений | Проверено |",
+             "| --- | --- | --- | --- | --- |"]
+    for name, host, where, source in rows:
+        lines.append(f"| {name} | {host} | {where} | {source} | {time.strftime('%Y-%m-%d')} |")
+    lines += ["", "Сведения подтверждены записями AI Hub; неизвестное не додумывается.", ""]
+    return "\n".join(lines)
+
+
 def sync_project(project_id: str, run_id: str | None = None, timeout_s: int = 120) -> dict:
     """Собрать отчёты по последнему прогону проекта и записать их на хост."""
     project = db.get_project(project_id)
@@ -183,7 +213,8 @@ def sync_project(project_id: str, run_id: str | None = None, timeout_s: int = 12
     run = runs_ctrl.get_run(str(prompts[0].get("id")))
     if not run:
         return {"ok": False, "error": "run not found"}
-    files = {"ops/TASKFLOW.md": build_taskflow(project, run)}
+    files = {"ops/TASKFLOW.md": build_taskflow(project, run),
+             "ops/ENVIRONMENTS.md": build_environments(project, run)}
     files.update(build_pr_drafts(project, run))
     reports = [{"path": path, "content": content} for path, content in sorted(files.items())]
     root = str(project.get("workdir") or "").strip()

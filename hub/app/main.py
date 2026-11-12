@@ -62,12 +62,43 @@ PROJECT_INIT_WAIT_S = int(os.environ.get("PROJECT_INIT_WAIT_S", "90"))
 # тик оставлял истёкшую аренду в running почти минуту, и поздний результат
 # принимался как актуальный. Верхняя граница — минута.
 SWEEP_INTERVAL_S = max(2, min(60, int(os.environ.get("LEASE_SECONDS", "300")) // 2))
+# По расписанию карта сверяется целиком — но только по проектам без активной работы.
+INDEX_SWEEP_S = int(os.environ.get("INDEX_SWEEP_S", "21600"))
+_last_index_sweep = 0.0
+
+
+async def _schedule_index_sweep() -> None:
+    """Раз в INDEX_SWEEP_S обновить карту проектов, где нет активного прогона.
+
+    Событие пропускается, пока по проекту идёт работа: карта строится по коммиту,
+    а сверка во время правок дала бы ложную картину.
+    """
+    global _last_index_sweep
+    now = time.monotonic()
+    if _last_index_sweep and now - _last_index_sweep < INDEX_SWEEP_S:
+        return
+    _last_index_sweep = now
+    stamp = time.strftime("%Y-%m-%d")
+    for project in await asyncio.to_thread(db.list_projects):
+        if project.get("status") != "ready" or not project.get("workdir"):
+            continue
+        runs = await asyncio.to_thread(runs_ctrl.list_runs, project.get("id"), 1)
+        if runs and str(runs[0].get("state")) in {"active", "paused"}:
+            continue
+        try:
+            await asyncio.to_thread(
+                workspace.create_op_job, "refresh_index", {"root": project["workdir"]},
+                str(project.get("host_id") or "laptop"), project.get("id"),
+                f"autoindex:{project.get('id')}:{stamp}", 180)
+        except Exception as exc:  # noqa: BLE001 — плановая сверка не должна ломать тик
+            print(f"index sweep skipped for {project.get('id')}: {exc}", flush=True)
 
 
 async def _sweeper() -> None:
     while True:
         await asyncio.sleep(SWEEP_INTERVAL_S)
         try:
+            await _schedule_index_sweep()
             expired = await asyncio.to_thread(db.expire_leases)
             if expired:
                 print(f"expired leases: {expired}", flush=True)
@@ -845,7 +876,7 @@ def refresh_project_index(project_id: str) -> dict:
     try:
         job = workspace.create_op_job(
             "refresh_index", {"root": root}, str(project.get("host_id") or "laptop"),
-            project_id, f"index:{project_id}:{project.get('head_sha') or ''}", 180)
+            project_id, None, 180)
     except workspace.OpError as exc:
         raise HTTPException(status_code=400, detail={"code": exc.code, "message": str(exc)}) from exc
     job_id = job["job"]["id"]
@@ -858,6 +889,51 @@ def refresh_project_index(project_id: str) -> dict:
         raise HTTPException(status_code=409, detail={"code": "index_report_invalid", "job": job_id})
     db.project_index_updated(project_id, str(report.get("head_sha") or ""), int(report.get("files") or 0))
     return {"job": job_id, **report}
+
+
+async def _project_op(project_id: str, op: str, args: dict, wait_s: int) -> dict:
+    """Запустить операцию воркера по проекту и дождаться её отчёта."""
+    project = await asyncio.to_thread(db.get_project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="project not found")
+    root = str(project.get("workdir") or "").strip()
+    if not root:
+        raise HTTPException(status_code=409, detail={"code": "no_workdir"})
+    try:
+        job = await asyncio.to_thread(
+            workspace.create_op_job, op, {**args, "root": root},
+            str(project.get("host_id") or "laptop"), project_id, None, wait_s)
+    except workspace.OpError as exc:
+        raise HTTPException(status_code=400, detail={"code": exc.code, "message": str(exc)}) from exc
+    job_id = job["job"]["id"]
+    final = await asyncio.to_thread(_wait_workspace_job, job_id, wait_s)
+    if final.get("status") != "succeeded":
+        raise HTTPException(status_code=409, detail={
+            "code": "op_failed", "message": final.get("error"), "job": job_id})
+    return {"job": job_id, **(final.get("result") if isinstance(final.get("result"), dict) else {})}
+
+
+@app.get("/projects/{project_id}/search", dependencies=[Depends(require_token)])
+async def search_project(project_id: str, q: str = "", limit: int = 50) -> dict:
+    """Поиск по именам и строкам коммита: путь, строка, версия файла (SHA-256)."""
+    result = await _project_op(project_id, "search_git",
+                               {"q": q, "limit": max(1, min(100, int(limit)))}, 120)
+    return result
+
+
+@app.get("/projects/{project_id}/index/file", dependencies=[Depends(require_token)])
+async def project_file_at(project_id: str, path: str = "", sha256: str = "") -> dict:
+    """Фрагмент файла из коммита; при несовпадении версии — отказ, а не чужое содержимое."""
+    result = await _project_op(project_id, "read_at", {"path": path, "sha256": sha256}, 120)
+    return result
+
+
+@app.post("/projects/{project_id}/index/describe", dependencies=[Depends(require_token)])
+async def describe_project_files(project_id: str, limit: int = 20) -> dict:
+    """Описания файлов локальной моделью; при выключенной модели карта не страдает."""
+    result = await _project_op(project_id, "describe_files",
+                               {"limit": max(1, min(50, int(limit)))}, 300)
+    return result
 
 
 @app.post("/projects/{project_id}/reports/sync", dependencies=[Depends(require_token)])
@@ -903,6 +979,54 @@ async def project_create(request: Request) -> dict:
         db.create_project, name[:200], host_id, workdir, settings,
         status="preparing", request_key=key or None, project_id=project_id)
     return await _prepare_project(project, name, host_id, settings)
+
+
+@app.post("/projects/import", dependencies=[Depends(require_token)])
+async def project_import(request: Request) -> dict:
+    """Подключить существующий репозиторий: фактический корень, ветка и HEAD.
+
+    Файлы не перезаписываются и история не меняется: воркер только читает
+    состояние каталога, карточка получает фактические пути и коммит.
+    """
+    payload = await request.json()
+    path = str(payload.get("path") or "").strip()
+    if not path:
+        raise HTTPException(status_code=400, detail="path is required")
+    if not ntpath.isabs(path):
+        raise HTTPException(status_code=400, detail="path must be absolute")
+    host_id = str(payload.get("host_id") or "laptop").strip()
+    name = str(payload.get("name") or ntpath.basename(path.rstrip("\\/")) or "Repository")[:200]
+    key = str(payload.get("idempotency_key") or "").strip()[:200]
+    if key:
+        existing = await asyncio.to_thread(db.project_by_request_key, key)
+        if existing:
+            return existing
+    try:
+        job = await asyncio.to_thread(
+            workspace.create_op_job, "inspect", {"root": path}, host_id, None, None, 120)
+    except workspace.OpError as exc:
+        raise HTTPException(status_code=400, detail={"code": exc.code, "message": str(exc)}) from exc
+    final = await asyncio.to_thread(_wait_workspace_job, job["job"]["id"], 120)
+    report = final.get("result") if isinstance(final.get("result"), dict) else {}
+    if final.get("status") not in JOB_SUCCESS:
+        raise HTTPException(status_code=409, detail={"code": "inspect_failed",
+                                                     "message": final.get("error")})
+    if not report.get("is_git"):
+        raise HTTPException(status_code=409, detail={"code": "not_git",
+                                                     "message": "в каталоге нет Git-репозитория"})
+    project = await asyncio.to_thread(
+        db.create_project, name, host_id, path, {"imported": True},
+        status="preparing", request_key=key or None)
+    project = await asyncio.to_thread(
+        db.project_prepared, project["id"],
+        repo_root=report.get("root") or path,
+        git_root=report.get("root") or path,
+        branch=report.get("branch") or "main",
+        head_sha=report.get("head") or "",
+        template_version="import")
+    project["inspect"] = {k: report.get(k) for k in
+                          ("files", "bytes", "dirty_entries", "tree_digest", "host")}
+    return project
 
 
 @app.patch("/projects/{project_id}", dependencies=[Depends(require_token)])

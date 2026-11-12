@@ -30,6 +30,9 @@ OPS = {
     "write_reports": "живые отчёты проекта в ops/: журнал и черновики PR",
     "create_backup": "точка восстановления: zip коммита и строка в ops/BACKUPS.md",
     "refresh_index": "карта проекта ops/INDEX.md по зафиксированному коммиту",
+    "search_git": "поиск по именам и строкам коммита с версией файла",
+    "read_at": "фрагмент файла из коммита с проверкой версии",
+    "describe_files": "описания файлов локальной моделью в ops/DESCRIPTIONS.md",
     "inspect": "канонический корень, git HEAD/status digest, возможности host",
     "snapshot": "управляемая копия и зафиксированное базовое состояние",
     "list_files": "ограниченный список путей с размерами и хешами",
@@ -179,13 +182,36 @@ def validate(op: str, args: dict | None) -> dict:
                            "changes", "checks", "snapshot_id", "include",
                            "base_tree_digest", "name", "branch", "author_name",
                            "author_email", "template_version", "template_files",
-                           "repo_subdir", "reports", "label", "host"}
+                           "repo_subdir", "reports", "label", "host",
+                           "q", "path", "sha256", "length"}
     if unknown:
         raise OpError("bad_arg", "лишние поля: " + ", ".join(sorted(unknown)))
     root = canon(_str(args.get("root"), "root", 400))
     clean: dict = {"root": root}
 
     if op == "refresh_index":
+        return clean
+
+    if op == "search_git":
+        query = _str(args.get("q"), "q", 200)
+        if not query.strip():
+            raise OpError("bad_arg", "q обязателен")
+        clean["q"] = query
+        clean["limit"] = _int(args.get("limit", 50), 1, 100, "limit")
+        return clean
+
+    if op == "describe_files":
+        clean["limit"] = _int(args.get("limit", 20), 1, 50, "limit")
+        return clean
+
+    if op == "read_at":
+        rel = _str(args.get("path"), "path", 400)
+        reason = denied_reason(rel)
+        if reason:
+            raise OpError("denied_path", f"{rel}: {reason}")
+        clean["path"] = rel
+        clean["sha256"] = _str(args.get("sha256"), "sha256", 64)
+        clean["length"] = _int(args.get("length", 64 * 1024), 1, MAX_READ_BYTES, "length")
         return clean
 
     if op == "create_backup":
@@ -500,8 +526,11 @@ def create_op_job(op: str, args: dict, host_id: str, project_id: str | None = No
         # Патч и упаковка идемпотентны по содержимому. Снимок — новая ревизия:
         # ключ уникален в пределах секунды, чтобы повтор запроса не плодил копии,
         # но новый запуск видел актуальное дерево, а не старый снимок.
-        if op == "snapshot":
-            key = f"ws:{host}:snapshot:{digest[:16]}:{int(time.time())}"
+        if op in {"snapshot", "refresh_index"}:
+            # Снимок — новая ревизия, карта — новое состояние коммита: ключ
+            # уникален в пределах секунды, иначе повторный вызов возвращал бы
+            # результат, посчитанный до последнего коммита.
+            key = f"ws:{host}:{op}:{digest[:16]}:{int(time.time())}"
         else:
             key = f"ws:{host}:{op}:{digest[:32]}"
     envelope = {"kind": "workspace", "op": op, "host_id": host, "digest": digest,

@@ -33,7 +33,7 @@ import time
 import uuid
 import zipfile
 
-OPS = ["init_project", "write_reports", "create_backup", "refresh_index", "inspect", "snapshot", "list_files", "read_files",
+OPS = ["init_project", "write_reports", "create_backup", "refresh_index", "search_git", "read_at", "describe_files", "inspect", "snapshot", "list_files", "read_files",
        "apply_patch", "run_checks", "package"]
 
 MAX_LIST = 200
@@ -500,12 +500,35 @@ def op_create_backup(root: str, args: dict) -> dict:
 INDEX_MAX_FILES = 2000
 
 
-def op_refresh_index(root: str, args: dict) -> dict:
-    """Карта проекта по зафиксированному коммиту: путь, размер, контрольная сумма.
+SECRET_PATTERNS = (".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "id_rsa*",
+                   "id_ed25519*", "credentials*", "secrets*", "*token*", "*.kdbx")
 
-    Источник — `git ls-tree HEAD`, поэтому карта описывает коммит, а не текущее
-    состояние каталога. Одинаковый коммит даёт одинаковый файл: повтор не меняет
-    `ops/INDEX.md` и не создаёт версий в Git.
+
+def _is_secret_path(rel: str) -> bool:
+    """Секретные пути не попадают в карту: индекс цитирует имена, но не секреты.
+
+    Примеры настроек (`.env.example`, `.sample`, `.template`) — часть шаблона
+    проекта и обязаны быть в карте: в них нет значений.
+    """
+    name = rel.rsplit("/", 1)[-1].lower()
+    if name in {".env.example", ".env.sample", ".env.template"}:
+        return False
+    if name == ".env" or name.startswith(".env."):
+        return True
+    return any(fnmatch.fnmatch(name, pat) for pat in SECRET_PATTERNS)
+
+
+def _git_blob(git_root: str, path: str) -> bytes | None:
+    code, out = _git(git_root, "show", f"HEAD:{path}")
+    return out.encode("utf-8") if code == 0 else None
+
+
+def op_refresh_index(root: str, args: dict) -> dict:
+    """Карта проекта по зафиксированному коммиту: путь, размер, версия и контрольная сумма.
+
+    Источник — `git ls-tree HEAD`, содержимое берётся из самого коммита, а не из
+    рабочего каталога. Секретные пути исключаются. Одинаковый коммит даёт
+    одинаковый файл: повтор не меняет `ops/INDEX.md`.
     """
     import hashlib
 
@@ -519,7 +542,7 @@ def op_refresh_index(root: str, args: dict) -> dict:
     code, out = _git(git_root, "ls-tree", "-r", "--long", "HEAD")
     if code != 0:
         raise OpFail("git_failed", f"git ls-tree failed: {out[:200]}")
-    rows, total = [], 0
+    rows, total, secrets = [], 0, []
     for line in out.splitlines():
         if not line.strip():
             continue
@@ -527,25 +550,27 @@ def op_refresh_index(root: str, args: dict) -> dict:
         parts = meta.split()
         if len(parts) < 4 or not path:
             continue
-        size = parts[3]
-        target = os.path.join(git_root, *path.split("/"))
-        try:
-            with open(target, "rb") as fh:
-                digest = hashlib.sha256(fh.read()).hexdigest()[:16]
-        except OSError:
-            digest = "—"
-        rows.append(f"| `{path}` | {size} | `{digest}` |")
+        if _is_secret_path(path):
+            secrets.append(path)
+            continue
+        blob, size = parts[2], parts[3]
+        raw = _git_blob(git_root, path)
+        digest = hashlib.sha256(raw).hexdigest() if raw is not None else "—"
+        rows.append(f"| `{path}` | {size} | `{blob[:12]}` | `{digest[:16]}` |")
         total += 1
         if total >= INDEX_MAX_FILES:
             break
     body = [
         "# Карта проекта",
         "",
-        f"Коммит: `{head}` · файлов в карте: {total}",
+        f"Коммит: `{head}` · файлов в карте: {total} · секретов исключено: {len(secrets)}",
         "",
-        "| Путь | Байт | SHA-256 (16) |",
-        "| --- | --- | --- |",
-    ] + rows + ["", "Карта построена по зафиксированному коммиту; изменение файлов без коммита в ней не видно.", ""]
+        "| Путь | Байт | Версия (git) | SHA-256 (16) |",
+        "| --- | --- | --- | --- |",
+    ] + rows
+    if secrets:
+        body += ["", "Исключены как секреты: " + ", ".join(f"`{p}`" for p in secrets[:20]) + "."]
+    body += ["", "Карта построена по зафиксированному коммиту; изменение файлов без коммита в ней не видно.", ""]
     content = "\n".join(body)
     target = os.path.join(root, "ops", "INDEX.md")
     os.makedirs(os.path.dirname(target), exist_ok=True)
@@ -556,8 +581,143 @@ def op_refresh_index(root: str, args: dict) -> dict:
     if changed:
         with open(target, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(content)
-    return {"root": root, "head_sha": head, "files": total, "changed": changed,
-            "path": "ops/INDEX.md", "digest": hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]}
+    return {"head_sha": head, "files": total, "secrets": secrets[:20],
+            "path": "ops/INDEX.md", "changed": changed,
+            "digest": hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]}
+
+
+def op_search_git(root: str, args: dict) -> dict:
+    """Поиск по именам и строкам коммита: результат несёт путь, строку и версию файла."""
+    import hashlib
+
+    git_root = os.path.join(root, "repo")
+    if not os.path.isdir(os.path.join(git_root, ".git")):
+        git_root = root
+    code, head = _git(git_root, "rev-parse", "HEAD")
+    if code != 0 or not head:
+        raise OpFail("git_failed", "cannot read HEAD for search")
+    head = head.strip()
+    query = str(args.get("q") or "").strip()
+    limit = int(args.get("limit") or 50)
+    matches: list[dict] = []
+    code, names = _git(git_root, "ls-tree", "-r", "--name-only", "HEAD")
+    for path in (names or "").splitlines():
+        if query.lower() in path.lower() and not _is_secret_path(path):
+            raw = _git_blob(git_root, path)
+            matches.append({"path": path, "line": None, "text": path,
+                            "sha256": hashlib.sha256(raw).hexdigest()[:16] if raw else "—",
+                            "kind": "name"})
+        if len(matches) >= limit:
+            break
+    code, out = _git(git_root, "grep", "-n", "-I", "-F", "-e", query, "HEAD", "--")
+    if code == 0:
+        for line in out.splitlines():
+            parts = line.split(":", 3)
+            if len(parts) < 4:
+                continue
+            _, path, line_no, text = parts
+            if _is_secret_path(path):
+                continue
+            raw = _git_blob(git_root, path)
+            matches.append({"path": path, "line": int(line_no), "text": text[:200],
+                            "sha256": hashlib.sha256(raw).hexdigest()[:16] if raw else "—",
+                            "kind": "content"})
+            if len(matches) >= limit:
+                break
+    return {"head_sha": head, "q": query, "matches": matches[:limit]}
+
+
+def op_read_at(root: str, args: dict) -> dict:
+    """Фрагмент файла из коммита с проверкой версии: чужой SHA — отказ, а не догадка."""
+    import hashlib
+
+    git_root = os.path.join(root, "repo")
+    if not os.path.isdir(os.path.join(git_root, ".git")):
+        git_root = root
+    path = str(args.get("path") or "")
+    want = str(args.get("sha256") or "").lower()
+    if not path or _is_secret_path(path):
+        raise OpFail("denied_path", f"путь запрещён политикой: {path}")
+    code, head = _git(git_root, "rev-parse", "HEAD")
+    if code != 0 or not head:
+        raise OpFail("git_failed", "cannot read HEAD")
+    raw = _git_blob(git_root, path)
+    if raw is None:
+        raise OpFail("not_found", f"нет файла в коммите: {path}")
+    digest = hashlib.sha256(raw).hexdigest()
+    if want and not digest.startswith(want):
+        raise OpFail("sha_mismatch", f"{path}: sha256 {digest[:16]} != {want[:16]}")
+    text = raw.decode("utf-8", "replace")
+    return {"path": path, "head_sha": head.strip(), "sha256": digest,
+            "size": len(raw), "text": text[:max(1, int(args.get("length") or 64 * 1024))]}
+
+
+def _local_llm_url() -> str:
+    return (os.environ.get("AIHUB_LOCAL_LLM") or "http://127.0.0.1:11434").rstrip("/")
+
+
+def _describe_with_model(path: str, snippet: str, timeout_s: float = 20.0) -> str | None:
+    """Краткое описание файла локальной моделью; недоступная модель — не ошибка."""
+    import urllib.request
+
+    prompt = ("Опиши назначение файла в одном предложении по-русски. "
+              f"Путь: {path}\nСодержимое:\n{snippet[:1500]}")
+    body = json.dumps({"model": os.environ.get("AIHUB_LOCAL_MODEL") or "local",
+                       "messages": [{"role": "user", "content": prompt}],
+                       "max_tokens": 80, "temperature": 0.1}).encode("utf-8")
+    request = urllib.request.Request(_local_llm_url() + "/v1/chat/completions", data=body,
+                                     headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_s) as resp:
+            data = json.load(resp)
+        text = (data.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+        return " ".join(text.split())[:400] or None
+    except Exception:  # noqa: BLE001 — модель может быть выключена
+        return None
+
+
+def op_describe_files(root: str, args: dict) -> dict:
+    """Описания файлов коммита локальной моделью; карта обновляется и без модели."""
+    git_root = os.path.join(root, "repo")
+    if not os.path.isdir(os.path.join(git_root, ".git")):
+        git_root = root
+    code, head = _git(git_root, "rev-parse", "HEAD")
+    if code != 0 or not head:
+        raise OpFail("git_failed", "cannot read HEAD for descriptions")
+    head = head.strip()
+    limit = min(int(args.get("limit") or 20), 50)
+    code, names = _git(git_root, "ls-tree", "-r", "--name-only", "HEAD")
+    rows, described, available = [], 0, True
+    for path in (names or "").splitlines():
+        if _is_secret_path(path) or path.endswith((".png", ".jpg", ".zip", ".pdf")):
+            continue
+        raw = _git_blob(git_root, path)
+        if raw is None:
+            continue
+        try:
+            snippet = raw.decode("utf-8")[:1500]
+        except UnicodeDecodeError:
+            continue
+        text = _describe_with_model(path, snippet)
+        if text is None:
+            available = False
+            break
+        rows.append(f"| `{path}` | {text} |")
+        described += 1
+        if described >= limit:
+            break
+    if not available:
+        return {"available": False, "head_sha": head, "described": 0,
+                "note": "локальная модель недоступна; карта не менялась"}
+    body = [f"# Описания файлов — {head[:12]}", "",
+            "| Путь | Описание |", "| --- | --- |"] + rows + [""]
+    content = "\n".join(body)
+    target = os.path.join(root, "ops", "DESCRIPTIONS.md")
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    with open(target, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(content)
+    return {"available": True, "head_sha": head, "described": described,
+            "path": "ops/DESCRIPTIONS.md", "model": _local_llm_url()}
 
 
 def op_inspect(root: str, args: dict) -> dict:
@@ -1216,6 +1376,9 @@ HANDLERS = {
     "write_reports": op_write_reports,
     "create_backup": op_create_backup,
     "refresh_index": op_refresh_index,
+    "search_git": op_search_git,
+    "read_at": op_read_at,
+    "describe_files": op_describe_files,
     "inspect": op_inspect,
     "snapshot": op_snapshot,
     "list_files": op_list_files,

@@ -419,6 +419,14 @@ DDL = [
         "alter table aihub.projects add column if not exists indexed_at timestamptz",
         "create unique index if not exists projects_request_key on aihub.projects(request_key)"
         " where request_key is not null",
+        # P-09: векторы фрагментов кода и документации, привязанные к коммиту.
+        "create table if not exists aihub.semantic_chunks (id bigserial primary key,"
+        " project_id text not null, sha text not null, path text not null, start_line int not null,"
+        " end_line int not null, kind text not null, text text not null, vector jsonb not null,"
+        " model text not null default '', created_at timestamptz not null default now())",
+        "create index if not exists semantic_chunks_scope on aihub.semantic_chunks(project_id, sha)",
+        "create unique index if not exists semantic_chunks_unique on aihub.semantic_chunks"
+        "(project_id, sha, path, start_line)",
     ]
 
 

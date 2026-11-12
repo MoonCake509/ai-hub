@@ -36,7 +36,7 @@ import zipfile
 OPS = ["init_project", "write_reports", "create_backup", "refresh_index", "task_start", "verify_task", "task_merge", "setup_env",
        "archive_artifacts", "publish_branch",
        "search_git", "read_at", "describe_files", "inspect", "snapshot", "list_files", "read_files",
-       "apply_patch", "run_checks", "package"]
+       "apply_patch", "run_checks", "package", "semantic_index", "semantic_embed"]
 
 MAX_LIST = 200
 MAX_WALK = 20000
@@ -1658,6 +1658,172 @@ def op_package(root: str, args: dict, job_id: str = "") -> dict:
             "manifest_truncated": len(manifest) > MAX_LIST}
 
 
+# ---------- семантический поиск: локальные эмбеддинги ----------
+# Код и документация индексируются разными моделями (как в документе проекта):
+# code_retriever_ru_en для кода, E5 для markdown/текста. Обе — локальные
+# llama-server с флагом --embeddings, поэтому наружу ничего не уходит.
+# Код в пилоте идёт через E5: сборка llama.cpp 12058 не грузит modernbert-модель
+# code_retriever_ru_en (key not found: modern-bert.attention.layer_norm_epsilon).
+# Как только движок научится, достаточно задать AIHUB_EMBED_CODE_URL на отдельный порт.
+EMBED_CODE_URL = os.environ.get("AIHUB_EMBED_CODE_URL", "")
+EMBED_DOCS_URL = os.environ.get("AIHUB_EMBED_DOCS_URL", "http://127.0.0.1:11442")
+
+CODE_EXTS = {".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java", ".kt", ".cs",
+             ".c", ".h", ".cpp", ".hpp", ".rb", ".php", ".sh", ".ps1", ".sql", ".lua",
+             ".gd", ".swift", ".m", ".mm", ".scala", ".ex", ".exs", ".vue", ".svelte"}
+DOC_EXTS = {".md", ".txt", ".rst", ".adoc", ".yaml", ".yml", ".toml", ".ini", ".cfg",
+            ".json", ".env.example"}
+SKIP_DIRS = {".git", "node_modules", "venv", ".venv", "__pycache__", "dist", "build",
+             "vendor", "target", ".idea", ".next", "runs", "backups"}
+
+
+def _semantic_kind(path: str) -> str:
+    ext = os.path.splitext(path)[1].lower()
+    if ext in CODE_EXTS:
+        return "code"
+    if ext in DOC_EXTS or os.path.basename(path).lower().startswith("readme"):
+        return "docs"
+    return ""
+
+
+def _embed_texts(texts: list[str], kind: str, timeout: int = 180) -> list[list[float]]:
+    """Векторы от локального llama-server. Батчами, чтобы не рвать контекст модели."""
+    import urllib.request
+
+    url = (EMBED_CODE_URL if kind == "code" and EMBED_CODE_URL else EMBED_DOCS_URL).rstrip("/")
+    if not texts:
+        return []
+    out: list[list[float]] = []
+    for start in range(0, len(texts), 16):
+        batch = texts[start:start + 16]
+        body = json.dumps({"model": "local", "input": batch}).encode("utf-8")
+        req = urllib.request.Request(url + "/v1/embeddings", data=body,
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except Exception as exc:  # noqa: BLE001 — сервис эмбеддингов может быть не поднят
+            raise OpFail("embed_unavailable",
+                         f"модель эмбеддингов {kind} недоступна ({url}): {str(exc)[:200]}") from None
+        rows = data.get("data") or []
+        if len(rows) != len(batch):
+            raise OpFail("embed_failed", f"модель вернула {len(rows)} векторов на {len(batch)}")
+        for row in rows:
+            vec = row.get("embedding")
+            if not isinstance(vec, list) or not vec:
+                raise OpFail("embed_failed", "пустой вектор эмбеддинга")
+            out.append([round(float(x), 6) for x in vec])
+    return out
+
+
+def _chunk_lines(text: str, size: int, overlap: int) -> list[tuple[int, int, str]]:
+    lines = text.splitlines()
+    chunks: list[tuple[int, int, str]] = []
+    step = max(1, size - overlap)
+    index = 0
+    while index < len(lines):
+        part = lines[index:index + size]
+        if not any(line.strip() for line in part):
+            index += step
+            continue
+        body = "\n".join(part)
+        chunks.append((index + 1, index + len(part), body[:4000]))
+        if index + size >= len(lines):
+            break
+        index += step
+    return chunks
+
+
+def op_semantic_index(root: str, args: dict) -> dict:
+    """Фрагменты коммита и их векторы. Ничего не пишет на диск: результат — в хаб."""
+    repo = _repo_dir(root)
+    sha = str(args.get("sha") or "").strip()
+    if not sha:
+        code, sha = _git(repo, "rev-parse", "HEAD")
+        sha = (sha or "").strip()
+        if code != 0 or not sha:
+            raise OpFail("git_failed", "cannot read HEAD")
+    code, listing = _git(repo, "ls-tree", "-r", "-l", sha)
+    if code != 0:
+        raise OpFail("git_failed", f"git ls-tree: {(listing or '')[:200]}")
+    budget = int(args.get("max_chunks") or 240)
+    files = 0
+    chunks: list[dict] = []
+    pending: dict[str, list[dict]] = {"code": [], "docs": []}
+    for line in (listing or "").splitlines():
+        parts = line.split(None, 4)
+        if len(parts) < 5:
+            continue
+        meta, path = parts[3], parts[4].strip()
+        if not path or int(parts[3] or 0) > 400_000:
+            continue
+        if any(part in SKIP_DIRS for part in path.split("/")):
+            continue
+        kind = _semantic_kind(path)
+        if not kind:
+            continue
+        rc, blob = _git(repo, "show", f"{sha}:{path}")
+        if rc != 0 or not blob or "\x00" in blob[:4000]:
+            continue
+        size = 40 if kind == "code" else 60
+        overlap = 8 if kind == "code" else 10
+        for start, end, body in _chunk_lines(blob, size, overlap):
+            if len(chunks) + sum(len(v) for v in pending.values()) >= budget:
+                break
+            pending[kind].append({"path": path, "start": start, "end": end,
+                                  "text": f"{path}:{start}-{end}\n{body}", "kind": kind})
+        files += 1
+    for kind in ("code", "docs"):
+        items = pending[kind]
+        if not items:
+            continue
+        vectors = _embed_texts([item["text"] for item in items], kind)
+        for item, vec in zip(items, vectors):
+            item["vector"] = vec
+            chunks.append(item)
+    stored = 0
+    if args.get("upload") and chunks:
+        stored = _upload_index(str(args.get("project_id") or ""), sha, chunks)
+    return {"sha": sha, "files": files, "chunks": len(chunks), "stored": stored,
+            "uploaded": stored > 0,
+            "code_url": EMBED_CODE_URL or EMBED_DOCS_URL, "docs_url": EMBED_DOCS_URL}
+
+
+def _upload_index(project_id: str, sha: str, items: list[dict]) -> int:
+    """Векторы не проходят через лимит результата задания — отправляем их в хаб.
+
+    Результат задания обрезается примерно на 100 КБ, а индекс из сотен фрагментов
+    больше. Поэтому воркер сам кладёт индекс в хаб тем же токеном.
+    """
+    import urllib.request
+
+    hub = (os.environ.get("HUB_URL") or "").rstrip("/")
+    token = os.environ.get("HUB_TOKEN") or ""
+    if not hub or not project_id:
+        raise OpFail("no_hub", "не заданы HUB_URL/project_id для загрузки индекса")
+    body = json.dumps({"sha": sha, "model": f"{EMBED_CODE_URL or EMBED_DOCS_URL}|{EMBED_DOCS_URL}",
+                       "items": items}, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(f"{hub}/projects/{project_id}/semantic/ingest", data=body,
+                                 headers={"Content-Type": "application/json",
+                                          "Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        raise OpFail("upload_failed", f"хаб не принял индекс: {str(exc)[:200]}") from None
+    return int(data.get("stored") or 0)
+
+
+def op_semantic_embed(root: str, args: dict) -> dict:
+    text = str(args.get("text") or "").strip()
+    kind = str(args.get("kind") or "docs")
+    if not text:
+        raise OpFail("bad_arg", "text обязателен")
+    if kind not in ("code", "docs"):
+        raise OpFail("bad_arg", "kind: code или docs")
+    return {"kind": kind, "vector": _embed_texts([text[:2000]], kind)[0]}
+
+
 HANDLERS = {
     "init_project": op_init_project,
     "write_reports": op_write_reports,
@@ -1679,6 +1845,8 @@ HANDLERS = {
     "apply_patch": op_apply_patch,
     "run_checks": op_run_checks,
     "package": op_package,
+    "semantic_index": op_semantic_index,
+    "semantic_embed": op_semantic_embed,
 }
 
 TAKES_JOB = {"snapshot", "apply_patch", "package"}

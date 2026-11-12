@@ -46,6 +46,8 @@ OPS = {
     "setup_env": "команды подготовки среды в рабочей копии задачи",
     "archive_artifacts": "журнал зарегистрированных артефактов запуска",
     "publish_branch": "публикация ветки в настроенный remote",
+    "semantic_index": "векторы фрагментов коммита локальными моделями",
+    "semantic_embed": "вектор запроса локальной моделью",
 }
 
 # Операции, которые меняют рабочее дерево пользователя: только они берут
@@ -192,7 +194,7 @@ def validate(op: str, args: dict | None) -> dict:
                            "repo_subdir", "reports", "label", "host",
                            "q", "path", "sha256", "length",
                            "run_id", "head_sha", "base_sha", "sha", "target", "cmd", "timeout_s",
-                           "artifacts", "remote"}
+                           "artifacts", "remote", "text", "kind", "max_chunks", "project_id", "upload"}
     if unknown:
         raise OpError("bad_arg", "лишние поля: " + ", ".join(sorted(unknown)))
     root = canon(_str(args.get("root"), "root", 400))
@@ -211,6 +213,22 @@ def validate(op: str, args: dict | None) -> dict:
 
     if op == "describe_files":
         clean["limit"] = _int(args.get("limit", 20), 1, 50, "limit")
+        return clean
+
+    if op == "semantic_index":
+        clean["sha"] = _str(args.get("sha"), "sha", 64)
+        clean["max_chunks"] = _int(args.get("max_chunks", 240), 1, 500, "max_chunks")
+        clean["project_id"] = _str(args.get("project_id"), "project_id", 64)
+        clean["upload"] = bool(args.get("upload"))
+        return clean
+
+    if op == "semantic_embed":
+        clean["text"] = _str(args.get("text"), "text", 4000)
+        clean["kind"] = _str(args.get("kind"), "kind", 8) or "docs"
+        if not clean["text"].strip():
+            raise OpError("bad_arg", "text обязателен")
+        if clean["kind"] not in ("code", "docs"):
+            raise OpError("bad_arg", "kind: code или docs")
         return clean
 
     if op == "read_at":

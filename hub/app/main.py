@@ -921,6 +921,79 @@ async def search_project(project_id: str, q: str = "", limit: int = 50) -> dict:
     return result
 
 
+@app.post("/projects/{project_id}/semantic/index", dependencies=[Depends(require_token)])
+async def semantic_index(project_id: str, request: Request) -> dict:
+    """Построить семантический индекс коммита: фрагменты и векторы локальных моделей."""
+    from . import semantic
+
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001 — пустое тело допустимо: индекс по HEAD
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    result = await _project_op(project_id, "semantic_index", {
+        "sha": str(payload.get("sha") or ""),
+        "max_chunks": max(1, min(500, int(payload.get("max_chunks") or 240))),
+        "project_id": project_id, "upload": True,
+    }, 900)
+    if isinstance(result.get("output"), str) and "sha" not in result:
+        try:
+            result = {**result, **json.loads(result["output"])}
+        except ValueError:
+            pass
+    items = result.get("items") or []
+    stored = 0
+    if items:  # запасной путь: маленький индекс может прийти прямо в результате
+        saved = await asyncio.to_thread(
+            semantic.store, project_id, str(result.get("sha") or ""), items,
+            f"{result.get('code_url') or ''}|{result.get('docs_url') or ''}")
+        stored = saved["stored"]
+    return {"job": result.get("job"), "sha": result.get("sha"), "files": result.get("files"),
+            "chunks": result.get("chunks"), "uploaded": result.get("uploaded", False),
+            "stored": stored or int(result.get("stored") or 0)}
+
+
+@app.post("/projects/{project_id}/semantic/ingest", dependencies=[Depends(require_token)])
+async def semantic_ingest(project_id: str, request: Request) -> dict:
+    """Приём индекса от воркера: векторы не проходят через лимит результата задания."""
+    from . import semantic
+
+    payload = await request.json()
+    sha = str(payload.get("sha") or "").strip()
+    items = payload.get("items") or []
+    if not sha or not isinstance(items, list):
+        raise HTTPException(status_code=400, detail={"code": "bad_arg",
+                                                     "message": "sha и items обязательны"})
+    stored = await asyncio.to_thread(semantic.store, project_id, sha, items,
+                                     str(payload.get("model") or ""))
+    return {"sha": sha, "stored": stored["stored"]}
+
+
+@app.get("/projects/{project_id}/semantic/search", dependencies=[Depends(require_token)])
+async def semantic_search(project_id: str, q: str = "", limit: int = 10,
+                          sha: str = "") -> dict:
+    """Смысловой поиск по проиндексированному коммиту: путь, строки, версия, фрагмент."""
+    from . import semantic
+
+    query = str(q or "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail={"code": "bad_arg", "message": "q обязателен"})
+    kinds = await asyncio.to_thread(semantic.kinds, project_id, sha)
+    if not kinds:
+        raise HTTPException(status_code=404, detail={
+            "code": "not_indexed", "message": "семантический индекс не построен"})
+    vectors: dict[str, list[float]] = {}
+    for kind in kinds:
+        embedded = await _project_op(project_id, "semantic_embed",
+                                     {"text": query, "kind": kind}, 120)
+        vector = embedded.get("vector")
+        if isinstance(vector, list) and vector:
+            vectors[kind] = vector
+    return await asyncio.to_thread(semantic.search, project_id, vectors, sha,
+                                   max(1, min(50, int(limit))))
+
+
 @app.get("/projects/{project_id}/index/file", dependencies=[Depends(require_token)])
 async def project_file_at(project_id: str, path: str = "", sha256: str = "") -> dict:
     """Фрагмент файла из коммита; при несовпадении версии — отказ, а не чужое содержимое."""

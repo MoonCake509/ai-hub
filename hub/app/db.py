@@ -365,6 +365,24 @@ DDL = [
         content text not null,
         primary key (packet_id, revision, path)
     )""",
+    # P-09: семантический контекст — отдельный тип evidence, не файлы пакета.
+    """create table if not exists aihub.context_packet_evidence (
+        packet_id text not null references aihub.context_packets(id) on delete cascade,
+        revision int not null,
+        position int not null,
+        sha text not null,
+        path text not null,
+        start_line int not null,
+        end_line int not null,
+        kind text not null,
+        text text not null,
+        blob_oid text not null,
+        text_sha256 text not null,
+        score double precision not null default 0,
+        model text not null default '',
+        primary key (packet_id, revision, position)
+    )""",
+    "create index if not exists context_packet_evidence_sha on aihub.context_packet_evidence(packet_id, revision)",
     # FLOW-P1: история ревизий пакетов — ревизии неизменяемы, текущие items лишь указатель.
     """create table if not exists aihub.context_packet_revisions (
         packet_id text not null references aihub.context_packets(id) on delete cascade,

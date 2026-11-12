@@ -6,8 +6,10 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+import time
 
 from . import db
 
@@ -98,3 +100,102 @@ def search(project_id: str, vectors: dict[str, list[float]], sha: str = "",
                        "text": (row.get("text") or "")[:1200]})
     scored.sort(key=lambda item: item["score"], reverse=True)
     return {"sha": sha, "indexed": True, "matches": scored[:max(1, min(50, limit))]}
+
+
+# ---------- проверяемый семантический контекст (P-09, вторая половина) ----------
+
+EVIDENCE_LIMIT = 5
+EVIDENCE_TOKENS = 1500
+
+
+def _op(project: dict, op: str, args: dict, timeout_s: int = 90) -> dict:
+    """Короткий вызов операции хоста с ожиданием: вектор и проверка blob'ов."""
+    from . import workspace
+
+    job = workspace.create_op_job(op, args, project.get("host_id") or "", project.get("id") or "")
+    job_id = job["job"]["id"]
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        row = workspace.job_result(job_id)
+        if row and row.get("status") in ("succeeded", "failed", "cancelled", "expired"):
+            if row["status"] != "succeeded":
+                raise RuntimeError(f"{op}: {str(row.get('error') or row['status'])[:200]}")
+            return row.get("result") or {}
+        time.sleep(0.4)
+    raise TimeoutError(f"{op}: хост не ответил за {timeout_s}s")
+
+
+def _overlaps(left: dict, right: dict) -> bool:
+    """Любое пересечение диапазонов — дубль: соседние чанки перекрываются намеренно."""
+    if left.get("path") != right.get("path"):
+        return False
+    a, b = int(left["start_line"]), int(left["end_line"])
+    c, d = int(right["start_line"]), int(right["end_line"])
+    return min(b, d) >= max(a, c)
+
+
+def collect_evidence(project: dict, sha: str, goal: str, budget_tokens: int = 2000) -> tuple[list[dict], dict]:
+    """Ищет фрагменты по цели и подтверждает их у хоста по blob'ам конкретного SHA.
+
+    В промпт уходит только то, что хост прочитал из blob'а указанного коммита и
+    заверил хешем текста. Пустой индекс, отсутствие модели и ошибка хоста не
+    блокируют запуск — состояние пишется в манифест пакета.
+    """
+    if not sha or not goal.strip():
+        return [], {"state": "skipped", "reason": "нет sha или цели"}
+    project_id = project.get("id") or ""
+    root = project.get("workdir") or ""
+    kinds_here = kinds(project_id, sha)
+    if not kinds_here:
+        return [], {"state": "no_index", "sha": sha}
+    vectors: dict[str, list[float]] = {}
+    try:
+        for kind in kinds_here:
+            embedded = _op(project, "semantic_embed",
+                           {"root": root, "text": goal[:2000], "kind": kind}, 120)
+            vector = embedded.get("vector")
+            if isinstance(vector, list) and vector:
+                vectors[kind] = [float(x) for x in vector]
+    except Exception as exc:  # noqa: BLE001
+        return [], {"state": "embed_failed", "sha": sha, "reason": str(exc)[:300]}
+    if not vectors:
+        return [], {"state": "no_vectors", "sha": sha}
+    found = search(project_id, vectors, sha, limit=12)
+    candidates: list[dict] = []
+    for hit in found.get("matches") or []:
+        if float(hit.get("score") or 0) <= 0:
+            continue
+        item = {"path": hit["path"], "start_line": int(hit["start_line"]),
+                "end_line": int(hit["end_line"]), "kind": hit.get("kind") or "code",
+                "score": float(hit.get("score") or 0)}
+        if any(_overlaps(item, seen) for seen in candidates):
+            continue
+        candidates.append(item)
+        if len(candidates) >= EVIDENCE_LIMIT * 2:
+            break
+    if not candidates:
+        return [], {"state": "empty", "sha": sha}
+    try:
+        checked = _op(project, "verify_evidence",
+                      {"root": root, "sha": sha, "items": candidates}, 120)
+    except Exception as exc:  # noqa: BLE001
+        return [], {"state": "verify_failed", "sha": sha, "reason": str(exc)[:300]}
+    by_key = {(c["path"], c["start_line"], c["end_line"]): c["score"] for c in candidates}
+    verified: list[dict] = []
+    used_tokens = 0
+    for item in checked.get("verified") or []:
+        tokens = max(1, len(str(item.get("text") or "")) // 4)
+        if used_tokens + tokens > min(EVIDENCE_TOKENS, max(200, int(budget_tokens))):
+            continue
+        used_tokens += tokens
+        item["score"] = by_key.get((item["path"], item["start_line"], item["end_line"]), 0.0)
+        item["model"] = "e5-mean"
+        verified.append(item)
+        if len(verified) >= EVIDENCE_LIMIT:
+            break
+    state = "collected" if verified else "rejected"
+    return verified, {"state": state, "sha": sha, "kinds": kinds_here,
+                      "query_sha256": hashlib.sha256(goal.encode("utf-8")).hexdigest()[:16],
+                      "candidates": len(candidates), "verified": len(verified),
+                      "dropped": len(checked.get("dropped") or []),
+                      "tokens": used_tokens}

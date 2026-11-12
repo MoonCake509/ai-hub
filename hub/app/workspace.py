@@ -47,6 +47,7 @@ OPS = {
     "archive_artifacts": "журнал зарегистрированных артефактов запуска",
     "publish_branch": "публикация ветки в настроенный remote",
     "semantic_index": "векторы фрагментов коммита локальными моделями",
+    "verify_evidence": "проверка фрагментов семантического контекста по blob'ам коммита",
     "semantic_embed": "вектор запроса локальной моделью",
 }
 
@@ -194,7 +195,8 @@ def validate(op: str, args: dict | None) -> dict:
                            "repo_subdir", "reports", "label", "host",
                            "q", "path", "sha256", "length",
                            "run_id", "head_sha", "base_sha", "sha", "target", "cmd", "timeout_s",
-                           "artifacts", "remote", "text", "kind", "max_chunks", "project_id", "upload"}
+                           "artifacts", "remote", "text", "kind", "max_chunks", "project_id", "upload",
+                           "items"}
     if unknown:
         raise OpError("bad_arg", "лишние поля: " + ", ".join(sorted(unknown)))
     root = canon(_str(args.get("root"), "root", 400))
@@ -220,6 +222,25 @@ def validate(op: str, args: dict | None) -> dict:
         clean["max_chunks"] = _int(args.get("max_chunks", 240), 1, 500, "max_chunks")
         clean["project_id"] = _str(args.get("project_id"), "project_id", 64)
         clean["upload"] = bool(args.get("upload"))
+        return clean
+
+    if op == "verify_evidence":
+        clean["sha"] = _str(args.get("sha"), "sha", 64)
+        if not clean["sha"]:
+            raise OpError("bad_arg", "sha обязателен")
+        raw = args.get("items")
+        if not isinstance(raw, list) or not raw:
+            raise OpError("bad_arg", "items обязателен")
+        if len(raw) > 20:
+            raise OpError("bad_arg", "items: не больше 20")
+        clean["items"] = [{
+            "path": _str(item.get("path"), "path", 400),
+            "start_line": _int(item.get("start_line"), 1, 2_000_000, "start_line"),
+            "end_line": _int(item.get("end_line"), 1, 2_000_000, "end_line"),
+            "kind": (_str(item.get("kind"), "kind", 12) or "code"),
+        } for item in raw if isinstance(item, dict)]
+        if not clean["items"]:
+            raise OpError("bad_arg", "items пуст")
         return clean
 
     if op == "semantic_embed":

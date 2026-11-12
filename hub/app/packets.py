@@ -87,9 +87,22 @@ def canonical(items: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def digest(items: list[dict], version: int = PACKET_FORMAT_VERSION) -> str:
-    """Digest пакета: SHA выбранных файлов + семантическая версия формата."""
+def evidence_canonical(evidence: list[dict]) -> str:
+    """Канонический вид семантического контекста: диапазоны и blob'ы, без текста."""
+    lines = []
+    for item in sorted(evidence or [], key=lambda x: (str(x.get("path")), int(x.get("start_line") or 0))):
+        lines.append(f"{item.get('path')}|{int(item.get('start_line') or 0)}|{int(item.get('end_line') or 0)}"
+                     f"|{item.get('kind')}|{item.get('blob_oid')}|{item.get('text_sha256')}")
+    return "\n".join(lines)
+
+
+def digest(items: list[dict], version: int = PACKET_FORMAT_VERSION,
+           evidence: list[dict] | None = None) -> str:
+    """Digest пакета: SHA выбранных файлов + evidence + версия формата."""
     body = f"aihub-packet-v{version}\n" + canonical(items)
+    ev = evidence_canonical(evidence or [])
+    if ev:
+        body += "\n--evidence--\n" + ev
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
@@ -214,7 +227,9 @@ def _write_items(conn, packet_id: str, items: list[dict]) -> None:
     for item in items:
         conn.run(db._qualify(
             "insert into aihub.context_packet_items(packet_id, path, size, sha256, selected, reason)"
-            " values (:p, :path, :s, :h, :sel, :r)"),
+            " values (:p, :path, :s, :h, :sel, :r)"
+            " on conflict (packet_id, path) do update set size = excluded.size,"
+            " sha256 = excluded.sha256, selected = excluded.selected, reason = excluded.reason"),
             p=packet_id, path=item["path"], s=int(item["size"]), h=item.get("sha256"),
             sel=bool(item["selected"]), r=item["reason"])
 
@@ -244,7 +259,35 @@ def revision_items(packet_id: str, revision: int) -> list[dict] | None:
     return items
 
 
-def seal(packet_id: str, entries: list[dict], recheck: bool = False) -> dict:
+def _write_evidence(conn, packet_id: str, revision: int, evidence: list[dict]) -> None:
+    conn.run(db._qualify("delete from aihub.context_packet_evidence where packet_id = :i and revision = :r"),
+             i=packet_id, r=int(revision))
+    for position, item in enumerate(evidence or []):
+        conn.run(db._qualify(
+            "insert into aihub.context_packet_evidence(packet_id, revision, position, sha, path,"
+            " start_line, end_line, kind, text, blob_oid, text_sha256, score, model)"
+            " values (:p, :r, :pos, :sha, :path, :a, :b, :k, :t, :oid, :h, :score, :m)"),
+            p=packet_id, r=int(revision), pos=position, sha=str(item.get("sha") or "")[:64],
+            path=str(item.get("path") or "")[:400], a=int(item.get("start_line") or 1),
+            b=int(item.get("end_line") or 1), k=str(item.get("kind") or "code")[:12],
+            t=str(item.get("text") or "")[:20000], oid=str(item.get("blob_oid") or "")[:64],
+            h=str(item.get("text_sha256") or "")[:64], score=float(item.get("score") or 0),
+            m=str(item.get("model") or "")[:200])
+
+
+def evidence(packet_id: str, revision: int) -> list[dict]:
+    """Проверенные фрагменты ревизии — только они попадают в промпт кодера."""
+    with db._lock:
+        conn = db.connect()
+        rows = db._rows(conn, db._qualify(
+            "select sha, path, start_line, end_line, kind, text, blob_oid, text_sha256, score, model"
+            " from aihub.context_packet_evidence where packet_id = :p and revision = :r"
+            " order by position"), p=packet_id, r=int(revision))
+    return [dict(row) for row in rows]
+
+
+def seal(packet_id: str, entries: list[dict], recheck: bool = False,
+         evidence_: list[dict] | None = None, semantic_state: str = "") -> dict:
     """Фиксирует пакет по фактическому списку файлов хоста.
 
     При повторной сверке сравнивает хеши с прежней ревизией: совпало — пакет
@@ -257,7 +300,18 @@ def seal(packet_id: str, entries: list[dict], recheck: bool = False) -> dict:
     if isinstance(request, str):
         request = json.loads(request)
     items, used, stats = select(entries, request.get("requested") or [], int(row["budget_bytes"]))
-    new_digest = digest(items)
+    evidence = evidence_ if evidence_ is not None else []
+    semantic = {"state": semantic_state or ("collected" if evidence else "empty")}
+    if evidence_ is None and request.get("sha") and request.get("kind") == "context":
+        from . import semantic as semantic_module
+        project = db.get_project(row.get("project_id") or "") or {}
+        try:
+            evidence, semantic = semantic_module.collect_evidence(
+                project, str(request.get("sha") or ""), str(request.get("goal") or ""),
+                int(request.get("budget_tokens") or 2000))
+        except Exception as exc:  # noqa: BLE001 — контекст не блокирует приёмку
+            evidence, semantic = [], {"state": "failed", "reason": str(exc)[:300]}
+    new_digest = digest(items, evidence=evidence)
 
     if recheck and row.get("digest"):
         if new_digest == row["digest"]:
@@ -276,7 +330,9 @@ def seal(packet_id: str, entries: list[dict], recheck: bool = False) -> dict:
                 " digest = :d, used_bytes = :u, manifest = :m::jsonb, sealed_at = now(),"
                 " updated_at = now() where id = :i returning revision"),
                 d=new_digest, u=int(used), i=packet_id,
-                m=json.dumps({"stats": stats, "previous_digest": row["digest"]}, ensure_ascii=False))
+                m=json.dumps({"stats": stats, "previous_digest": row["digest"],
+                              "semantic": semantic}, ensure_ascii=False))
+            _write_evidence(conn, packet_id, int(row["revision"]) + 1, evidence)
             fresh = _packet_row(packet_id)
             _save_revision(conn, packet_id, int(fresh["revision"]), new_digest, items)
         return {"packet_id": packet_id, "state": "conflict", "digest": new_digest,
@@ -291,12 +347,13 @@ def seal(packet_id: str, entries: list[dict], recheck: bool = False) -> dict:
             " manifest = :m::jsonb, sealed_at = now(), updated_at = now()"
             " where id = :i returning id"),
             d=new_digest, u=int(used), i=packet_id,
-            m=json.dumps({"stats": stats, "format_version": PACKET_FORMAT_VERSION},
-                         ensure_ascii=False))
+            m=json.dumps({"stats": stats, "format_version": PACKET_FORMAT_VERSION,
+                          "semantic": semantic}, ensure_ascii=False))
         _save_revision(conn, packet_id, int(row["revision"]), new_digest, items)
+        _write_evidence(conn, packet_id, int(row["revision"]), evidence)
     return {"packet_id": packet_id, "state": "sealed", "digest": new_digest,
             "changed": not recheck, "revision": int(row["revision"]), "used_bytes": int(used),
-            "stats": stats}
+            "stats": stats, "semantic": semantic, "evidence": len(evidence)}
 
 
 def fail(packet_id: str, reason: str) -> None:
@@ -344,7 +401,8 @@ TERMINAL = {"succeeded", "failed", "cancelled", "timeout", "unknown"}
 
 
 def create_context(project: dict, goal: str, entry: str, contracts: list[str],
-                   budget_tokens: int, conversation_id: str | None = None) -> dict:
+                   budget_tokens: int, conversation_id: str | None = None,
+                   sha: str = "") -> dict:
     """Запрос контекста под задачу: список файлов, затем содержимое входа и контрактов."""
     from . import workspace
     if not entry:
@@ -354,7 +412,8 @@ def create_context(project: dict, goal: str, entry: str, contracts: list[str],
     packet_id = uuid.uuid4().hex
     request = {"kind": "context", "goal": goal or "", "entry": normalize_path(entry),
                "contracts": [normalize_path(c) for c in contracts or []],
-               "budget_tokens": int(budget_tokens), "requested": []}
+               "budget_tokens": int(budget_tokens), "requested": [],
+               "sha": str(sha or "")}
     with db._lock:
         conn = db.connect()
         db._one(conn, db._qualify(
@@ -396,8 +455,23 @@ def _entries_from_listing(result: dict | None) -> list[dict]:
     return out
 
 
-def _store_built(packet_id: str, built: dict, contents: dict[str, str] | None = None) -> None:
-    """Пишет собранный вход; изменившийся digest означает конфликт и новую ревизию."""
+def _store_built(packet_id: str, built: dict, contents: dict[str, str] | None = None,
+                 evidence: list[dict] | None = None,
+                 semantic: dict | None = None) -> None:
+    """Пишет собранный вход; изменившийся digest означает конфликт и новую ревизию.
+
+    Семантический контекст входит в digest: смена набора фрагментов — это новая
+    ревизия, даже если выбранные файлы не изменились.
+    """
+    evidence = evidence or []
+    if evidence:
+        built = dict(built)
+        built["digest"] = hashlib.sha256(
+            (str(built["digest"]) + "\n--evidence--\n" + evidence_canonical(evidence)).encode("utf-8")
+        ).hexdigest()
+    if semantic:
+        built = dict(built)
+        built["semantic"] = semantic
     previous = (_packet_row(packet_id) or {}).get("digest")
     state = "conflict" if previous and previous != built["digest"] else "sealed"
     bump = ", revision = revision + 1" if state == "conflict" else ""
@@ -434,6 +508,7 @@ def _store_built(packet_id: str, built: dict, contents: dict[str, str] | None = 
                 size=int(item["size"]), content=text)
         _save_revision(conn, packet_id, revision, built["digest"],
                        built["items"])
+        _write_evidence(conn, packet_id, revision, evidence)
 
 
 def verified_contents(packet_id: str, revision: int) -> list[dict]:
@@ -455,8 +530,25 @@ def _store_collected(packet_id: str, collected: list[dict]) -> None:
             m=json.dumps({"collected": collected}, ensure_ascii=False), i=packet_id)
 
 
+_POLL_LOCK = threading.Lock()
+
+
 def poll_active(limit: int = 20) -> int:
-    """Продвигает пакеты, ожидающие результата задания хоста. Вызывается sweeper'ом."""
+    """Продвигает пакеты, ожидающие результата задания хоста. Вызывается sweeper'ом.
+
+    Тик не должен накладываться сам на себя: два прохода по одному пакету
+    пишут items параллельно и роняют вставку дублем ключа.
+    """
+    from . import workspace
+    if not _POLL_LOCK.acquire(blocking=False):
+        return 0
+    try:
+        return _poll_active_locked(limit)
+    finally:
+        _POLL_LOCK.release()
+
+
+def _poll_active_locked(limit: int = 20) -> int:
     from . import workspace
     with db._lock:
         conn = db.connect()
@@ -555,7 +647,20 @@ def poll_active(limit: int = 20) -> int:
             except context.ContextError as exc:
                 fail(row["id"], exc.message)
                 continue
-            _store_built(row["id"], built, contents)
+            collected_evidence: list[dict] = []
+            semantic_state: dict = {}
+            if request.get("sha"):
+                from . import semantic as semantic_module
+                project = db.get_project(packet_row.get("project_id") or "") or {}
+                try:
+                    collected_evidence, semantic_state = semantic_module.collect_evidence(
+                        project, str(request.get("sha") or ""),
+                        str(request.get("goal") or ""),
+                        int(request.get("budget_tokens") or 2000))
+                except Exception as exc:  # noqa: BLE001 — поиск не блокирует сборку
+                    semantic_state = {"state": "failed", "reason": str(exc)[:300]}
+            _store_built(row["id"], built, contents, evidence=collected_evidence,
+                         semantic=semantic_state)
         elif op == "materialize":
             # Материализация выполняется синхронно в _materialize_sync: тик не
             # должен принимать результат порции параллельно с её сверкой.

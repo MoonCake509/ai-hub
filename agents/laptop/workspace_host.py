@@ -36,7 +36,8 @@ import zipfile
 OPS = ["init_project", "write_reports", "create_backup", "refresh_index", "task_start", "verify_task", "task_merge", "setup_env",
        "archive_artifacts", "publish_branch",
        "search_git", "read_at", "describe_files", "inspect", "snapshot", "list_files", "read_files",
-       "apply_patch", "run_checks", "package", "semantic_index", "semantic_embed"]
+       "apply_patch", "run_checks", "package", "semantic_index", "semantic_embed",
+       "verify_evidence"]
 
 MAX_LIST = 200
 MAX_WALK = 20000
@@ -1824,6 +1825,74 @@ def op_semantic_embed(root: str, args: dict) -> dict:
     return {"kind": kind, "vector": _embed_texts([text[:2000]], kind)[0]}
 
 
+def _git_bytes(root: str, *args: str) -> tuple[int, bytes]:
+    """Сырые байты blob'а: текстовый _git обрезает пробелы и ломает номера строк."""
+    try:
+        proc = subprocess.run(["git", "-C", root, *args], capture_output=True,
+                              stdin=subprocess.DEVNULL, timeout=30)
+        return proc.returncode, proc.stdout or b""
+    except (OSError, subprocess.SubprocessError):
+        return 127, b""
+
+
+def op_verify_evidence(root: str, args: dict) -> dict:
+    """Проверка фрагментов семантического контекста по blob'ам указанного коммита.
+
+    Хаб хранит только пути и диапазоны; текст и blob_oid подтверждает хост, у
+    которого есть репозиторий. Несовпавший фрагмент отбрасывается, а не правится.
+    """
+    repo = _repo_dir(root)
+    sha = str(args.get("sha") or "").strip()
+    if not sha:
+        raise OpFail("bad_arg", "sha обязателен")
+    code, listing = _git(repo, "ls-tree", "-r", sha)
+    if code != 0:
+        raise OpFail("git_failed", f"git ls-tree {sha}: {(listing or '')[:200]}")
+    oids: dict[str, str] = {}
+    for line in (listing or "").splitlines():
+        if "\t" not in line:
+            continue
+        meta, path = line.split("\t", 1)
+        parts = meta.split()
+        if len(parts) >= 3 and parts[1] == "blob":
+            oids[path.strip()] = parts[2]
+    verified: list[dict] = []
+    dropped: list[dict] = []
+    cache: dict[str, str] = {}
+    for item in (args.get("items") or [])[:20]:
+        path = str(item.get("path") or "").strip().lstrip("./")
+        try:
+            start = int(item.get("start_line") or 0)
+            end = int(item.get("end_line") or 0)
+        except (TypeError, ValueError):
+            dropped.append({"path": path, "reason": "bad_range"})
+            continue
+        oid = oids.get(path)
+        if not oid:
+            dropped.append({"path": path, "reason": "not_in_sha"})
+            continue
+        if path not in cache:
+            rc, blob = _git_bytes(repo, "cat-file", "blob", oid)
+            if rc != 0 or b"\x00" in blob[:4000]:
+                dropped.append({"path": path, "reason": "blob_unreadable"})
+                continue
+            cache[path] = blob.decode("utf-8", "replace")
+        lines = cache[path].splitlines()
+        if start < 1 or end < start or end > len(lines):
+            dropped.append({"path": path, "reason": "range_out_of_bounds"})
+            continue
+        text = "\n".join(lines[start - 1:end])
+        if not text.strip() or len(text) > 20000:
+            dropped.append({"path": path, "reason": "text_unusable"})
+            continue
+        verified.append({"path": path, "start_line": start, "end_line": end,
+                         "kind": str(item.get("kind") or "code")[:12],
+                         "blob_oid": oid, "sha": sha,
+                         "text": text,
+                         "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()})
+    return {"sha": sha, "verified": verified, "dropped": dropped}
+
+
 HANDLERS = {
     "init_project": op_init_project,
     "write_reports": op_write_reports,
@@ -1847,6 +1916,7 @@ HANDLERS = {
     "package": op_package,
     "semantic_index": op_semantic_index,
     "semantic_embed": op_semantic_embed,
+    "verify_evidence": op_verify_evidence,
 }
 
 TAKES_JOB = {"snapshot", "apply_patch", "package"}

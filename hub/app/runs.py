@@ -505,7 +505,8 @@ def _gate_context(conn, run: dict, task: dict) -> tuple[str | None, dict | None]
         if entry_path:
             ctx = packets.create_context(
                 project, context_spec.get("goal") or run.get("goal") or "",
-                entry_path, contracts, int(context_spec.get("budget_tokens") or 2000))
+                entry_path, contracts, int(context_spec.get("budget_tokens") or 2000),
+                sha=str(run.get("base_sha") or ""))
         elif context_spec.get("paths"):
             ctx = packets.start(project, list(context_spec["paths"]),
                                 int(context_spec.get("budget_tokens") or 2000) * 4)
@@ -610,6 +611,20 @@ def dispatch(run_id: str, resolve_agent, max_queue: int = 50) -> dict:
                                 [{"path": item["path"], "sha256": item["sha256"],
                                   "content": item["content"]} for item in context_files],
                                 ensure_ascii=False))
+                    evidence = packets.evidence(packet["id"], int(packet.get("revision") or 1))
+                    if evidence and (task.get("role") or "") == "coder":
+                        sections.append(
+                            "Семантический контекст (фрагменты коммита "
+                            + str(run.get("base_sha") or "")[:12]
+                            + ", сверены с blob и хешем текста; справочно, права записи не дают):\n"
+                            + json.dumps([{ "path": item["path"], "start_line": item["start_line"],
+                                            "end_line": item["end_line"], "kind": item["kind"],
+                                            "score": item["score"], "blob_oid": item["blob_oid"],
+                                            "text_sha256": item["text_sha256"], "text": item["text"]}
+                                          for item in evidence], ensure_ascii=False))
+                        event(conn, run_id, task["id"], "semantic_context_attached",
+                              {"packet_id": packet["id"], "fragments": len(evidence),
+                               "sha": str(run.get("base_sha") or "")})
                     conn.run(db._qualify(
                         "update aihub.run_tasks set packet_revision = :rev where id = :i"),
                         rev=int(packet.get("revision") or 1), i=task["id"])
@@ -1002,9 +1017,11 @@ def _after_step(run: dict, job_id: str) -> None:
                                 "project_id": run["project_id"], "upload": True},
                                wait_s=300, key=f"run:{run_id}:semantic",
                                root=str(project.get("workdir") or ""))
+            indexed = indexed.get("result") or indexed
             _event(run_id, None, "semantic_indexed",
                    {"sha": indexed.get("sha"), "chunks": indexed.get("chunks"),
-                    "stored": indexed.get("stored")})
+                    "stored": indexed.get("stored"),
+                    "status": "ok" if indexed.get("chunks") else "failed"})
         except Exception as exc:  # noqa: BLE001 — поиск не должен ронять приёмку
             _event(run_id, None, "semantic_failed", {"reason": str(exc)[:300]})
         publish_run(fresh, project)

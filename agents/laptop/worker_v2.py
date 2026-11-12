@@ -364,7 +364,9 @@ def task_precheck(job: dict) -> str | None:
     Несовпадение — шаг не начинается, файлы не меняются.
     """
     if workspace_host is None:
-        return None
+        # Модуль сверки не загрузился: для копии задачи это отказ, а не пропуск.
+        return ("шаг остановлен: сверка рабочей копии недоступна"
+                if job.get("task_copy") else None)
     root = str(job.get("workdir") or job.get("project_workdir") or "")
     branch = str(job.get("task_branch") or "")
     if job.get("task_copy"):

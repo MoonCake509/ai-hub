@@ -259,11 +259,15 @@ def activate_run(run_id: str) -> dict:
         conn = db.connect()
         with db.transaction(conn):
             row = db._one(conn, db._qualify(
-                "select state from aihub.runs where id = :i for update"), i=run_id)
+                "select state, task_root, task_branch from aihub.runs where id = :i for update"),
+                i=run_id)
             if not row:
                 raise RunError("not_found", "запуск не найден")
             if row.get("state") != "preparing":
                 return {"run_id": run_id, "state": row.get("state"), "activated": False}
+            if not str(row.get("task_root") or "").strip() or not str(row.get("task_branch") or "").strip():
+                raise RunError("no_task_copy",
+                               "запуск нельзя активировать без рабочей копии задачи")
             db._one(conn, db._qualify(
                 "update aihub.runs set state = 'active', updated_at = now()"
                 " where id = :i returning id"), i=run_id)
@@ -957,6 +961,13 @@ def _after_step(run: dict, job_id: str) -> None:
     if merged.get("merged"):
         # Порядок важен: отчёты перезаписывают ops/pr/*.md, поэтому артефакты
         # регистрируются после них, с фактическими хешами; карта — по слитому HEAD.
+        # Карта — по слитому HEAD до регистрации артефактов: иначе в журнал
+        # попадёт версия INDEX.md, которая тут же перезаписывается.
+        try:
+            _task_op(fresh, project, "refresh_index", {}, wait_s=120,
+                     key=f"run:{run_id}:index", root=str(project.get("workdir") or ""))
+        except Exception as exc:  # noqa: BLE001
+            _event(run_id, None, "index_failed", {"reason": str(exc)[:300]})
         try:
             from . import reports as reports_ctrl
             synced = reports_ctrl.sync_project(run["project_id"])
@@ -968,11 +979,6 @@ def _after_step(run: dict, job_id: str) -> None:
             _archive_run(fresh, project)
         except Exception as exc:  # noqa: BLE001 — журнал не должен ронять приёмку
             _event(run_id, None, "artifacts_failed", {"reason": str(exc)[:300]})
-        try:
-            _task_op(fresh, project, "refresh_index", {}, wait_s=120,
-                     key=f"run:{run_id}:index", root=str(project.get("workdir") or ""))
-        except Exception as exc:  # noqa: BLE001
-            _event(run_id, None, "index_failed", {"reason": str(exc)[:300]})
         publish_run(fresh, project)
 
 def _restart_from_coder(conn, task: dict, decision: dict,
@@ -1006,8 +1012,13 @@ def _restart_from_coder(conn, task: dict, decision: dict,
                 "update aihub.run_tasks set state = 'pending', error = null, result = null,"
                 " receipt = null, updated_at = now(), finished_at = null where id = :i"),
                 i=row["id"])
+    # Новый цикл начинается с чистого кандидата: иначе слияние возьмёт SHA
+    # прошлого цикла, хотя проверялся уже другой коммит.
     conn.run(db._qualify(
-        "update aihub.runs set cycles = cycles + 1, updated_at = now() where id = :i"),
+        "update aihub.runs set cycles = cycles + 1, updated_at = now(),"
+        " candidate_sha = null, merged_sha = null, merge_state = null,"
+        " candidate_digest = null, candidate_snapshot_id = null,"
+        " check_receipt = null where id = :i"),
         i=task["run_id"])
     conn.run(db._qualify(
         "update aihub.run_tasks set state = 'pending', error = null, updated_at = now(),"

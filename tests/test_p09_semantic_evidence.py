@@ -132,3 +132,16 @@ def test_verify_evidence_matches_blob_and_range(tmp_path):
     assert bad["verified"] == []
     reasons = {row["reason"] for row in bad["dropped"]}
     assert reasons == {"range_out_of_bounds", "not_in_sha"}
+
+
+def test_stage_names_resolve_to_registered_host_ops():
+    """Имена этапов конвейера и операции хоста — не одно и то же.
+
+    Этап semantic_verify на хосте называется verify_evidence. Ошибка в этом
+    месте роняла тик и оставляла пакет посередине конвейера.
+    """
+    stages = {packets.HOST_OP.get(name, name)
+              for name in ("semantic_index", "semantic_embed", "semantic_verify")}
+    registered = set(wh.HANDLERS)
+    assert stages <= registered, stages - registered
+    assert packets.HOST_OP["semantic_verify"] == "verify_evidence"

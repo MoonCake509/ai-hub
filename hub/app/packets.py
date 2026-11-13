@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import fnmatch
 import base64
+import logging
 import threading
 import hashlib
 import json
@@ -28,6 +29,8 @@ import uuid
 from . import context, db, security_policy
 
 LIST_PAGE = 200
+
+log = logging.getLogger("aihub.packets")
 
 STATES = ("probing", "semantic", "sealed", "materializing", "materialized", "conflict", "failed")
 
@@ -298,7 +301,8 @@ def evidence(packet_id: str, revision: int) -> list[dict]:
 
 
 def seal(packet_id: str, entries: list[dict], recheck: bool = False,
-         evidence_: list[dict] | None = None, semantic_state: str = "") -> dict:
+         evidence_: list[dict] | None = None, semantic_state: str = "",
+         semantic_detail: dict | None = None) -> dict:
     """Фиксирует пакет по фактическому списку файлов хоста.
 
     При повторной сверке сравнивает хеши с прежней ревизией: совпало — пакет
@@ -312,7 +316,8 @@ def seal(packet_id: str, entries: list[dict], recheck: bool = False,
         request = json.loads(request)
     items, used, stats = select(entries, request.get("requested") or [], int(row["budget_bytes"]))
     evidence = evidence_ if evidence_ is not None else []
-    semantic = {"state": semantic_state or ("collected" if evidence else "empty")}
+    semantic = dict(semantic_detail or {})
+    semantic["state"] = semantic_state or semantic.get("state") or ("collected" if evidence else "empty")
     if evidence_ is None and _semantic_required(request):
         # Ожидание воркера вынесено из тика: пакет получает состояние semantic,
         # evidence собирается этапами (индекс → вектор → поиск → сверка blob'ов),
@@ -567,9 +572,15 @@ def _set_semantic_job(packet_id: str, job_id: str | None, op: str | None) -> Non
             j=job_id, o=op, i=packet_id)
 
 
+# Этап конвейера и операция хоста называются по-разному: сверка диапазонов
+# объявлена на хосте как verify_evidence, а состояние пакета — semantic_verify.
+HOST_OP = {"semantic_verify": "verify_evidence"}
+
+
 def _enqueue_semantic(packet_id: str, project: dict, draft: dict, op: str, args: dict) -> None:
     from . import workspace
-    job = workspace.create_op_job(op, args, project.get("host_id") or "", project.get("id") or "")
+    job = workspace.create_op_job(HOST_OP.get(op, op), args,
+                                  project.get("host_id") or "", project.get("id") or "")
     draft["stage"] = op
     draft["last_args"] = args
     if op == "semantic_embed":
@@ -611,7 +622,8 @@ def _semantic_finalize(packet_id: str, project: dict, draft: dict,
     _draft_drop(packet_id)
     if draft.get("mode") == "seal":
         seal(packet_id, draft.get("entries") or [], recheck=bool(draft.get("recheck")),
-             evidence_=evidence, semantic_state=semantic.get("state") or "empty")
+             evidence_=evidence, semantic_state=semantic.get("state") or "empty",
+             semantic_detail=semantic)
     else:
         _store_built(packet_id, draft["built"], draft.get("contents") or {},
                      evidence=evidence, semantic=semantic)
@@ -654,6 +666,8 @@ def _advance_semantic(packet_id: str, op: str, job: dict) -> None:
     project = db.get_project(row.get("project_id") or "") or {}
     ok = job.get("status") == "succeeded"
     result = job.get("result") or {}
+    log.info("semantic stage=%s packet=%s ok=%s kinds=%s vectors=%s",
+             op, packet_id[:8], ok, draft.get("kinds"), sorted((draft.get("vectors") or {}).keys()))
     if op == "semantic_index":
         if not ok:
             _semantic_fail_or_retry(packet_id, project, draft, "semantic_index",
@@ -806,7 +820,14 @@ def _poll_active_locked(limit: int = 20) -> int:
         op = row.get("provider_op")
         if row["state"] == "semantic":
             if op in ("semantic_index", "semantic_embed", "semantic_verify"):
-                _advance_semantic(row["id"], str(op), job)
+                # Сбой этапа не должен ронять тик: иначе один пакет останавливает
+                # продвижение всех остальных и причина видна только в логах.
+                try:
+                    _advance_semantic(row["id"], str(op), job)
+                except Exception as exc:  # noqa: BLE001
+                    log.exception("semantic stage %s failed for %s", op, row["id"])
+                    _draft_drop(row["id"])
+                    fail(row["id"], f"этап {op}: {exc}"[:300])
             else:
                 fail(row["id"], f"неизвестный этап семантики: {op}")
             continue

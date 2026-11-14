@@ -1445,7 +1445,7 @@ async function wsLoadJobs(){
 }
 async function wsCreateJob(){
  if(!WS.project)return;
- const body={name:'Архивариус',kind:'archivist',agent_id:'hermes-server',profile:'router-cheap',model:'deepseek-v4.1-flash-1017',schedule:'0 5 * * *',fallback_agent_id:'qwen-server',fallback_profile:'qwen-sub',fallback_model:'qwen3.8-flash'};
+ const body={name:'Архивариус',kind:'archivist',agent_id:'hermes-server',profile:'router-cheap',model:'deepseek-v4.1-flash-1017',schedule:'0 5 * * *',fallback_agent_id:'hermes-server',fallback_profile:'router-cheap',fallback_model:'qwen3.8-27b'};
  await api('/projects/'+encodeURIComponent(WS.project.id)+'/jobs',{method:'POST',body:JSON.stringify(body)});
  toast('Задача архивариуса добавлена: 05:00 МСК');
  await wsLoadJobs()

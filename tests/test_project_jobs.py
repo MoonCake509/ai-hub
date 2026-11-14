@@ -60,8 +60,9 @@ def main() -> int:
     check("отчёты по дням в ops/archivist", "ops/archivist/<YYYY-MM-DD>/" in main_py)
     check("основной канал — дешёвый router.cheap 1017",
           'ARCHIVIST_MODEL = "deepseek-v4.1-flash-1017"' in main_py)
-    check("резерв — Qwen", 'ARCHIVIST_FALLBACK_AGENT = "qwen-server"' in main_py
-          and 'ARCHIVIST_FALLBACK_MODEL = "qwen3.8-flash"' in main_py)
+    check("резерв — qwen3.8-27b через router.cheap",
+          'ARCHIVIST_FALLBACK_AGENT = "hermes-server"' in main_py
+          and 'ARCHIVIST_FALLBACK_MODEL = "qwen3.8-27b"' in main_py)
     check("резерв включается один раз", "and not j.fallback_used limit 20" in src)
     check("резерв ставится в очередь тиком", "await _poll_project_fallbacks()" in main_py)
     check("простой 10 минут считается сбоем", "STUCK_RUN_S = 600" in src)

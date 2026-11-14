@@ -107,9 +107,9 @@ ARCHIVIST_PROMPT = (
 ARCHIVIST_AGENT = "hermes-server"
 ARCHIVIST_PROFILE = "router-cheap"
 ARCHIVIST_MODEL = "deepseek-v4.1-flash-1017"
-ARCHIVIST_FALLBACK_AGENT = "qwen-server"
-ARCHIVIST_FALLBACK_PROFILE = "qwen-sub"
-ARCHIVIST_FALLBACK_MODEL = "qwen3.8-flash"
+ARCHIVIST_FALLBACK_AGENT = "hermes-server"
+ARCHIVIST_FALLBACK_PROFILE = "router-cheap"
+ARCHIVIST_FALLBACK_MODEL = "qwen3.8-27b"
 
 _project_jobs_busy = False
 
@@ -142,9 +142,9 @@ async def _schedule_project_jobs() -> None:
         ARCHIVIST_AGENT = "hermes-server"
 ARCHIVIST_PROFILE = "router-cheap"
 ARCHIVIST_MODEL = "deepseek-v4.1-flash-1017"
-ARCHIVIST_FALLBACK_AGENT = "qwen-server"
-ARCHIVIST_FALLBACK_PROFILE = "qwen-sub"
-ARCHIVIST_FALLBACK_MODEL = "qwen3.8-flash"
+ARCHIVIST_FALLBACK_AGENT = "hermes-server"
+ARCHIVIST_FALLBACK_PROFILE = "router-cheap"
+ARCHIVIST_FALLBACK_MODEL = "qwen3.8-27b"
 
 _project_jobs_busy = False
 

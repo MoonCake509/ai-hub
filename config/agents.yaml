@@ -380,6 +380,7 @@ agents:
         name: Router.cheap (сервер)
         models:
           - deepseek-v4.1-flash-1017
+          - qwen3.8-27b
           - deepseek-v4.1-flash
           - gpt-6.1-sol
           - qwen3.8-max

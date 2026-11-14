@@ -1362,7 +1362,7 @@ function renderMessages(){
  else box.scrollTop=previousScroll;
  wsUpdateRecipient();
 }
-const REASONING_LABELS={minimal:'Минимальный',low:'Низкий',medium:'Средний',high:'Высокий',xhigh:'Очень высокий',max:'Максимальный'};
+const REASONING_LABELS={minimal:'Минимальный',low:'Низкий',medium:'Средний',high:'Высокий',xhigh:'Очень высокий',max:'Максимальный',auto:'Авто',fast:'Быстро',thinking:'Размышление'};
 function wsReasoningLabel(level){return REASONING_LABELS[level]||level}
 function wsReasoningSpec(data,assignment){
  const catalog=data&&data.reasoning;if(!catalog||!catalog.models)return null;
@@ -1512,35 +1512,56 @@ async function wsSend(text){
 }
 function wsStartPolling(){clearInterval(WS.pollTimer);WS.pollTimer=setInterval(()=>{if(token&&!document.hidden&&WS.view==='workspace'&&WS.conv)wsLoadMessages().catch(error=>{if(error.message!=='unauthorized')$('#chat-msg').textContent='Не удалось обновить ответ: '+error.message})},2500)}
 
+const WS_ROOT='R:\\AIHub\\WorkSpace';
+function wsProjectSlug(name){
+ const slug=String(name||'').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'').slice(0,48);
+ return slug||'project'
+}
+function wsProjectPath(){return WS_ROOT+'\\'+wsProjectSlug($('#project-name')?.value.trim()||'project')}
+function wsProjectProgress(on){
+ const box=$('#project-progress');if(!box)return;
+ box.hidden=!on;
+ if(on){box._step=0;wsProjectStep(0);clearInterval(box._timer);box._timer=setInterval(()=>wsProjectStep(Math.min(4,(box._step||0)+1)),900)}
+ else clearInterval(box._timer)
+}
+function wsProjectStep(index){
+ const box=$('#project-progress');if(!box)return;
+ box._step=index;
+ box.querySelectorAll('.ws-step').forEach((item,i)=>{item.dataset.state=i<index?'done':i===index?'active':''});
+}
 async function wsProjectDialog(create=false){
  WS.newProject=create;
  $('#project-dialog-title').textContent=create?'Новый проект':'Настройки проекта';
  $('#project-name').value=create?'':WS.project?.name||'';
- $('#project-host').value=create?'laptop':WS.project?.host_id||'laptop';
- const workdir=create?'':WS.project?.workdir||'';
- $('#project-workdir').value=workdir;
+ const path=create?wsProjectPath():(WS.project?.workdir||'');
+ $('#project-path').textContent=path||'—';
+ $('#project-progress').hidden=true;wsProjectProgress(false);
+ $('#project-dialog-error').textContent='';
+ $('#project-dialog').showModal();$('#project-name').focus()
+}
+async function wsSaveProject(event){
+ if(event.submitter&&event.submitter.formMethod==='dialog')return;
+ event.preventDefault();if(WS.projectSaving)return;
+ const name=$('#project-name').value.trim();if(!name)return;
+ const button=$('#project-settings-form').querySelector('button[type=submit]'),originalText=button.textContent;
+ WS.projectSaving=true;button.disabled=true;button.textContent=WS.newProject?'Создаю…':'Сохраняю…';
+ if(WS.newProject)wsProjectProgress(true);
  try{
-  const data=await api('/workspace/roots');
-  putOptions($('#project-root'),(data.roots||[]).map(item=>({id:item.path,name:item.label})),data.default);
-  const roots=(data.roots||[]).map(item=>item.path);
-  const root=roots.filter(path=>workdir.toLowerCase().startsWith(path.toLowerCase())).sort((a,b)=>b.length-a.length)[0]||data.default||'';
-  $('#project-root').value=root;
-  $('#project-folder').value=root&&workdir.toLowerCase().startsWith(root.toLowerCase())?workdir.slice(root.length).replace(/^[\\/]+/,''):''
- }catch(error){putOptions($('#project-root'),[{id:'',name:'Корни недоступны'}],'');$('#project-folder').value=''}
- $('#project-dialog-error').textContent='';$('#project-dialog').showModal();$('#project-name').focus()
+  const payload={name};
+  const project=await api(WS.newProject?'/projects':'/projects/'+WS.project.id,{method:WS.newProject?'POST':'PATCH',body:JSON.stringify(payload)});
+  wsProjectStep(4);
+  storeSet('aihub.project',project.id);
+  await new Promise(resolve=>setTimeout(resolve,600));
+  $('#project-dialog').close();WS.conv=null;await wsRefreshAll();
+  toast(WS.newProject?'Проект создан: '+(project.workdir||name):'Проект сохранён')
+ }catch(error){$('#project-dialog-error').textContent=error.message}
+ finally{WS.projectSaving=false;button.disabled=false;button.textContent=originalText;wsProjectProgress(false)}
 }
-function wsComposeWorkdir(){
- const root=$('#project-root').value;
- const folder=$('#project-folder').value.trim().replace(/^[\\/]+|[\\/]+$/g,'');
- if(!root)return;
- $('#project-workdir').value=folder?root.replace(/[\\/]+$/,'')+'\\'+folder:root
-}
-async function wsSaveProject(event){if(event.submitter&&event.submitter.formMethod==='dialog')return;event.preventDefault();if(WS.projectSaving)return;const payload={name:$('#project-name').value.trim(),host_id:$('#project-host').value,workdir:$('#project-workdir').value.trim()};if(!payload.name)return;const button=$('#project-settings-form').querySelector('button[type=submit]'),originalText=button.textContent;WS.projectSaving=true;button.disabled=true;button.textContent='Сохраняю…';try{const project=await api(WS.newProject?'/projects':'/projects/'+WS.project.id,{method:WS.newProject?'POST':'PATCH',body:JSON.stringify(payload)});storeSet('aihub.project',project.id);$('#project-dialog').close();WS.conv=null;await wsRefreshAll();toast('Проект сохранён')}catch(error){$('#project-dialog-error').textContent=error.message}finally{WS.projectSaving=false;button.disabled=false;button.textContent=originalText}}
 function wsWire(){
  runsWire();
  document.querySelectorAll('.tab').forEach(tab=>tab.addEventListener('click',()=>switchView(tab.dataset.view)));
  $('#workspace-retry').onclick=action(wsRefreshAll);$('#conv-new').onclick=action(wsNewConversation);$('#project-new').onclick=()=>wsProjectDialog(true);$('#project-settings').onclick=()=>wsProjectDialog(!WS.project);$('#project-settings-form').onsubmit=wsSaveProject;
- $('#role-agent').onchange=action(async()=>{const roleId=WS.roleId,agentId=$('#role-agent').value;setDraftDirty();await wsPopulateRoleProfiles(agentId,'','');if(WS.roleId===roleId&&$('#role-agent').value===agentId)setDraftDirty()});$('#role-profile').onchange=action(async()=>{const roleId=WS.roleId,agentId=$('#role-agent').value,profileId=$('#role-profile').value;const data=await wsGetProfiles(agentId);if(WS.roleId!==roleId||$('#role-agent').value!==agentId||$('#role-profile').value!==profileId)return;wsPopulateRoleModels(data,profileId,'');$('#role-capability').textContent=wsUpdateRoleCapability(agentId,profileId,$('#role-model').value);setDraftDirty()});$('#role-model').onchange=()=>{$('#role-capability').textContent=wsUpdateRoleCapability($('#role-agent').value,$('#role-profile').value,$('#role-model').value);wsLoadRoleQuota($('#role-agent').value,$('#role-profile').value,$('#role-model').value);setDraftDirty()};$('#role-instructions').oninput=setDraftDirty;$('#role-save').onclick=action(async()=>{await wsSaveRole();toast('Настройки роли сохранены')});$('#job-add').onclick=action(wsCreateJob);$('#project-root').onchange=wsComposeWorkdir;$('#project-folder').oninput=wsComposeWorkdir;$('#chat-target').onchange=action(()=>wsEditRole($('#chat-target').value));
+ $('#role-agent').onchange=action(async()=>{const roleId=WS.roleId,agentId=$('#role-agent').value;setDraftDirty();await wsPopulateRoleProfiles(agentId,'','');if(WS.roleId===roleId&&$('#role-agent').value===agentId)setDraftDirty()});$('#role-profile').onchange=action(async()=>{const roleId=WS.roleId,agentId=$('#role-agent').value,profileId=$('#role-profile').value;const data=await wsGetProfiles(agentId);if(WS.roleId!==roleId||$('#role-agent').value!==agentId||$('#role-profile').value!==profileId)return;wsPopulateRoleModels(data,profileId,'');$('#role-capability').textContent=wsUpdateRoleCapability(agentId,profileId,$('#role-model').value);setDraftDirty()});$('#role-model').onchange=()=>{$('#role-capability').textContent=wsUpdateRoleCapability($('#role-agent').value,$('#role-profile').value,$('#role-model').value);wsLoadRoleQuota($('#role-agent').value,$('#role-profile').value,$('#role-model').value);setDraftDirty()};$('#role-instructions').oninput=setDraftDirty;$('#role-save').onclick=action(async()=>{await wsSaveRole();toast('Настройки роли сохранены')});$('#job-add').onclick=action(wsCreateJob);$('#project-name').oninput=()=>{if(WS.newProject)$('#project-path').textContent=wsProjectPath()};$('#chat-target').onchange=action(()=>wsEditRole($('#chat-target').value));
  $('#att-file').onchange=action(async event=>{const files=Array.from(event.target.files||[]);try{await wsUpload(files)}finally{event.target.value=''}});
  const dropPanel=$('#context-panel');if(dropPanel){let dragDepth=0;dropPanel.addEventListener('dragenter',event=>{if(!event.dataTransfer?.types?.includes('Files'))return;event.preventDefault();dragDepth+=1;wsSetDropState(true)});dropPanel.addEventListener('dragover',event=>{if(!event.dataTransfer?.types?.includes('Files'))return;event.preventDefault();event.dataTransfer.dropEffect='copy';wsSetDropState(true)});dropPanel.addEventListener('dragleave',event=>{if(!event.dataTransfer?.types?.includes('Files'))return;event.preventDefault();dragDepth=Math.max(0,dragDepth-1);if(!dragDepth)wsSetDropState(false)});dropPanel.addEventListener('drop',event=>{if(!event.dataTransfer?.files?.length)return;event.preventDefault();dragDepth=0;wsSetDropState(false);action(()=>wsUpload(Array.from(event.dataTransfer.files)))().catch(workspaceError)})}
  const filterBox=$('#att-filter');if(filterBox)filterBox.oninput=event=>{WS.attFilter=event.target.value||'';wsRenderAttachments()}; const clearButton=$('#att-clear');if(clearButton)clearButton.onclick=()=>{WS.selectedAtts.clear();wsRenderAttachments()};

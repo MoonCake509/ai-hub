@@ -977,10 +977,12 @@ async def project(project_id: str) -> dict:
 
 
 def _project_dir_name(name: str, project_id: str) -> str:
-    """Имя папки: безопасная часть названия и короткий ID, чтобы одноимённые не слипались."""
-    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:40] or "project"
-    return f"{slug}-{project_id[:8]}"
+    """Папка проекта = его название (safe-slug). ID добавляется только при совпадении."""
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:48] or "project"
+    return slug if slug != "project" else f"project-{project_id[:8]}"
 
+
+DEFAULT_PROJECT_HOST = (os.environ.get("HUB_DEFAULT_HOST") or "laptop").strip() or "laptop"
 
 # Статусы, после которых задание воркера уже не изменится.
 JOB_TERMINAL = {"succeeded", "done", "failed", "cancelled", "unknown", "error"}
@@ -1275,7 +1277,8 @@ async def project_create(request: Request) -> dict:
     name = (payload.get("name") or "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="name is required")
-    host_id = (payload.get("host_id") or "laptop").strip()
+    # Решение владельца: выбор устройства убран, все проекты создаются на сервере.
+    host_id = DEFAULT_PROJECT_HOST
     settings = payload.get("settings") or {}
     if not isinstance(settings, dict):
         raise HTTPException(status_code=400, detail="settings must be an object")
@@ -1292,15 +1295,11 @@ async def project_create(request: Request) -> dict:
             return existing
 
     project_id = uuid.uuid4().hex
-    requested = str(payload.get("workdir") or "").strip()
-    if requested:
-        try:
-            workdir = workspace.validate_workdir(requested)
-        except workspace.OpError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-    else:
-        root = await asyncio.to_thread(workspace.projects_root)
-        workdir = ntpath.join(root, _project_dir_name(name, project_id))
+    # Единое рабочее пространство: путь не выбирается и не принимается из формы.
+    root = await asyncio.to_thread(workspace.projects_root)
+    workdir = ntpath.join(root, _project_dir_name(name, project_id))
+    if await asyncio.to_thread(db.project_by_workdir, workdir):
+        workdir = ntpath.join(root, f"{ntpath.basename(workdir)}-{project_id[:6]}")
     project = await asyncio.to_thread(
         db.create_project, name[:200], host_id, workdir, settings,
         status="preparing", request_key=key or None, project_id=project_id)

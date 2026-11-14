@@ -1,7 +1,8 @@
-"""Этап 3: рабочая папка проекта выбирается человеком — диск и папка.
+"""Этап 3: рабочая папка проекта.
 
-Решение владельца: корень R:, внутри — папки проектов. Сервер не даёт выйти
-за разрешённые корни, не принимает относительные пути и «..».
+Решение владельца (14.11): выбор диска, папки и устройства убран. Все проекты
+создаются на сервере в едином пространстве R:\\AIHub\\WorkSpace, папка проекта
+называется по проекту. Сервер по-прежнему не даёт выйти за разрешённые корни.
 
 Запуск: python tests/test_workspace_choice.py
 """
@@ -50,11 +51,13 @@ def main() -> int:
     conf = (ROOT / "config" / "hub.yaml").read_text(encoding="utf-8")
 
     check("эндпоинт корней", '/workspace/roots' in main_py)
-    check("workdir из запроса проходит проверку", "workspace.validate_workdir(requested)" in main_py)
-    check("в форме есть выбор корня", 'id="project-root"' in html)
-    check("в форме есть папка проекта", 'id="project-folder"' in html)
-    check("путь собирается из корня и папки", "wsComposeWorkdir" in app_js)
-    check("корни перечислены в конфиге", "allowed_roots:" in conf)
+    check("выбор устройства убран из формы", 'id="project-host"' not in html)
+    check("выбор корня убран из формы", 'id="project-root"' not in html and 'id="project-folder"' not in html)
+    check("рабочая папка только показывается", 'id="project-path"' in html and "wsProjectPath" in app_js)
+    check("проект создаётся на сервере, путь не принимается из формы",
+          "DEFAULT_PROJECT_HOST" in main_py and "workspace.validate_workdir(requested)" not in main_py)
+    check("единое пространство WorkSpace в конфиге", "WorkSpace" in conf)
+    check("анимация создания рабочей зоны", "ws-progress" in html and "ws-slide" in (ROOT / "web" / "styles.css").read_text(encoding="utf-8"))
 
     print(("FAILED: %d" % len(FAILS)) if FAILS else "ALL OK")
     return 1 if FAILS else 0

@@ -1507,6 +1507,18 @@ def project_index_updated(project_id: str, head_sha: str, files: int) -> None:
                 " where id = :i"), s=head_sha, f=files, i=project_id)
 
 
+def project_by_workdir(workdir: str) -> dict | None:
+    """Проект, который уже занимает эту папку (для проверки совпадения имён)."""
+    if not workdir:
+        return None
+    with _lock:
+        conn = connect()
+        row = _one(conn, _qualify(
+            "select id from aihub.projects where lower(workdir) = lower(:w) limit 1"),
+            w=workdir)
+    return get_project(row["id"]) if row else None
+
+
 def project_by_request_key(key: str) -> dict | None:
     if not key:
         return None

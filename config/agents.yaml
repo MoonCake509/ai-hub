@@ -348,7 +348,7 @@ agents:
             output_modalities: [text]
             context_mode: "Только текст prompt; файлы проекта недоступны"
             filesystem_access: false
-    name: llama.cpp Dolphin 8B (сервер)
+    name: Локальные LLM · Dolphin 8B (сервер)
     transport: http
     host: server
     configured: true

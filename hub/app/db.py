@@ -238,7 +238,7 @@ DDL = [
     """create table if not exists aihub.projects (
         id text primary key,
         name text not null,
-        host_id text not null default 'laptop',
+        host_id text not null default 'server',
         workdir text not null default '',
         settings jsonb not null default '{}',
         created_at timestamptz not null default now()
@@ -1015,6 +1015,15 @@ def usage_summary(project_id: str, days: int = 30) -> dict:
     return {"project_id": project_id, "days": days, "totals": totals, "items": items,
             "has_usage": totals["tokens_total"] > 0}
 
+def fail_orphan_jobs(reason: str = "прогон прерван перезапуском хаба") -> int:
+    """Хаб перезапустился — аренда потеряна; такие задания больше некому завершить."""
+    with _lock:
+        conn = connect()
+        rows = conn.run("update aihub.jobs set status='failed', result_error=:r, finished_at=now() "
+                        "where status in ('running','leased') returning id", r=reason)
+    return len(rows or [])
+
+
 def delete_project(project_id: str) -> bool:
     """Удаляет карточку проекта; роли, чаты, вложения и задания уходят каскадом."""
     with _lock:
@@ -1478,7 +1487,7 @@ def seed_workspace() -> dict:
             if not proj:
                 conn.run(_qualify(
                     "insert into aihub.projects(id, name, host_id, workdir, settings)"
-                    " values ('ai-hub', 'AI Hub', 'laptop', '', '{}'::jsonb)"))
+                    " values ('ai-hub', 'AI Hub', 'server', '', '{}'::jsonb)"))
             # Раньше роль архитектора хранилась как architect; данные переводим на
             # planner, чтобы шаблоны и назначения ссылались на один идентификатор.
             conn.run(_qualify(
@@ -1527,7 +1536,7 @@ def get_project(project_id: str) -> dict | None:
         return proj
 
 
-def create_project(name: str, host_id: str = "laptop", workdir: str = "",
+def create_project(name: str, host_id: str = "server", workdir: str = "",
                    settings: dict | None = None, *, status: str = "ready",
                    request_key: str | None = None,
                    project_id: str | None = None) -> dict:

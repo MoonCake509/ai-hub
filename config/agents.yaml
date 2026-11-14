@@ -31,7 +31,7 @@ agents:
     name: Codex CLI
     model_selection: true
     transport: cli
-    host: laptop
+    host: server
     configured: true
     capabilities:
       text: {supported: true, evidence: "catalog"}
@@ -141,9 +141,9 @@ agents:
         native_provider: dolphin-local
         models:
           - "dolphin"
-    name: OpenClaw (ноутбук)
+    name: OpenClaw (выключен)
     transport: cli
-    host: laptop
+    host: server
     configured: true
     capabilities:
       text: {supported: true, evidence: "catalog"}
@@ -247,9 +247,9 @@ agents:
           - "gpt-6.1-terra"
           - "qwen3.8-flash"
           - "qwen3.8-max"
-    name: Hermes (ноутбук)
+    name: Hermes (выключен)
     transport: cli
-    host: laptop
+    host: server
     configured: true
     capabilities:
       text: {supported: true, evidence: "catalog"}
@@ -278,7 +278,7 @@ agents:
           - qwen3.8-flash
     name: Qwen Desktop
     transport: cdp
-    host: laptop
+    host: server
     configured: true
     capabilities:
       text: {supported: true, evidence: "catalog"}
@@ -299,7 +299,7 @@ agents:
     reasoning: {levels: [low, high, max], default: high}
     profiles:
       - id: kimi-code
-        name: Kimi Code (сервер)
+        name: Kimi Code
         models:
           - kimi-code/kimi-for-coding
           - kimi-code/k3.1-pro
@@ -307,9 +307,9 @@ agents:
           - kimi-code/k3
           - kimi-code/k3.1-pro-highspeed
           - kimi-code/kimi-for-coding-highspeed
-    name: Kimi Code (сервер)
+    name: Kimi Code
     transport: http
-    host: laptop
+    host: server
     bridge_agent: kimi
     configured: true
     supports_workdir: true
@@ -348,7 +348,7 @@ agents:
             output_modalities: [text]
             context_mode: "Только текст prompt; файлы проекта недоступны"
             filesystem_access: false
-    name: Локальные LLM · Dolphin 8B (сервер)
+    name: Локальные LLM · Dolphin 8B
     transport: http
     host: server
     configured: true
@@ -429,9 +429,9 @@ agents:
           - deepseek-v4.1-flash
           - gpt-6.1-sol
           - qwen3.8-max
-    name: Hermes (сервер)
+    name: Hermes
     transport: cli
-    host: laptop
+    host: server
     configured: true
     capabilities:
       text: {supported: true, evidence: "catalog"}
@@ -463,9 +463,9 @@ agents:
           - deepseek-v4.1-flash
           - gpt-6.1-sol
           - qwen3.8-max
-    name: OpenClaw (сервер)
+    name: OpenClaw
     transport: cli
-    host: laptop
+    host: server
     configured: true
     capabilities:
       text: {supported: true, evidence: "catalog"}
@@ -491,9 +491,9 @@ agents:
           - qwen3.8-max
           - qwen3.8-plus
           - qwen3.8-flash
-    name: Qwen Desktop (сервер)
+    name: Qwen Desktop
     transport: cdp
-    host: laptop
+    host: server
     configured: true
     capabilities:
       text: {supported: true, evidence: "catalog"}

@@ -91,7 +91,7 @@ async def _schedule_index_sweep() -> None:
         try:
             await asyncio.to_thread(
                 workspace.create_op_job, "refresh_index", {"root": project["workdir"]},
-                str(project.get("host_id") or "laptop"), project.get("id"),
+                str(project.get("host_id") or "server"), project.get("id"),
                 f"autoindex:{project.get('id')}:{stamp}", 180)
         except Exception as exc:  # noqa: BLE001 — плановая сверка не должна ломать тик
             print(f"index sweep skipped for {project.get('id')}: {exc}", flush=True)
@@ -216,6 +216,7 @@ async def _sweeper() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await asyncio.to_thread(db.init)
+    await asyncio.to_thread(db.fail_orphan_jobs)
     await asyncio.to_thread(quality_db.init)
     await asyncio.to_thread(observations.init)
     await asyncio.to_thread(workers.init)
@@ -1047,7 +1048,7 @@ def _project_dir_name(name: str, project_id: str) -> str:
     return slug if slug and slug != "project" else f"project-{project_id[:8]}"
 
 
-DEFAULT_PROJECT_HOST = (os.environ.get("HUB_DEFAULT_HOST") or "laptop").strip() or "laptop"
+DEFAULT_PROJECT_HOST = (os.environ.get("HUB_DEFAULT_HOST") or "server").strip() or "server"
 
 # Статусы, после которых задание воркера уже не изменится.
 JOB_TERMINAL = {"succeeded", "done", "failed", "cancelled", "unknown", "error"}
@@ -1138,8 +1139,8 @@ def _ensure_restore_point(project: dict, label: str) -> dict:
         return {"ok": False, "error": "project has no workdir"}
     job = workspace.create_op_job(
         "create_backup", {"root": root, "label": label,
-                          "host": str(project.get("host_id") or "laptop")},
-        str(project.get("host_id") or "laptop"), str(project.get("id") or ""),
+                          "host": str(project.get("host_id") or "server")},
+        str(project.get("host_id") or "server"), str(project.get("id") or ""),
         f"backup:{project.get('id')}:{project.get('head_sha') or ''}:{label}", 180)
     job_id = job["job"]["id"]
     final = _wait_workspace_job(job_id, int(os.environ.get("BACKUP_WAIT_S", "180")))
@@ -1180,7 +1181,7 @@ def refresh_project_index(project_id: str) -> dict:
         raise HTTPException(status_code=409, detail={"code": "no_workdir"})
     try:
         job = workspace.create_op_job(
-            "refresh_index", {"root": root}, str(project.get("host_id") or "laptop"),
+            "refresh_index", {"root": root}, str(project.get("host_id") or "server"),
             project_id, None, 180)
     except workspace.OpError as exc:
         raise HTTPException(status_code=400, detail={"code": exc.code, "message": str(exc)}) from exc
@@ -1207,7 +1208,7 @@ async def _project_op(project_id: str, op: str, args: dict, wait_s: int) -> dict
     try:
         job = await asyncio.to_thread(
             workspace.create_op_job, op, {**args, "root": root},
-            str(project.get("host_id") or "laptop"), project_id, None, wait_s)
+            str(project.get("host_id") or "server"), project_id, None, wait_s)
     except workspace.OpError as exc:
         raise HTTPException(status_code=400, detail={"code": exc.code, "message": str(exc)}) from exc
     job_id = job["job"]["id"]
@@ -1384,7 +1385,7 @@ async def project_import(request: Request) -> dict:
         raise HTTPException(status_code=400, detail="path is required")
     if not ntpath.isabs(path):
         raise HTTPException(status_code=400, detail="path must be absolute")
-    host_id = str(payload.get("host_id") or "laptop").strip()
+    host_id = str(payload.get("host_id") or "server").strip()
     name = str(payload.get("name") or ntpath.basename(path.rstrip("\\/")) or "Repository")[:200]
     key = str(payload.get("idempotency_key") or "").strip()[:200]
     if key:
@@ -1745,7 +1746,7 @@ def _resolve_chat_target(payload: dict, project: dict) -> tuple[dict, dict, str,
     if not bridge_agent:
         raise HTTPException(status_code=501, detail=f"adapter for '{agent_id}' is not implemented yet")
     # A configured workdir must belong to the executor's declared host.
-    host_id = (project.get("host_id") or "laptop").strip() or "laptop"
+    host_id = (project.get("host_id") or "server").strip() or "laptop"
     agent_host = (item.get("host") or "").strip()
     if item.get("transport") != "http" and project.get("workdir") and agent_host != host_id:
         raise HTTPException(status_code=400,

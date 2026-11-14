@@ -7,4 +7,4 @@ projects:
     - 'R:\AIHub\WorkSpace'
     - 'R:\'
   # Внутренний ярлык машины, где живёт рабочий воркер (для человека это «сервер»).
-  default_host: 'laptop'
+  default_host: 'server'

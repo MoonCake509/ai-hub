@@ -320,7 +320,7 @@ def validate(op: str, args: dict | None) -> dict:
 
     if op == "create_backup":
         clean["label"] = _str(args.get("label"), "label", 48) or "backup"
-        clean["host"] = _str(args.get("host"), "host", 64) or "laptop"
+        clean["host"] = _str(args.get("host"), "host", 64) or "server"
         return clean
 
     if op == "write_reports":

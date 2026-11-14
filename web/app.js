@@ -1146,7 +1146,7 @@ const WS={projects:[],project:null,convs:[],conv:null,roles:{},atts:[],messages:
 function toast(message,error=false){const box=$('#toast');box.textContent=message;box.classList.toggle('error',error);box.hidden=false;clearTimeout(toast.timer);toast.timer=setTimeout(()=>box.hidden=true,5500)}
 function workspaceError(error){const text=String(error?.message||error);if(text==='unauthorized')return;$('#workspace-error-text').textContent=text.includes('404')||text==='Not Found'?'Сервер ещё не обновлён: API проектов недоступен. Обновите backend вместе с интерфейсом.':text;$('#workspace-error').hidden=false}
 function action(fn){return async(...args)=>{try{return await fn(...args)}catch(error){workspaceError(error);toast(error.message||String(error),true)}}}
-function switchView(name){WS.view=name;document.querySelectorAll('.tab').forEach(b=>{b.classList.toggle('active',b.dataset.view===name);b.setAttribute('aria-pressed',String(b.dataset.view===name))});$('#view-workspace').hidden=name!=='workspace';$('#view-ops').hidden=name!=='ops';$('#view-usage').hidden=name!=='usage';$('#detail').hidden=true;currentJob=null;if(name==='workspace'&&token)wsRefreshAll().catch(workspaceError);if(name==='usage'&&token){usageLoad().catch(workspaceError)}if(name==='ops'&&token){loadJobs();loadRuns();loadAgents().catch(error=>{if(error.message!=='unauthorized')$('#health-text').textContent='ошибка наблюдений: '+error.message});reconLoad(false)}}
+function switchView(name){WS.view=name;document.querySelectorAll('.tab').forEach(b=>{b.classList.toggle('active',b.dataset.view===name);b.setAttribute('aria-pressed',String(b.dataset.view===name))});$('#view-workspace').hidden=name!=='workspace';$('#view-ops').hidden=name!=='ops';$('#view-usage').hidden=name!=='usage';$('#view-channels').hidden=name!=='channels';$('#view-quality').hidden=name!=='quality';$('#detail').hidden=true;currentJob=null;if(name==='workspace'&&token)wsRefreshAll().catch(workspaceError);if(name==='usage'&&token){usageLoad().catch(workspaceError)}if(name==='channels'&&token){channelsLoad().catch(workspaceError)}if(name==='ops'&&token){loadJobs();loadRuns();loadAgents().catch(error=>{if(error.message!=='unauthorized')$('#health-text').textContent='ошибка наблюдений: '+error.message});reconLoad(false)}}
 function putOptions(select,items,value){select.replaceChildren();for(const item of items){const option=el('option','',item.name||item.id);option.value=item.id;select.append(option)}if(items.some(x=>x.id===value))select.value=value;else if(items.length)select.value=items[0].id}
 function roleInfo(id){return ROLE_META[id]||[id,'?','']}
 function selectedAssignment(){return WS.roles[WS.roleId]||{role_id:WS.roleId,agent_id:'codex',profile:'',model:'',instructions:''}}
@@ -1424,7 +1424,7 @@ async function wsLoadRoleQuota(agentId,profileId,modelId){
  try{
   const data=await api('/projects/'+encodeURIComponent(WS.project.id)+'/usage?days=30');
   const rows=(data.items||[]).filter(item=>item.agent_id===agentId&&(!modelId||item.model===modelId));
-  if(!rows.length||!data.has_usage){box.textContent='Токенов за 30 дней нет: канал не сообщает usage.';return}
+  if(!rows.length||!data.has_usage){box.textContent='Токенов за 30 дней нет.';return}
   const sum=rows.reduce((acc,item)=>{acc.total+=item.tokens_total;acc.input+=item.tokens_in;acc.output+=item.tokens_out;acc.reason+=item.tokens_reasoning;acc.attempts+=item.attempts;return acc},{total:0,input:0,output:0,reason:0,attempts:0});
   const n=value=>Number(value||0).toLocaleString('ru-RU');
   box.textContent='Токены за 30 дней: '+n(sum.total)+' (вход '+n(sum.input)+', выход '+n(sum.output)+', размышление '+n(sum.reason)+') · попыток '+n(sum.attempts);
@@ -1756,5 +1756,194 @@ function wireExtras(){
     }catch(error){toast('Не удалось удалить: '+error.message)}
     finally{remove.disabled=false}
   };
+  wireChannels();
   for(const id of ['#usage-days','#usage-provider','#usage-model']){const node=$(id);if(node)node.onchange=()=>usageLoad().catch(()=>{})}
+}
+
+/* ===== Каналы: внешний OpenAI-совместимый API ===== */
+const Channels = { items: [], busy: false };
+
+function channelsNum(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n.toLocaleString('ru-RU') : '0';
+}
+
+function channelsTestLabel(test) {
+  if (!test) return 'не проверялся';
+  if (test.ok) return 'проверен · ' + channelsNum(test.elapsed_ms) + ' мс';
+  return 'ошибка проверки';
+}
+
+function channelTestBlock(test) {
+  if (!test) return null;
+  const box = el('div', 'channel-test ' + (test.ok ? 'ok' : 'failed'));
+  if (test.ok) {
+    box.append(el('div', 'channel-test-answer', String(test.answer || '—')));
+    const metrics = el('div', 'channel-test-metrics');
+    metrics.append(el('span', '', 'задержка ' + channelsNum(test.elapsed_ms) + ' мс'));
+    if (test.usage) {
+      metrics.append(el('span', '', 'вход ' + channelsNum(test.usage.input_tokens)));
+      metrics.append(el('span', '', 'выход ' + channelsNum(test.usage.output_tokens)));
+      metrics.append(el('span', '', 'всего ' + channelsNum(test.usage.total_tokens)));
+    } else {
+      metrics.append(el('span', '', 'токены провайдер не сообщил'));
+    }
+    if (test.reported_model) metrics.append(el('span', '', 'модель: ' + test.reported_model));
+    box.append(metrics);
+  } else {
+    box.append(el('div', 'channel-test-error', 'Причина: ' + (test.error || 'провайдер не ответил')));
+    const metrics = el('div', 'channel-test-metrics');
+    metrics.append(el('span', '', 'модель: ' + (test.model || '—')),
+      el('span', '', 'задержка ' + channelsNum(test.elapsed_ms) + ' мс'));
+    box.append(metrics);
+  }
+  if (test.checked_at) box.append(el('div', 'channel-test-time', 'Проверка ' + String(test.checked_at).replace('T', ' ')));
+  return box;
+}
+
+function channelsRender() {
+  const box = $('#channels-list');
+  if (!box) return;
+  box.replaceChildren();
+  $('#channels-count').textContent = Channels.items.length ? Channels.items.length + ' подключено' : '';
+  if (!Channels.items.length) {
+    box.append(el('p', 'hint', 'Каналов пока нет. Подключите первый слева: название, адрес API, ключ и ID модели.'));
+    return;
+  }
+  for (const item of Channels.items) {
+    const test = item.last_test || null;
+    const card = el('article', 'channel-card ' + (test ? (test.ok ? 'ok' : 'failed') : ''));
+    const head = el('div', 'channel-card-head');
+    const titleBox = el('div');
+    titleBox.append(el('div', 'channel-card-title', item.name || 'Канал'));
+    titleBox.append(el('div', 'channel-card-url', item.base_url || ''));
+    const badge = el('span', 'badge ' + (test ? (test.ok ? 'succeeded' : 'failed') : 'queued'),
+      channelsTestLabel(test));
+    head.append(titleBox, badge);
+    card.append(head);
+
+    const models = el('div', 'channel-models');
+    for (const model of item.models || []) models.append(el('span', 'channel-model', model));
+    card.append(models);
+
+    const meta = el('div', 'channel-meta');
+    meta.append(el('span', 'hint', 'ключ: ' + (item.key_masked || 'не сохранён')));
+    if (test && test.reported_model) meta.append(el('span', 'hint', 'провайдер сообщил модель: ' + test.reported_model));
+    card.append(meta);
+
+    const actions = el('div', 'channel-actions');
+    const testButton = el('button', 'ghost', 'Проверить');
+    testButton.type = 'button';
+    testButton.onclick = () => channelsTest(item.id, testButton);
+    const deleteButton = el('button', 'ghost danger', 'Отключить');
+    deleteButton.type = 'button';
+    deleteButton.onclick = () => channelsDelete(item);
+    actions.append(testButton, deleteButton);
+    card.append(actions);
+
+    const block = channelTestBlock(test);
+    if (block) card.append(block);
+    box.append(card);
+  }
+}
+
+async function channelsLoad() {
+  const box = $('#channels-list');
+  if (box) box.setAttribute('aria-busy', 'true');
+  try {
+    const data = await api('/channels');
+    Channels.items = data.channels || [];
+    $('#channels-error').hidden = true;
+    channelsRender();
+  } catch (error) {
+    const err = $('#channels-error');
+    if (err) { err.textContent = 'Не удалось загрузить каналы: ' + error.message; err.hidden = false; }
+    throw error;
+  } finally {
+    if (box) box.setAttribute('aria-busy', 'false');
+  }
+}
+
+async function channelsTest(id, button) {
+  const label = button.textContent;
+  button.disabled = true;
+  button.textContent = 'Проверяю…';
+  try {
+    const data = await api('/channels/' + encodeURIComponent(id) + '/test',
+      { method: 'POST', body: JSON.stringify({}), timeout: 150000 });
+    const item = Channels.items.find(row => row.id === id);
+    if (item) item.last_test = data.test;
+    channelsRender();
+    if (data.test && data.test.ok) toast('Канал ответил за ' + channelsNum(data.test.elapsed_ms) + ' мс');
+    else toast('Проверка не прошла: ' + ((data.test || {}).error || 'причина не сообщена'), true);
+  } catch (error) {
+    toast('Проверка не прошла: ' + error.message, true);
+    button.disabled = false;
+    button.textContent = label;
+  }
+}
+
+async function channelsDelete(item) {
+  if (!window.confirm('Отключить канал «' + (item.name || '') + '»?\n\nКлюч будет удалён с сервера. Роли, назначенные на этот канал, перестанут получать ответы — их нужно переназначить.')) return;
+  try {
+    await api('/channels/' + encodeURIComponent(item.id), { method: 'DELETE' });
+    await channelsLoad();
+    await loadAgents();
+    if (WS.roleId) await wsEditRole(WS.roleId);
+    toast('Канал отключён');
+  } catch (error) {
+    toast('Не удалось отключить: ' + error.message, true);
+  }
+}
+
+async function channelSubmit(event) {
+  event.preventDefault();
+  if (Channels.busy) return;
+  const name = $('#channel-name').value.trim();
+  const baseUrl = $('#channel-base-url').value.trim();
+  const key = $('#channel-key').value;
+  const models = $('#channel-models').value.trim();
+  const hint = $('#channel-form-hint');
+  const button = $('#channel-submit');
+  if (!name || !baseUrl || !key.trim() || !models) {
+    hint.className = 'hint err';
+    hint.textContent = 'Заполните все поля: название, адрес, ключ и ID модели.';
+    return;
+  }
+  Channels.busy = true;
+  button.disabled = true;
+  button.textContent = 'Сохраняю ключ на сервере…';
+  hint.className = 'hint';
+  hint.textContent = 'Ключ передаётся по защищённому каналу и сохраняется только на сервере.';
+  try {
+    await api('/channels', {
+      method: 'POST',
+      body: JSON.stringify({ name, base_url: baseUrl, api_key: key, models }),
+      timeout: 60000,
+    });
+    $('#channel-key').value = '';
+    $('#channel-models').value = '';
+    $('#channel-name').value = '';
+    $('#channel-base-url').value = '';
+    await channelsLoad();
+    await loadAgents();
+    if (WS.roleId) await wsEditRole(WS.roleId);
+    hint.className = 'hint ok';
+    hint.textContent = 'Канал подключён. Нажмите «Проверить», затем выберите модель в карточке роли.';
+    toast('Канал подключён');
+  } catch (error) {
+    hint.className = 'hint err';
+    hint.textContent = 'Не удалось подключить: ' + error.message;
+  } finally {
+    Channels.busy = false;
+    button.disabled = false;
+    button.textContent = 'Подключить';
+  }
+}
+
+function wireChannels() {
+  const form = $('#channel-form');
+  if (form) form.onsubmit = channelSubmit;
+  const refresh = $('#channels-refresh');
+  if (refresh) refresh.onclick = () => channelsLoad().catch(() => {});
 }

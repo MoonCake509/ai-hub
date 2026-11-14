@@ -1,10 +1,10 @@
 <!doctype html>
 <html lang="ru">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#10141c"><title>AI Hub — проекты, команда и качество</title><link rel="stylesheet" href="styles.css?v=36"><link rel="stylesheet" href="quality.css?v=3"></head>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#10141c"><title>AI Hub — проекты, команда и качество</title><link rel="stylesheet" href="styles.css?v=37"><link rel="stylesheet" href="quality.css?v=3"></head>
 <body>
 <header class="top">
   <a class="brand" href="/ui/" aria-label="AI Hub — рабочее пространство"><span class="brand-mark">AI</span><span>Hub<span class="ver" id="version"></span><span class="ver" id="build"></span></span></a>
-  <nav class="tabs" aria-label="Разделы"><button type="button" class="tab active" data-view="workspace" aria-pressed="true">Рабочее пространство</button><button type="button" class="tab" data-view="ops" aria-pressed="false">Запуски и диагностика</button><button type="button" class="tab" data-view="usage" aria-pressed="false">Расход</button><button type="button" class="tab" data-view="quality" aria-pressed="false">Качество каналов</button></nav>
+  <nav class="tabs" aria-label="Разделы"><button type="button" class="tab active" data-view="workspace" aria-pressed="true">Рабочее пространство</button><button type="button" class="tab" data-view="ops" aria-pressed="false">Запуски и диагностика</button><button type="button" class="tab" data-view="usage" aria-pressed="false">Расход</button><button type="button" class="tab" data-view="channels" aria-pressed="false">Каналы</button><button type="button" class="tab" data-view="quality" aria-pressed="false">Качество каналов</button></nav>
   <div class="state"><span class="dot" id="health-dot"></span><span id="health-text">Подключение…</span></div><button type="button" class="ghost token-button" id="token-btn">Доступ</button>
 </header>
 <main id="view-workspace" class="workspace-shell">
@@ -139,6 +139,31 @@
     <div class="usage-breakdown"><section><h3>По моделям</h3><div id="usage-models" class="usage-table"></div></section><section><h3>По провайдерам</h3><div id="usage-providers" class="usage-table"></div></section></div>
   </section>
 </main>
+<main id="view-channels" class="channels-view" hidden>
+  <header class="channels-header">
+    <div><div class="eyebrow">КАНАЛЫ</div><h1>Подключение провайдеров</h1><p class="hint">OpenAI-совместимый API: адрес, ключ и ID модели. Ключ остаётся на сервере — в браузер возвращается только маска. «Проверить» делает один короткий настоящий запрос и показывает ответ, задержку и токены.</p></div>
+    <button type="button" class="ghost small" id="channels-refresh">Обновить</button>
+  </header>
+  <div id="channels-error" class="quality-error" role="alert" hidden></div>
+  <section class="channels-grid">
+    <section class="panel channel-form-panel">
+      <div class="panel-head"><div><div class="eyebrow">НОВЫЙ КАНАЛ</div><h2>Подключить API</h2></div></div>
+      <form id="channel-form" class="channel-form">
+        <label>Название<input id="channel-name" required maxlength="80" autocomplete="off" placeholder="Например, Pishnye AI"></label>
+        <label>Адрес API<input id="channel-base-url" required inputmode="url" autocomplete="off" placeholder="https://provider.example/v1"></label>
+        <label>Ключ<input id="channel-key" type="password" required autocomplete="new-password" placeholder="Ключ провайдера"></label>
+        <label>ID модели<input id="channel-models" required autocomplete="off" placeholder="deepseek-v4.1-flash, qwen3.8-27b"></label>
+        <p class="hint">Несколько моделей — через запятую: тогда в чате появится выбор модели.</p>
+        <p class="hint" id="channel-form-hint" role="status"></p>
+        <button class="primary" id="channel-submit" type="submit">Подключить</button>
+      </form>
+    </section>
+    <section class="panel channel-list-panel">
+      <div class="panel-head"><div><div class="eyebrow">ПОДКЛЮЧЕНО</div><h2>Каналы</h2></div><span class="count-label" id="channels-count"></span></div>
+      <div id="channels-list" class="channels-list"><p class="hint">Каналов пока нет.</p></div>
+    </section>
+  </section>
+</main>
 <main id="view-quality" class="quality-view" hidden>
   <header class="quality-header">
     <div><div class="eyebrow">КАЧЕСТВО КАНАЛОВ</div><h1>Проверка выбранного канала</h1><p class="hint">Короткая проверка запускается сразу. Расширенные проверки находятся в раскрытом разделе.</p></div>
@@ -214,5 +239,5 @@
 <dialog id="project-dialog" class="settings-dialog"><form id="project-settings-form"><div class="dialog-heading"><h2 id="project-dialog-title">Настройки проекта</h2><button type="submit" formmethod="dialog" formnovalidate id="project-dialog-close" class="icon-button" aria-label="Закрыть настройки">×</button></div><label>Название<input id="project-name" required maxlength="120" placeholder="Название проекта"></label><div class="ws-choice"><span class="ws-choice-label">Устройство</span><span class="ws-choice-value"><i class="ws-dot"></i>Сервер</span></div><div class="ws-path"><span class="ws-path-label">Рабочая папка</span><code id="project-path">R:\AIHub\WorkSpace\…</code></div><p class="hint">Папка создаётся сама: git, .env.example, README, AGENTS.md, TASKFLOW, map, ROADMAP, DEPENDENCIES, tools, crons, backups и журнал проекта.</p><div id="project-progress" class="ws-progress" hidden><div class="ws-progress-track"><i></i></div><ol class="ws-steps"><li class="ws-step" data-state="active">Создаю папку проекта</li><li class="ws-step">Готовлю git и первый коммит</li><li class="ws-step">Раскладываю документы и карту</li><li class="ws-step">Подключаю проект к хабу</li><li class="ws-step">Проверяю готовность</li></ol><p class="hint ws-progress-note" id="project-progress-note" role="status"></p></div><p id="project-dialog-error" class="err" role="alert"></p><div class="project-dialog-actions"><button type="button" id="project-delete" class="ghost small danger" hidden>Удалить проект</button><button type="submit" class="primary">Сохранить проект</button></div></form></dialog>
 <div id="toast" class="toast" role="status" hidden></div>
 <div class="gate" id="gate" hidden><form class="gate-box" id="token-form"><div class="brand-mark">AI</div><h2>Подключиться к AI Hub</h2><p>Введите токен доступа к вашему хабу.</p><label class="sr-only" for="token-input">Токен доступа</label><input id="token-input" type="password" placeholder="HUB_TOKEN" autocomplete="off"><div class="row"><button class="primary" id="token-save" type="button">Подключиться</button><button class="ghost" id="token-cancel" type="button">Отмена</button><button class="ghost" id="token-diag" type="button">Диагностика</button></div><pre id="diag" class="diag" hidden></pre><p class="msg" id="token-status"></p><p class="err" id="token-err" role="alert"></p></form></div>
-<script src="app.js?v=36"></script><script src="quality.js?v=3"></script>
+<script src="app.js?v=37"></script><script src="quality.js?v=3"></script>
 </body></html>

@@ -539,6 +539,10 @@ def main() -> int:
             elif agent_id in ("openclaw", "hermes"):
                 result = spec["runner"](
                     prompt, timeout, requested_model, requested_profile, cwd=workdir)
+            elif agent_id == "channel":
+                # Ключ канала воркер не получает: запрос к провайдеру делает хаб.
+                result = spec["runner"](
+                    prompt, timeout, requested_model, requested_profile, cwd=workdir)
             else:
                 result = spec["runner"](prompt, timeout)
             ok = result.get("exit_code") == 0

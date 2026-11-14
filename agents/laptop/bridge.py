@@ -594,6 +594,54 @@ def run_kimi(prompt: str, timeout: int, requested_model: str | None = None,
                 "error": str(exc)}
 
 
+def run_channel(prompt: str, timeout: int, requested_model: str | None = None,
+                requested_profile: str | None = None, reasoning_effort: str | None = None,
+                *, cwd: str | None = None) -> dict:
+    """Канал внешнего API: запрос выполняет хаб, ключ остаётся на сервере."""
+    import urllib.error
+    import urllib.request
+    started = time.time()
+    channel_id = (requested_profile or "").split(":", 1)[-1].strip()
+    hub = (os.environ.get("HUB_URL") or "http://127.0.0.1:8090").rstrip("/")
+    token = os.environ.get("HUB_TOKEN") or TOKEN
+    if not channel_id:
+        return {"output": "", "usage": {}, "exit_code": 1,
+                "error": "не выбран API-канал (profile channel:<id>)",
+                "elapsed": round(time.time() - started, 2)}
+    body = json.dumps({"prompt": prompt, "model": requested_model or "",
+                       "timeout": max(10, min(int(timeout), 900))},
+                      ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(f"{hub}/channels/{channel_id}/chat", data=body,
+                                     method="POST")
+    request.add_header("Content-Type", "application/json")
+    if token:
+        request.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(request, timeout=int(timeout) + 20) as response:
+            data = json.loads(response.read() or b"{}")
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = json.loads(exc.read() or b"{}").get("detail")
+        except Exception:  # noqa: BLE001
+            detail = None
+        text = detail if isinstance(detail, str) else None
+        return {"output": "", "usage": {}, "exit_code": 1,
+                "error": text or f"хаб ответил HTTP {exc.code}", "elapsed": round(time.time() - started, 2)}
+    except Exception as exc:  # noqa: BLE001
+        return {"output": "", "usage": {}, "exit_code": 1, "error": str(exc),
+                "elapsed": round(time.time() - started, 2)}
+    output = data.get("output") if isinstance(data.get("output"), str) else ""
+    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    if not output.strip():
+        return {"output": "", "usage": {}, "exit_code": 1,
+                "error": "канал вернул пустой ответ", "elapsed": round(time.time() - started, 2)}
+    if data.get("reported_model"):
+        usage = dict(usage)
+        usage["reported_model"] = data["reported_model"]
+    return {"output": output.strip(), "usage": usage, "exit_code": 0,
+            "elapsed": round(time.time() - started, 2)}
+
+
 AGENTS = {
     "codex": {
         "name": "Codex CLI (ноутбук)",
@@ -622,6 +670,12 @@ AGENTS = {
     "kimi": {
         "name": "Kimi Code (API приложения)",
         "runner": run_kimi,
+        "path": sys.executable,
+        "timeout": 900,
+    },
+    "channel": {
+        "name": "API-канал (внешний провайдер)",
+        "runner": run_channel,
         "path": sys.executable,
         "timeout": 900,
     },

@@ -33,6 +33,7 @@ from fastapi.staticfiles import StaticFiles
 from . import chat_context, db, observations, probes, quality, quality_db, quality_quick, workers
 from . import reconciliation
 from . import capabilities
+from . import channels
 from . import packets
 from . import runs as runs_ctrl
 from . import project_template
@@ -246,7 +247,11 @@ def load_agents() -> dict:
     if not AGENTS_FILE.exists():
         return {"agents": []}
     with AGENTS_FILE.open(encoding="utf-8") as fh:
-        return yaml.safe_load(fh) or {"agents": []}
+        catalog = yaml.safe_load(fh) or {"agents": []}
+    # Подключённые владельцем API-каналы — такие же агенты для выбора роли,
+    # но исполняются они через хаб, а не через CLI-воркер.
+    catalog["agents"] = list(catalog.get("agents") or []) + channels.agent_dicts()
+    return catalog
 
 
 def find_agent(agent_id: str) -> dict | None:
@@ -371,6 +376,96 @@ def agents() -> dict:
     return {"count": len(items), "agents": items}
 
 
+# --- Каналы внешних провайдеров (OpenAI-совместимый API) ---
+# Ключ принимается формой и остаётся на сервере: наружу отдаются только маска
+# и результат последней проверки. Работа с файлами и Git — у исполнителей
+# AI Hub; канал даёт доступ к модели, а не к процессу.
+
+@app.get("/channels", dependencies=[Depends(require_token)])
+async def channels_list() -> dict:
+    items = await asyncio.to_thread(channels.list_channels)
+    return {"count": len(items), "channels": items}
+
+
+@app.post("/channels", dependencies=[Depends(require_token)])
+async def channels_create(request: Request) -> dict:
+    payload = await request.json()
+    try:
+        item = await asyncio.to_thread(
+            channels.create, payload.get("name") or "", payload.get("base_url") or "",
+            payload.get("api_key") or "", payload.get("models") or payload.get("model") or [])
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    return {"channel": item}
+
+
+@app.patch("/channels/{channel_id}", dependencies=[Depends(require_token)])
+async def channels_update(channel_id: str, request: Request) -> dict:
+    payload = await request.json()
+    try:
+        item = await asyncio.to_thread(
+            channels.update, channel_id, name=payload.get("name"),
+            base_url=payload.get("base_url"), api_key=payload.get("api_key"),
+            models=payload.get("models") if "models" in payload else payload.get("model")
+            if "model" in payload else None)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="channel not found") from None
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    return {"channel": item}
+
+
+@app.delete("/channels/{channel_id}", dependencies=[Depends(require_token)])
+async def channels_delete(channel_id: str) -> dict:
+    removed = await asyncio.to_thread(channels.delete, channel_id)
+    if not removed:
+        raise HTTPException(status_code=404, detail="channel not found")
+    return {"deleted": True, "id": channel_id}
+
+
+@app.post("/channels/{channel_id}/test", dependencies=[Depends(require_token)])
+async def channels_test(channel_id: str, request: Request) -> dict:
+    """Короткий настоящий запрос к провайдеру: ответ, задержка, токены или причина."""
+    payload = await request.json() if await request.body() else {}
+    try:
+        result = await asyncio.to_thread(channels.probe, channel_id, payload.get("model"))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="channel not found") from None
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    return {"test": result}
+
+
+@app.post("/channels/{channel_id}/chat", dependencies=[Depends(require_token)])
+async def channels_chat(channel_id: str, request: Request) -> dict:
+    """Вызов модели канала. Ключ не покидает хаб; ошибка провайдера — как есть."""
+    payload = await request.json()
+    prompt = (payload.get("prompt") or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="prompt is required")
+    model = (payload.get("model") or "").strip()
+    if not model:
+        raise HTTPException(status_code=400, detail="model is required")
+    try:
+        max_tokens = int(payload.get("max_tokens") or channels.DEFAULT_MAX_TOKENS)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="max_tokens must be an integer") from None
+    max_tokens = max(64, min(8192, max_tokens))
+    try:
+        timeout = int(payload.get("timeout") or 300)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="timeout must be an integer") from None
+    timeout = max(10, min(900, timeout))
+    row = await asyncio.to_thread(channels._row, channel_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="channel not found")
+    try:
+        result = await asyncio.to_thread(channels.call, row, model, prompt, timeout, max_tokens)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from None
+    return result
+
+
 # Профили провайдеров и модели для выбора в интерфейсе. Источник — реестр агентов,
 # а не внешние платные вызовы: хаб не расходует бюджет на перечисление каталога.
 AGENT_PROFILES: dict[str, dict] = {}
@@ -392,7 +487,8 @@ async def agent_profiles(agent_id: str) -> dict:
     item = find_agent(agent_id)
     if item is None:
         raise HTTPException(status_code=404, detail=f"agent '{agent_id}' not found")
-    prof = AGENT_PROFILES.get(agent_id) or {"profiles": [], "default_profile": ""}
+    prof = AGENT_PROFILES.get(agent_id) or {"profiles": item.get("profiles") or [],
+                                            "default_profile": item.get("default_profile") or ""}
     observed = await asyncio.to_thread(observations.evaluate_one, item, None, VERSION)
     described = await asyncio.to_thread(capabilities.describe, item)
     return {
@@ -1464,12 +1560,17 @@ async def role_update(project_id: str, role_id: str, request: Request) -> dict:
         selected_agent = find_agent(str(agent_id or (await asyncio.to_thread(db.get_role, project_id, role_id) or {}).get("agent_id", "")))
         if not selected_agent or not selected_agent.get("model_selection"):
             raise HTTPException(status_code=400, detail="selected agent does not support profile/model selection")
-        prof = AGENT_PROFILES.get(selected_agent["id"]) or {}
+        prof = AGENT_PROFILES.get(selected_agent["id"]) or {
+            "profiles": selected_agent.get("profiles") or [],
+            "default_profile": selected_agent.get("default_profile") or "",
+        }
         profile = payload.get("profile") or prof.get("default_profile") or ""
         spec = next((p for p in prof.get("profiles", []) if p.get("id") == profile), None)
         if profile and spec is None:
             raise HTTPException(status_code=400, detail=f"unknown provider profile '{profile}'")
-        if payload.get("model") and (not spec or payload["model"] not in (spec.get("models") or [])):
+        model_ids = {str(m if isinstance(m, str) else (m or {}).get("id") or "")
+                     for m in ((spec or {}).get("models") or [])}
+        if payload.get("model") and (not spec or payload["model"] not in model_ids):
             raise HTTPException(status_code=400, detail=f"model '{payload['model']}' is not available for profile '{profile}'")
     if payload.get("timeout_s") is not None:
         try:
@@ -1776,7 +1877,10 @@ def _resolve_chat_target(payload: dict, project: dict) -> tuple[dict, dict, str,
 
 def _validate_chat_profile(item: dict, agent_id: str, profile: str, model: str | None) -> tuple[str, str | None]:
     """Валидация профиля/модели как в /run: дефолты из реестра, несовместимое — 400."""
-    prof = AGENT_PROFILES.get(agent_id) or {}
+    prof = AGENT_PROFILES.get(agent_id) or {
+        "profiles": item.get("profiles") or [],
+        "default_profile": item.get("default_profile") or "",
+    }
     known_profiles = prof.get("profiles") or []
     default_profile = prof.get("default_profile") or ""
     if not profile:
@@ -1785,7 +1889,9 @@ def _validate_chat_profile(item: dict, agent_id: str, profile: str, model: str |
     if profile and spec is None:
         raise HTTPException(status_code=400, detail=f"unknown provider profile '{profile}'")
     if spec is not None:
-        known_models = spec.get("models") or []
+        known_models = [str(m if isinstance(m, str) else (m or {}).get("id") or "")
+                        for m in (spec.get("models") or [])]
+        known_models = [m for m in known_models if m]
         if model and model not in known_models:
             raise HTTPException(status_code=400,
                                 detail=f"model '{model}' not supported by profile '{profile}'")
@@ -1795,8 +1901,8 @@ def _validate_chat_profile(item: dict, agent_id: str, profile: str, model: str |
 
 
 def _model_capabilities(item: dict, agent_id: str, profile: str, model: str | None) -> dict:
-    profile_spec = next((p for p in (AGENT_PROFILES.get(agent_id, {}).get("profiles") or [])
-                         if p.get("id") == profile), {})
+    profiles = (AGENT_PROFILES.get(agent_id) or {}).get("profiles") or item.get("profiles") or []
+    profile_spec = next((p for p in profiles if p.get("id") == profile), {})
     model_spec = (profile_spec.get("model_capabilities") or {}).get(model) or {}
     defaults = {
         "input_modalities": ["text"], "output_modalities": ["text"],

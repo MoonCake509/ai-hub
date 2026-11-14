@@ -509,6 +509,19 @@ DDL = [
         "create index if not exists semantic_chunks_scope on aihub.semantic_chunks(project_id, sha)",
         "create unique index if not exists semantic_chunks_unique on aihub.semantic_chunks"
         "(project_id, sha, path, start_line)",
+        # Каналы внешних провайдеров: ключ хранится на сервере в зашифрованном
+        # виде и никогда не возвращается в браузер.
+        """create table if not exists aihub.channels (
+            id text primary key,
+            name text not null,
+            base_url text not null,
+            api_key text not null,
+            models jsonb not null default '[]'::jsonb,
+            last_test jsonb,
+            created_at timestamptz not null default now(),
+            updated_at timestamptz not null default now()
+        )""",
+        "create unique index if not exists channels_name on aihub.channels(lower(name))",
     ]
 
 
@@ -977,13 +990,18 @@ def _usage_numbers(usage: dict | None) -> tuple[int, int, int, str]:
 def _record_usage(conn, job: dict, attempt_id: str, usage: dict | None) -> None:
     """append-only журнал: одна строка на попытку, повтор не удваивает счёт."""
     t_in, t_out, t_reason, source = _usage_numbers(usage)
+    agent_id, profile = job.get("agent_id"), job.get("requested_profile")
+    # API-канал исполняется общим мостом "channel": в расходе показываем сам канал,
+    # иначе карточка роли не находит свои токены.
+    if agent_id == "channel" and str(profile or "").startswith("channel:"):
+        agent_id = profile
     conn.run(_qualify(
         "insert into aihub.usage_ledger(attempt_id, job_id, project_id, role_id, agent_id,"
         " profile, model, tokens_in, tokens_out, tokens_reasoning, source)"
         " values (:a, :j, :p, :r, :ag, :pr, :m, :ti, :to, :tr, :s)"
         " on conflict (attempt_id) do nothing"),
         a=attempt_id, j=job.get("id"), p=job.get("project_id"), r=job.get("role_id"),
-        ag=job.get("agent_id"), pr=job.get("requested_profile"),
+        ag=agent_id, pr=profile,
         m=(usage or {}).get("reported_model") or (usage or {}).get("model") or job.get("effective_model"),
         ti=t_in, to=t_out, tr=t_reason, s=source)
 

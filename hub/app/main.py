@@ -94,11 +94,52 @@ async def _schedule_index_sweep() -> None:
             print(f"index sweep skipped for {project.get('id')}: {exc}", flush=True)
 
 
+# --- Автоматизация проекта: архивариус по расписанию (05:00 МСК по умолчанию) ---
+ARCHIVIST_PROMPT = (
+    "Ты архивариус проекта. Наведи порядок и разложи документы по местам. "
+    "Правила: ничего не удалять; спорное — только предложить в отчёте. "
+    "Навигацию по проекту веди в папке map (карта файлов и назначение каждого). "
+    "Отчёт сложи в ops/archivist/<YYYY-MM-DD>/: summary.md (что перемещено/переименовано), "
+    "deletions-proposed.md (что предлагаешь убрать), run.json (модель, время, токены, статус). "
+    "Дополни ops/archivist/INDEX.md строкой: дата → проект → что сделано → что предложено убрать."
+)
+
+_project_jobs_busy = False
+
+
+async def _schedule_project_jobs() -> None:
+    """Ставит в очередь задачи проектов, которым пора запускаться.
+
+    Слот идемпотентен: повторный тик не создаёт второй запуск той же задачи.
+    """
+    global _project_jobs_busy
+    if _project_jobs_busy:
+        return
+    _project_jobs_busy = True
+    try:
+        due = await asyncio.to_thread(db.due_project_jobs)
+        for item in due:
+            try:
+                prompt = item.get("prompt") or ARCHIVIST_PROMPT
+                sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+                job, _created = await asyncio.to_thread(
+                    db.create_job, item["agent_id"], prompt, sha, 1800,
+                    f"cron:{item['id']}:{item['slot']}", None,
+                    item.get("model"), item.get("profile"),
+                    {"project_id": item["project_id"], "role_id": "archivist"}, "agent", None)
+                await asyncio.to_thread(db.attach_project_run, item["run_id"], job["id"])
+            except Exception as exc:  # noqa: BLE001 — одна задача не должна ломать тик
+                await asyncio.to_thread(db.finish_project_run, item["run_id"], "failed", str(exc)[:400])
+                print(f"project job {item.get('id')} failed to queue: {exc}", flush=True)
+    finally:
+        _project_jobs_busy = False
+
 async def _sweeper() -> None:
     while True:
         await asyncio.sleep(SWEEP_INTERVAL_S)
         try:
             await _schedule_index_sweep()
+            await _schedule_project_jobs()
             expired = await asyncio.to_thread(db.expire_leases)
             if expired:
                 print(f"expired leases: {expired}", flush=True)
@@ -199,13 +240,31 @@ def with_observations(item: dict, summary: dict | None = None) -> dict:
 QWEN_THINKING_LEVELS = ("auto", "fast", "thinking")
 
 
-def declared_reasoning(item: dict) -> dict | None:
-    thinking = ((item.get("capabilities") or {}).get("thinking") or {})
-    if not thinking.get("supported"):
+def _thinking_supported(matrix: dict) -> bool:
+    """Модель считается «думающей», если это подтверждено хотя бы одним измерением."""
+    if isinstance(matrix.get("capabilities"), dict):
+        matrix = matrix["capabilities"]
+    if (matrix.get("thinking") or {}).get("supported"):
+        return True
+    for profile in matrix.get("profiles") or []:
+        for model in (profile or {}).get("models") or []:
+            if not isinstance(model, dict):
+                continue
+            node = (model.get("capabilities") or {}).get("thinking") or {}
+            if node.get("supported"):
+                return True
+    return False
+
+
+def declared_reasoning(item: dict, described: dict | None = None,
+                      profiles: list | None = None) -> dict | None:
+    """Уровни размышления из измеренной матрицы канала, а не из сырого реестра."""
+    matrix = described if isinstance(described, dict) else capabilities.describe(item)
+    if not _thinking_supported(matrix):
         return None
     models: dict[str, dict] = {}
-    for profile in item.get("profiles") or []:
-        for model in profile.get("models") or []:
+    for profile in (profiles if profiles is not None else item.get("profiles") or []):
+        for model in (profile or {}).get("models") or []:
             mid = model if isinstance(model, str) else (model or {}).get("id")
             if mid:
                 models[str(mid)] = {"levels": list(QWEN_THINKING_LEVELS), "default": "auto"}
@@ -215,9 +274,10 @@ def declared_reasoning(item: dict) -> dict | None:
             "updated_at": None, "state": "ok", "source": "catalog"}
 
 
-def reasoning_for(item: dict, agent_id: str) -> dict | None:
+def reasoning_for(item: dict, agent_id: str, described: dict | None = None,
+                  profiles: list | None = None) -> dict | None:
     """Каталог воркера главнее: он подтверждён живым CLI."""
-    return workers.reasoning_catalog(agent_id) or declared_reasoning(item)
+    return workers.reasoning_catalog(agent_id) or declared_reasoning(item, described, profiles)
 
 
 def reasoning_levels_for(item: dict, agent_id: str, model: str) -> list[str]:
@@ -259,6 +319,7 @@ async def agent_profiles(agent_id: str) -> dict:
         raise HTTPException(status_code=404, detail=f"agent '{agent_id}' not found")
     prof = AGENT_PROFILES.get(agent_id) or {"profiles": [], "default_profile": ""}
     observed = await asyncio.to_thread(observations.evaluate_one, item, None, VERSION)
+    described = await asyncio.to_thread(capabilities.describe, item)
     return {
         "agent_id": agent_id,
         "observations": observed.get("observations") or {},
@@ -275,10 +336,10 @@ async def agent_profiles(agent_id: str) -> dict:
         "supports_workdir": bool(item.get("supports_workdir")),
         "requires_image": bool(item.get("requires_image")),
         # ADAPTER-01: что канал действительно умеет — с причиной для выключенного.
-        "capabilities": await asyncio.to_thread(capabilities.describe, item),
+        "capabilities": described,
         # Уровни рассуждения приходят с воркера (codex debug models), а не из
         # реестра: интерфейс показывает только то, что подтверждает эта версия CLI.
-        "reasoning": await asyncio.to_thread(reasoning_for, item, agent_id),
+        "reasoning": await asyncio.to_thread(reasoning_for, item, agent_id, described, prof.get("profiles")),
         **prof,
     }
 
@@ -769,6 +830,57 @@ async def projects() -> dict:
     return {"projects": items}
 
 
+@app.get("/projects/{project_id}/jobs", dependencies=[Depends(require_token)])
+async def project_jobs(project_id: str) -> dict:
+    """Задачи проекта по расписанию: модель, время, последний запуск, промпт."""
+    project = await asyncio.to_thread(db.get_project, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail=f"project '{project_id}' not found")
+    items = await asyncio.to_thread(db.list_project_jobs, project_id)
+    return {"project_id": project_id, "count": len(items), "jobs": items}
+
+
+@app.post("/projects/{project_id}/jobs", dependencies=[Depends(require_token)])
+async def project_job_create(project_id: str, payload: dict) -> dict:
+    project = await asyncio.to_thread(db.get_project, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail=f"project '{project_id}' not found")
+    body = dict(payload or {})
+    body.setdefault("name", "Архивариус")
+    body.setdefault("kind", "archivist")
+    body.setdefault("prompt", ARCHIVIST_PROMPT)
+    body.setdefault("schedule", "0 5 * * *")
+    if not body.get("agent_id"):
+        body["agent_id"] = "qwen-server"
+    try:
+        job = await asyncio.to_thread(db.create_project_job, project_id, body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"job": job}
+
+
+@app.post("/projects/{project_id}/jobs/{job_id}/run", dependencies=[Depends(require_token)])
+async def project_job_run(project_id: str, job_id: str) -> dict:
+    """Пробный запуск сейчас, не дожидаясь расписания."""
+    job = await asyncio.to_thread(db.get_project_job, job_id)
+    if not job or job.get("project_id") != project_id:
+        raise HTTPException(status_code=404, detail="job not found")
+    prompt = job.get("prompt") or ARCHIVIST_PROMPT
+    sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    run_id = await asyncio.to_thread(db.record_manual_run, job_id)
+    try:
+        agent_job, _created = await asyncio.to_thread(
+            db.create_job, job["agent_id"], prompt, sha, 1800,
+            f"cron:{job_id}:manual:{uuid.uuid4().hex[:8]}", None,
+            job.get("model"), job.get("profile"),
+            {"project_id": project_id, "role_id": "archivist"}, "agent", None)
+    except Exception as exc:  # noqa: BLE001
+        await asyncio.to_thread(db.finish_project_run, run_id, "failed", str(exc)[:400])
+        raise HTTPException(status_code=409, detail=str(exc))
+    await asyncio.to_thread(db.attach_project_run, run_id, agent_job["id"])
+    return {"job_id": agent_job["id"], "status": agent_job.get("status")}
+
+
 @app.get("/projects/{project_id}/usage", dependencies=[Depends(require_token)])
 async def project_usage(project_id: str, days: int = 30) -> dict:
     """Расход в токенах по проекту.
@@ -1075,6 +1187,14 @@ def sync_project_reports(project_id: str, run_id: str | None = None) -> dict:
     return result
 
 
+@app.get("/workspace/roots", dependencies=[Depends(require_token)])
+async def workspace_roots() -> dict:
+    """Диски и корни, доступные для выбора рабочей папки проекта."""
+    roots = await asyncio.to_thread(workspace.workspace_roots)
+    default = await asyncio.to_thread(workspace.projects_root)
+    return {"default": default, "roots": [{"path": item, "label": item} for item in roots]}
+
+
 @app.post("/projects", dependencies=[Depends(require_token)])
 async def project_create(request: Request) -> dict:
     payload = await request.json()
@@ -1098,8 +1218,15 @@ async def project_create(request: Request) -> dict:
             return existing
 
     project_id = uuid.uuid4().hex
-    root = await asyncio.to_thread(workspace.projects_root)
-    workdir = ntpath.join(root, _project_dir_name(name, project_id))
+    requested = str(payload.get("workdir") or "").strip()
+    if requested:
+        try:
+            workdir = workspace.validate_workdir(requested)
+        except workspace.OpError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+    else:
+        root = await asyncio.to_thread(workspace.projects_root)
+        workdir = ntpath.join(root, _project_dir_name(name, project_id))
     project = await asyncio.to_thread(
         db.create_project, name[:200], host_id, workdir, settings,
         status="preparing", request_key=key or None, project_id=project_id)

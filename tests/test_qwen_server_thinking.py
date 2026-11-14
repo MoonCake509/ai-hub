@@ -52,7 +52,7 @@ def main() -> int:
 
     main_py = (ROOT / "hub" / "app" / "main.py").read_text(encoding="utf-8")
     check("уровни Qwen объявлены в хабе", "QWEN_THINKING_LEVELS" in main_py)
-    check("каталог воркера главнее объявленного", "workers.reasoning_catalog(agent_id) or declared_reasoning(item)" in main_py)
+    check("каталог воркера главнее объявленного", "workers.reasoning_catalog(agent_id) or declared_reasoning(item, described, profiles)" in main_py)
     check("валидация использует объявленные уровни", "reasoning_levels_for" in main_py)
 
     qwen_js = (ROOT / "agents" / "laptop" / "qwen.js").read_text(encoding="utf-8")

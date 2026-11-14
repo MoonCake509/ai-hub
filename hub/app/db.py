@@ -15,6 +15,7 @@ import contextlib
 import json
 import os
 import threading
+import time
 import uuid
 from urllib.parse import urlparse
 
@@ -180,6 +181,36 @@ DDL = [
         recorded_at timestamptz not null default now()
     )""",
     "create index if not exists usage_ledger_project on aihub.usage_ledger(project_id, recorded_at desc)",
+    """create table if not exists aihub.project_jobs (
+        id text primary key,
+        project_id text not null references aihub.projects(id) on delete cascade,
+        name text not null,
+        kind text not null default 'archivist',
+        agent_id text not null,
+        profile text,
+        model text,
+        prompt text not null,
+        schedule text not null default '0 5 * * *',
+        timezone text not null default 'Europe/Moscow',
+        enabled boolean not null default true,
+        last_run_at timestamptz,
+        next_run_at timestamptz,
+        last_status text,
+        last_job_id text,
+        created_at timestamptz not null default now()
+    )""",
+    "create index if not exists project_jobs_due on aihub.project_jobs(enabled, next_run_at)",
+    """create table if not exists aihub.project_job_runs (
+        id bigserial primary key,
+        job_id text not null references aihub.project_jobs(id) on delete cascade,
+        slot text not null,
+        status text not null default 'queued',
+        agent_job_id text,
+        started_at timestamptz not null default now(),
+        finished_at timestamptz,
+        summary text,
+        unique (job_id, slot)
+    )""",
     """create table if not exists aihub.late_results (
         id bigserial primary key,
         job_id text,
@@ -1084,6 +1115,153 @@ def finish_attempt(attempt_id: str, ok: bool, output: str | None, error: str | N
             raise
         return "applied"
 
+
+# --- Автоматизация проекта: задачи по расписанию (решение владельца 2026-11-14) ---
+# Архивариус живёт не в списке ролей, а здесь: расписание, модель, промпт и
+# последний запуск видны в одном месте. Расписание поддерживает ежедневный вид
+# "M H * * *"; часовой пояс МСК фиксирован (UTC+3, без перехода на летнее время).
+MSK_OFFSET = 3 * 3600
+
+
+def _parse_daily(schedule: str) -> tuple[int, int]:
+    parts = (schedule or "").split()
+    if len(parts) != 5 or parts[2:] != ["*", "*", "*"]:
+        raise ValueError("schedule must be daily cron: 'M H * * *'")
+    minute, hour = int(parts[0]), int(parts[1])
+    if not (0 <= minute < 60 and 0 <= hour < 24):
+        raise ValueError("schedule time is out of range")
+    return minute, hour
+
+
+def _next_daily_run(schedule: str, now: float | None = None) -> float:
+    minute, hour = _parse_daily(schedule)
+    moment = now if now is not None else time.time()
+    local = moment + MSK_OFFSET
+    day_start = local - (local % 86400)
+    target = day_start + hour * 3600 + minute * 60
+    if target <= local:
+        target += 86400
+    return target - MSK_OFFSET
+
+
+def create_project_job(project_id: str, payload: dict) -> dict:
+    name = (payload.get("name") or "Архивариус").strip()[:120]
+    agent_id = (payload.get("agent_id") or "").strip()
+    prompt = (payload.get("prompt") or "").strip()
+    schedule = (payload.get("schedule") or "0 5 * * *").strip()
+    if not agent_id:
+        raise ValueError("agent_id is required")
+    if not prompt:
+        raise ValueError("prompt is required")
+    _parse_daily(schedule)
+    job_id = uuid.uuid4().hex[:16]
+    now = time.time()
+    with _lock:
+        conn = connect()
+        with transaction(conn):
+            conn.run(_qualify(
+                "insert into aihub.project_jobs(id, project_id, name, kind, agent_id, profile,"
+                " model, prompt, schedule, timezone, enabled, next_run_at)"
+                " values (:i, :p, :n, :k, :a, :pr, :m, :t, :s, 'Europe/Moscow', :e, to_timestamp(:nx))"),
+                i=job_id, p=project_id, n=name, k=(payload.get("kind") or "archivist"),
+                a=agent_id, pr=payload.get("profile"), m=payload.get("model"), t=prompt,
+                s=schedule, e=bool(payload.get("enabled", True)),
+                nx=_next_daily_run(schedule, now))
+    return get_project_job(job_id)
+
+
+def get_project_job(job_id: str) -> dict | None:
+    with _lock:
+        conn = connect()
+        return _one(conn, _qualify("select * from aihub.project_jobs where id = :i"), i=job_id)
+
+
+def list_project_jobs(project_id: str) -> list[dict]:
+    with _lock:
+        conn = connect()
+        rows = _rows(conn, _qualify(
+            "select * from aihub.project_jobs where project_id = :p order by created_at"), p=project_id)
+    out = []
+    for row in rows:
+        item = dict(row)
+        last = None
+        with _lock:
+            conn = connect()
+            last = _one(conn, _qualify(
+                "select status, started_at, finished_at, summary from aihub.project_job_runs"
+                " where job_id = :i order by started_at desc limit 1"), i=row["id"])
+        item["last_run"] = ({**last,
+                             "started_at": last["started_at"].isoformat() if last.get("started_at") else None,
+                             "finished_at": last["finished_at"].isoformat() if last.get("finished_at") else None}
+                            if last else None)
+        item["next_run_at"] = row["next_run_at"].isoformat() if row.get("next_run_at") else None
+        item["last_run_at"] = row["last_run_at"].isoformat() if row.get("last_run_at") else None
+        out.append(item)
+    return out
+
+
+def due_project_jobs(now: float | None = None) -> list[dict]:
+    """Забирает задачи, которым пора запускаться, и двигает их расписание.
+
+    Слот фиксируется строкой (!YYYY-MM-DD HH:MM по МСК): повтор тика не создаёт
+    второй запуск — уникальный ключ (job_id, slot) отбивает дубль.
+    """
+    moment = now if now is not None else time.time()
+    claimed: list[dict] = []
+    with _lock:
+        conn = connect()
+        with transaction(conn):
+            rows = _rows(conn, _qualify(
+                "select * from aihub.project_jobs where enabled and next_run_at is not null"
+                " and next_run_at <= to_timestamp(:n) order by next_run_at limit 20"), n=moment)
+            for row in rows:
+                minute, hour = _parse_daily(row["schedule"])
+                local = moment + MSK_OFFSET
+                slot_day = time.strftime("%Y-%m-%d", time.gmtime(local))
+                slot = f"{slot_day} {hour:02d}:{minute:02d}"
+                inserted = _one(conn, _qualify(
+                    "insert into aihub.project_job_runs(job_id, slot, status) values (:j, :s, 'queued')"
+                    " on conflict (job_id, slot) do nothing returning id"), j=row["id"], s=slot)
+                if not inserted:
+                    conn.run(_qualify("update aihub.project_jobs set next_run_at = to_timestamp(:n) where id = :i"),
+                             n=_next_daily_run(row["schedule"], moment), i=row["id"])
+                    continue
+                conn.run(_qualify(
+                    "update aihub.project_jobs set last_run_at = to_timestamp(:n), last_status = 'queued',"
+                    " next_run_at = to_timestamp(:nx) where id = :i"),
+                    n=moment, nx=_next_daily_run(row["schedule"], moment), i=row["id"])
+                claimed.append({**row, "run_id": inserted["id"], "slot": slot})
+    return claimed
+
+
+def record_manual_run(job_id: str) -> int:
+    """Пробный запуск тоже попадает в историю задачи, а не только в очередь."""
+    slot = "manual:" + time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+    with _lock:
+        conn = connect()
+        with transaction(conn):
+            row = _one(conn, _qualify(
+                "insert into aihub.project_job_runs(job_id, slot, status) values (:j, :s, 'queued')"
+                " returning id"), j=job_id, s=slot)
+            conn.run(_qualify(
+                "update aihub.project_jobs set last_run_at = now(), last_status = 'queued' where id = :i"),
+                i=job_id)
+    return int(row["id"])
+
+
+def attach_project_run(run_id: int, agent_job_id: str) -> None:
+    with _lock:
+        conn = connect()
+        conn.run(_qualify("update aihub.project_job_runs set agent_job_id = :a where id = :i"),
+                 a=agent_job_id, i=run_id)
+
+
+def finish_project_run(run_id: int, status: str, summary: str | None = None) -> None:
+    with _lock:
+        conn = connect()
+        conn.run(_qualify(
+            "update aihub.project_job_runs set status = :s, finished_at = now(), summary = :m where id = :i"),
+            s=status, m=summary, i=run_id)
 
 def cancel_job(job_id: str) -> str:
     """queued → cancelled сразу; running → cancel_requested (подтверждает исполнитель)."""

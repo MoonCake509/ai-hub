@@ -1172,7 +1172,7 @@ async function wsRefreshAll(){
  WS.conv=openConv||WS.convs[0]||null;
  if(WS.conv?.role_id&&ROLE_META[WS.conv.role_id])WS.roleId=WS.conv.role_id;
  $('#project-title').textContent=project.name;$('#project-location').textContent=(project.host_id==='server'?'Сервер':'Ноутбук')+' · '+(project.workdir||'Рабочая папка не указана');
- wsRenderProjects();wsRenderConversations();wsRenderAttachments();renderRoles();await wsEditRole(WS.roleId);await wsLoadMessages();wsStartPolling();
+ wsRenderProjects();wsRenderConversations();wsRenderAttachments();renderRoles();wsLoadJobs();await wsEditRole(WS.roleId);await wsLoadMessages();wsStartPolling();
 }
 
 function wsRenderProjects(){const box=$('#projects-list');box.replaceChildren();for(const project of WS.projects){const button=el('button','proj'+(project.id===WS.project?.id?' active':''));button.type='button';button.setAttribute('aria-pressed',String(project.id===WS.project?.id));button.append(el('span','project-icon',project.name.slice(0,1).toUpperCase()),el('span','project-text',project.name));button.onclick=action(async()=>{if(WS.project?.id===project.id)return;storeSet('aihub.project',project.id);WS.conv=null;WS.messages=[];WS.selectedAtts.clear();WS.pending=null;await wsRefreshAll()});box.append(button)}if(!WS.projects.length)box.append(el('p','sidebar-empty','Добавьте проект, чтобы начать.'))}
@@ -1413,13 +1413,41 @@ async function wsLoadRoleQuota(agentId,profileId,modelId){
  const box=$('#role-quota');if(!box)return;
  if(!WS.project){box.textContent='Проект не выбран — расход не с чем сверять.';return}
  try{
-  const data=await api('/projects/'+encodeURIComponent(WS.project)+'/usage?days=30');
+  const data=await api('/projects/'+encodeURIComponent(WS.project.id)+'/usage?days=30');
   const rows=(data.items||[]).filter(item=>item.agent_id===agentId&&(!modelId||item.model===modelId));
   if(!rows.length||!data.has_usage){box.textContent='Токенов за 30 дней нет: канал не сообщает usage.';return}
   const sum=rows.reduce((acc,item)=>{acc.total+=item.tokens_total;acc.input+=item.tokens_in;acc.output+=item.tokens_out;acc.reason+=item.tokens_reasoning;acc.attempts+=item.attempts;return acc},{total:0,input:0,output:0,reason:0,attempts:0});
   const n=value=>Number(value||0).toLocaleString('ru-RU');
   box.textContent='Токены за 30 дней: '+n(sum.total)+' (вход '+n(sum.input)+', выход '+n(sum.output)+', размышление '+n(sum.reason)+') · попыток '+n(sum.attempts);
  }catch(error){box.textContent='Расход недоступен: '+error.message}
+}
+async function wsLoadJobs(){
+ const box=$('#jobs-list');if(!box)return;
+ if(!WS.project){box.replaceChildren(el('p','hint','Проект не выбран.'));return}
+ try{
+  const data=await api('/projects/'+encodeURIComponent(WS.project.id)+'/jobs');
+  box.replaceChildren();
+  if(!data.jobs.length){box.append(el('p','hint','Задач по расписанию нет. «Добавить» создаст архивариуса на 05:00 МСК.'));return}
+  for(const job of data.jobs){
+   const card=el('div','job-card');
+   card.append(el('strong','',job.name));
+   card.append(el('p','hint',[job.agent_id,job.model||'модель по настройкам',job.schedule+' МСК'].join(' · ')));
+   const last=job.last_run?('Последний запуск: '+new Date(job.last_run.started_at).toLocaleString('ru-RU')+' · '+job.last_run.status):'Ещё не запускался';
+   card.append(el('p','hint',last));
+   const details=el('details','role-instructions');details.append(el('summary','','Промпт'));
+   const text=el('p','hint');text.textContent=job.prompt;details.append(text);card.append(details);
+   const run=el('button','ghost','Запустить сейчас');run.type='button';
+   run.onclick=action(async()=>{await api('/projects/'+encodeURIComponent(WS.project.id)+'/jobs/'+job.id+'/run',{method:'POST'});toast('Архивариус поставлен в очередь');await wsLoadJobs()});
+   card.append(run);box.append(card)
+  }
+ }catch(error){box.replaceChildren(el('p','hint','Не удалось получить задачи: '+error.message))}
+}
+async function wsCreateJob(){
+ if(!WS.project)return;
+ const body={name:'Архивариус',kind:'archivist',agent_id:'qwen-server',schedule:'0 5 * * *'};
+ await api('/projects/'+encodeURIComponent(WS.project.id)+'/jobs',{method:'POST',body:JSON.stringify(body)});
+ toast('Задача архивариуса добавлена: 05:00 МСК');
+ await wsLoadJobs()
 }
 async function wsGetProfiles(agentId){if(!WS.profiles.has(agentId))WS.profiles.set(agentId,await api('/agent-profiles/'+encodeURIComponent(agentId)));return WS.profiles.get(agentId)}
 async function wsEditRole(id){WS.roleId=id;WS.dirty=false;renderRoles();const role=selectedAssignment();const meta=roleInfo(id);$('#role-editor-title').textContent=meta[0];$('#role-avatar').textContent=meta[1];$('#role-description').textContent=meta[2];$('#role-instructions').value=role.instructions||'';$('#role-save-status').textContent='';putOptions($('#role-agent'),agents.filter(a=>a.enabled!==false).map(a=>({id:a.id,name:a.name+' · '+(a.host==='server'?'сервер':'ноутбук')})),role.agent_id||'codex');await wsPopulateRoleProfiles($('#role-agent').value,role.profile,role.model);wsUpdateRecipient()}
@@ -1483,13 +1511,35 @@ async function wsSend(text){
 }
 function wsStartPolling(){clearInterval(WS.pollTimer);WS.pollTimer=setInterval(()=>{if(token&&!document.hidden&&WS.view==='workspace'&&WS.conv)wsLoadMessages().catch(error=>{if(error.message!=='unauthorized')$('#chat-msg').textContent='Не удалось обновить ответ: '+error.message})},2500)}
 
-function wsProjectDialog(create=false){WS.newProject=create;$('#project-dialog-title').textContent=create?'Новый проект':'Настройки проекта';$('#project-name').value=create?'':WS.project?.name||'';$('#project-host').value=create?'laptop':WS.project?.host_id||'laptop';$('#project-workdir').value=create?'':WS.project?.workdir||'';$('#project-dialog-error').textContent='';$('#project-dialog').showModal();$('#project-name').focus()}
+async function wsProjectDialog(create=false){
+ WS.newProject=create;
+ $('#project-dialog-title').textContent=create?'Новый проект':'Настройки проекта';
+ $('#project-name').value=create?'':WS.project?.name||'';
+ $('#project-host').value=create?'laptop':WS.project?.host_id||'laptop';
+ const workdir=create?'':WS.project?.workdir||'';
+ $('#project-workdir').value=workdir;
+ try{
+  const data=await api('/workspace/roots');
+  putOptions($('#project-root'),(data.roots||[]).map(item=>({id:item.path,name:item.label})),data.default);
+  const roots=(data.roots||[]).map(item=>item.path);
+  const root=roots.filter(path=>workdir.toLowerCase().startsWith(path.toLowerCase())).sort((a,b)=>b.length-a.length)[0]||data.default||'';
+  $('#project-root').value=root;
+  $('#project-folder').value=root&&workdir.toLowerCase().startsWith(root.toLowerCase())?workdir.slice(root.length).replace(/^[\\/]+/,''):''
+ }catch(error){putOptions($('#project-root'),[{id:'',name:'Корни недоступны'}],'');$('#project-folder').value=''}
+ $('#project-dialog-error').textContent='';$('#project-dialog').showModal();$('#project-name').focus()
+}
+function wsComposeWorkdir(){
+ const root=$('#project-root').value;
+ const folder=$('#project-folder').value.trim().replace(/^[\\/]+|[\\/]+$/g,'');
+ if(!root)return;
+ $('#project-workdir').value=folder?root.replace(/[\\/]+$/,'')+'\\'+folder:root
+}
 async function wsSaveProject(event){if(event.submitter&&event.submitter.formMethod==='dialog')return;event.preventDefault();if(WS.projectSaving)return;const payload={name:$('#project-name').value.trim(),host_id:$('#project-host').value,workdir:$('#project-workdir').value.trim()};if(!payload.name)return;const button=$('#project-settings-form').querySelector('button[type=submit]'),originalText=button.textContent;WS.projectSaving=true;button.disabled=true;button.textContent='Сохраняю…';try{const project=await api(WS.newProject?'/projects':'/projects/'+WS.project.id,{method:WS.newProject?'POST':'PATCH',body:JSON.stringify(payload)});storeSet('aihub.project',project.id);$('#project-dialog').close();WS.conv=null;await wsRefreshAll();toast('Проект сохранён')}catch(error){$('#project-dialog-error').textContent=error.message}finally{WS.projectSaving=false;button.disabled=false;button.textContent=originalText}}
 function wsWire(){
  runsWire();
  document.querySelectorAll('.tab').forEach(tab=>tab.addEventListener('click',()=>switchView(tab.dataset.view)));
  $('#workspace-retry').onclick=action(wsRefreshAll);$('#conv-new').onclick=action(wsNewConversation);$('#project-new').onclick=()=>wsProjectDialog(true);$('#project-settings').onclick=()=>wsProjectDialog(!WS.project);$('#project-settings-form').onsubmit=wsSaveProject;
- $('#role-agent').onchange=action(async()=>{const roleId=WS.roleId,agentId=$('#role-agent').value;setDraftDirty();await wsPopulateRoleProfiles(agentId,'','');if(WS.roleId===roleId&&$('#role-agent').value===agentId)setDraftDirty()});$('#role-profile').onchange=action(async()=>{const roleId=WS.roleId,agentId=$('#role-agent').value,profileId=$('#role-profile').value;const data=await wsGetProfiles(agentId);if(WS.roleId!==roleId||$('#role-agent').value!==agentId||$('#role-profile').value!==profileId)return;wsPopulateRoleModels(data,profileId,'');$('#role-capability').textContent=wsUpdateRoleCapability(agentId,profileId,$('#role-model').value);setDraftDirty()});$('#role-model').onchange=()=>{$('#role-capability').textContent=wsUpdateRoleCapability($('#role-agent').value,$('#role-profile').value,$('#role-model').value);setDraftDirty()};$('#role-instructions').oninput=setDraftDirty;$('#role-save').onclick=action(async()=>{await wsSaveRole();toast('Настройки роли сохранены')});$('#chat-target').onchange=action(()=>wsEditRole($('#chat-target').value));
+ $('#role-agent').onchange=action(async()=>{const roleId=WS.roleId,agentId=$('#role-agent').value;setDraftDirty();await wsPopulateRoleProfiles(agentId,'','');if(WS.roleId===roleId&&$('#role-agent').value===agentId)setDraftDirty()});$('#role-profile').onchange=action(async()=>{const roleId=WS.roleId,agentId=$('#role-agent').value,profileId=$('#role-profile').value;const data=await wsGetProfiles(agentId);if(WS.roleId!==roleId||$('#role-agent').value!==agentId||$('#role-profile').value!==profileId)return;wsPopulateRoleModels(data,profileId,'');$('#role-capability').textContent=wsUpdateRoleCapability(agentId,profileId,$('#role-model').value);setDraftDirty()});$('#role-model').onchange=()=>{$('#role-capability').textContent=wsUpdateRoleCapability($('#role-agent').value,$('#role-profile').value,$('#role-model').value);wsLoadRoleQuota($('#role-agent').value,$('#role-profile').value,$('#role-model').value);setDraftDirty()};$('#role-instructions').oninput=setDraftDirty;$('#role-save').onclick=action(async()=>{await wsSaveRole();toast('Настройки роли сохранены')});$('#job-add').onclick=action(wsCreateJob);$('#project-root').onchange=wsComposeWorkdir;$('#project-folder').oninput=wsComposeWorkdir;$('#chat-target').onchange=action(()=>wsEditRole($('#chat-target').value));
  $('#att-file').onchange=action(async event=>{const files=Array.from(event.target.files||[]);try{await wsUpload(files)}finally{event.target.value=''}});
  const dropPanel=$('#context-panel');if(dropPanel){let dragDepth=0;dropPanel.addEventListener('dragenter',event=>{if(!event.dataTransfer?.types?.includes('Files'))return;event.preventDefault();dragDepth+=1;wsSetDropState(true)});dropPanel.addEventListener('dragover',event=>{if(!event.dataTransfer?.types?.includes('Files'))return;event.preventDefault();event.dataTransfer.dropEffect='copy';wsSetDropState(true)});dropPanel.addEventListener('dragleave',event=>{if(!event.dataTransfer?.types?.includes('Files'))return;event.preventDefault();dragDepth=Math.max(0,dragDepth-1);if(!dragDepth)wsSetDropState(false)});dropPanel.addEventListener('drop',event=>{if(!event.dataTransfer?.files?.length)return;event.preventDefault();dragDepth=0;wsSetDropState(false);action(()=>wsUpload(Array.from(event.dataTransfer.files)))().catch(workspaceError)})}
  const filterBox=$('#att-filter');if(filterBox)filterBox.oninput=event=>{WS.attFilter=event.target.value||'';wsRenderAttachments()}; const clearButton=$('#att-clear');if(clearButton)clearButton.onclick=()=>{WS.selectedAtts.clear();wsRenderAttachments()};

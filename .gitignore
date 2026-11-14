@@ -20,6 +20,7 @@ backups/
 *.dump
 
 # CORE-03 stage-only artifacts
+infra/.hub-token
 infra/.core03-token
 infra/.env.core03
 forensics/

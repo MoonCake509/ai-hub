@@ -513,6 +513,48 @@ CONFIG_FILE = os.environ.get("HUB_CONFIG", "/app/config/hub.yaml")
 DEFAULT_PROJECTS_ROOT = r"R:\Projects"
 
 
+def workspace_roots() -> list[str]:
+    """Диски, где разрешено выбирать рабочую папку (решение владельца: R:)."""
+    raw = (os.environ.get("HUB_WORKSPACE_ROOTS") or "").strip()
+    parts: list[str] = []
+    if raw:
+        parts = [part.strip() for part in raw.replace(";", ",").split(",") if part.strip()]
+    else:
+        try:
+            import yaml
+            with open(CONFIG_FILE, encoding="utf-8") as fh:
+                data = yaml.safe_load(fh) or {}
+            value = ((data.get("projects") or {}) if isinstance(data, dict) else {}).get("allowed_roots")
+            if isinstance(value, str):
+                parts = [part.strip() for part in value.replace(";", ",").split(",") if part.strip()]
+            elif isinstance(value, list):
+                parts = [str(part).strip() for part in value if str(part).strip()]
+        except (OSError, ValueError):
+            parts = []
+    return parts or [projects_root()]
+
+
+def validate_workdir(path: str) -> str:
+    """Рабочая папка проекта: абсолютный путь внутри разрешённого корня.
+
+    Каталог выбирается человеком (диск + папка), но сервер не даёт выйти за
+    разрешённые диски и не принимает относительные пути и «..».
+    """
+    value = (path or "").strip().strip('"')
+    if not value:
+        raise OpError("bad_arg", "рабочая папка не указана")
+    if not ntpath.isabs(value):
+        raise OpError("bad_arg", "рабочая папка должна быть абсолютным путём")
+    parts = [part for part in value.replace("/", "\\").split("\\") if part]
+    if any(part == ".." for part in parts):
+        raise OpError("bad_arg", "рабочая папка не может содержать «..»")
+    normalized = ntpath.normpath(value)
+    for root in workspace_roots():
+        base = ntpath.normpath(root)
+        if normalized.lower() == base.lower() or normalized.lower().startswith(base.rstrip("\\").lower() + "\\"):
+            return normalized
+    raise OpError("bad_arg", "рабочая папка должна быть внутри: " + ", ".join(workspace_roots()))
+
 def projects_root() -> str:
     """Корень рабочих папок новых проектов: переменная окружения, затем config/hub.yaml."""
     env = (os.environ.get("HUB_PROJECTS_ROOT") or "").strip()

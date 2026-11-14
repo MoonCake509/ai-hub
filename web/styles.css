@@ -224,3 +224,7 @@ body{background:
 
 .usage-axis{position:absolute;left:10px;right:10px;bottom:4px;display:flex;justify-content:space-between;font-size:9px;color:#93aec9}
 .usage-chart{position:relative}
+
+.project-dialog-actions{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:4px}
+.ghost.danger{color:var(--red);border-color:#6c4650}
+.ghost.danger:hover{background:#36232d;border-color:#a46274}

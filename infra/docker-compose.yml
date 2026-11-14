@@ -27,7 +27,8 @@ services:
       postgres:
         condition: service_healthy
     ports:
-      - "0.0.0.0:4000:4000"
+      # 4000 на хосте занят пробросом в WSL; наружу отдаём 4001.
+      - "127.0.0.1:4001:4000"
     environment:
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
       DATABASE_URL: postgresql://llmproxy:${POSTGRES_PASSWORD}@postgres:5432/litellm
@@ -55,8 +56,8 @@ services:
       litellm:
         condition: service_started
     ports:
-      - "0.0.0.0:8000:8000"
-      - "0.0.0.0:8443:8443"
+      # 8000/8443 на хосте заняты пробросом в WSL (netsh portproxy) — публикуем UI на 8090.
+      - "0.0.0.0:8090:8000"
     environment:
       LITELLM_URL: http://litellm:4000
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
@@ -77,6 +78,8 @@ services:
       - ../web:/app/web:ro
       - ../hub/app:/app/app:ro
       - ./certs:/certs:ro
+      # Рабочее пространство проектов: загрузки и архив удалённых проектов.
+      - R:/AIHub:/workspace
     logging:
       options:
         max-size: "10m"

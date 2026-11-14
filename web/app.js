@@ -1547,6 +1547,7 @@ async function wsProjectDialog(create=false){
  const path=create?wsProjectPath():(WS.project?.workdir||'');
  $('#project-path').textContent=path||'—';
  $('#project-progress').hidden=true;wsProjectProgress(false);
+ $('#project-delete').hidden=create||!WS.project;
  $('#project-dialog-error').textContent='';
  $('#project-dialog').showModal();$('#project-name').focus()
 }
@@ -1733,5 +1734,20 @@ function wireExtras(){
     input.onchange=()=>{const files=Array.from(input.files||[]);input.value='';if(files.length)wsUploadToWorkspace(files).catch(workspaceError)};
   }
   const refresh=$('#uploads-refresh');if(refresh)refresh.onclick=()=>wsLoadUploads().catch(()=>{});
+  const remove=$('#project-delete');
+  if(remove)remove.onclick=async()=>{
+    if(!WS.project){toast('Сначала выберите проект');return}
+    const name=WS.project.name||'проект';
+    if(!window.confirm('Удалить «'+name+'» из AI Hub?\n\nПапка проекта будет перенесена в архив на сервере (R:\\AIHub\\Archive), данные проекта удалятся из интерфейса.'))return;
+    remove.disabled=true;
+    try{
+      const result=await api('/projects/'+WS.project.id,{method:'DELETE',timeout:120000});
+      const dialog=$('#project-dialog');if(dialog&&dialog.open)dialog.close();
+      WS.project=null;
+      await wsRefreshAll();
+      toast(result.folder_moved?('Проект в архиве: '+(result.archived_to||'')):'Проект удалён');
+    }catch(error){toast('Не удалось удалить: '+error.message)}
+    finally{remove.disabled=false}
+  };
   for(const id of ['#usage-days','#usage-provider','#usage-model']){const node=$(id);if(node)node.onchange=()=>usageLoad().catch(()=>{})}
 }

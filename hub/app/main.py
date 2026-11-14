@@ -12,7 +12,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
-import json
+import os
+import shutil
 import ntpath
 import os
 import re
@@ -969,6 +970,38 @@ async def project_job_run(project_id: str, job_id: str) -> dict:
         raise HTTPException(status_code=409, detail=str(exc))
     await asyncio.to_thread(db.attach_project_run, run_id, agent_job["id"])
     return {"job_id": agent_job["id"], "status": agent_job.get("status")}
+
+
+ARCHIVE_DIR_NAME = "Archive"
+
+
+@app.delete("/projects/{project_id}", dependencies=[Depends(require_token)])
+async def project_delete(project_id: str) -> dict:
+    """Удаляет проект из хаба, а его папку переносит в архив на сервере (без стирания)."""
+    project = await asyncio.to_thread(db.get_project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="project not found")
+    archived_to = ""
+    moved = False
+    source = _container_workspace(str(project.get("workdir") or ""))
+    if source and os.path.isdir(source):
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        archive_root = os.path.join(WORKSPACE_MAP[0][1], ARCHIVE_DIR_NAME)
+        # рабочая папка лежит внутри WorkSpace: архив — рядом, на том же диске
+        base = os.path.basename(source.rstrip("/\\")) or f"project-{project_id[:8]}"
+        target = os.path.join(archive_root, f"{base}-{stamp}")
+        os.makedirs(archive_root, exist_ok=True)
+        try:
+            shutil.move(source, target)
+            moved = True
+            archived_to = WORKSPACE_MAP[0][0] + "\\" + ARCHIVE_DIR_NAME + "\\" + os.path.basename(target)
+        except OSError as exc:
+            raise HTTPException(status_code=409, detail=f"не удалось перенести папку в архив: {exc}")
+    deleted = await asyncio.to_thread(db.delete_project, project_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="project not found")
+    return {"deleted": True, "project_id": project_id, "folder_moved": moved,
+            "archived_to": archived_to, "name": project.get("name") or ""}
 
 
 @app.get("/usage/analytics", dependencies=[Depends(require_token)])

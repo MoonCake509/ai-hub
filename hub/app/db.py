@@ -1015,6 +1015,15 @@ def usage_summary(project_id: str, days: int = 30) -> dict:
     return {"project_id": project_id, "days": days, "totals": totals, "items": items,
             "has_usage": totals["tokens_total"] > 0}
 
+def delete_project(project_id: str) -> bool:
+    """Удаляет карточку проекта; роли, чаты, вложения и задания уходят каскадом."""
+    with _lock:
+        conn = connect()
+        conn.run("delete from aihub.projects where id = :id", id=project_id)
+        row = _one(conn, "select count(*) as n from aihub.projects where id = :id", id=project_id)
+    return not int((row or {}).get("n") or 0)
+
+
 def usage_analytics(days: int = 1, profile: str = "", model: str = "") -> dict:
     """Расход по времени: часы для суток, дни для 7/30; срезы по модели и провайдеру."""
     days = max(1, min(int(days or 1), 90))

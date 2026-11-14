@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import ntpath
@@ -315,10 +316,25 @@ def _thinking_supported(matrix: dict) -> bool:
 def declared_reasoning(item: dict, described: dict | None = None,
                       profiles: list | None = None) -> dict | None:
     """Уровни размышления из измеренной матрицы канала, а не из сырого реестра."""
+    models: dict[str, dict] = {}
+    declared = item.get("reasoning") if isinstance(item.get("reasoning"), dict) else {}
+    levels = [str(x) for x in (declared.get("levels") or []) if str(x).strip()]
+    default = str(declared.get("default") or "")
+    if levels:
+        # Уровни, заявленные в реестре (Codex CLI), действуют для всех моделей канала:
+        # иначе точная версия модели без записи в каталоге воркера теряет переключатель.
+        for profile in (profiles if profiles is not None else item.get("profiles") or []):
+            for model in (profile or {}).get("models") or []:
+                mid = model if isinstance(model, str) else (model or {}).get("id")
+                if mid:
+                    models[str(mid)] = {"levels": list(levels),
+                                        "default": default or levels[0]}
+        if models:
+            return {"models": models, "worker_id": None, "cli_version": None,
+                    "updated_at": None, "state": "ok", "source": "declared"}
     matrix = described if isinstance(described, dict) else capabilities.describe(item)
     if not _thinking_supported(matrix):
         return None
-    models: dict[str, dict] = {}
     for profile in (profiles if profiles is not None else item.get("profiles") or []):
         for model in (profile or {}).get("models") or []:
             mid = model if isinstance(model, str) else (model or {}).get("id")
@@ -955,6 +971,12 @@ async def project_job_run(project_id: str, job_id: str) -> dict:
     return {"job_id": agent_job["id"], "status": agent_job.get("status")}
 
 
+@app.get("/usage/analytics", dependencies=[Depends(require_token)])
+async def usage_analytics(days: int = 1, provider: str = "", model: str = "") -> dict:
+    """Расход токенов: 24 часа по часам или 7/30 дней по дням, срезы по провайдеру и модели."""
+    return await asyncio.to_thread(db.usage_analytics, days, provider, model)
+
+
 @app.get("/projects/{project_id}/usage", dependencies=[Depends(require_token)])
 async def project_usage(project_id: str, days: int = 30) -> dict:
     """Расход в токенах по проекту.
@@ -976,10 +998,19 @@ async def project(project_id: str) -> dict:
     return data
 
 
+_TRANSLIT = str.maketrans({
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e", "ж": "zh",
+    "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m", "н": "n", "о": "o",
+    "п": "p", "р": "r", "с": "s", "т": "t", "у": "u", "ф": "f", "х": "h", "ц": "ts",
+    "ч": "ch", "ш": "sh", "щ": "sch", "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu",
+    "я": "ya",
+})
+
+
 def _project_dir_name(name: str, project_id: str) -> str:
-    """Папка проекта = его название (safe-slug). ID добавляется только при совпадении."""
-    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:48] or "project"
-    return slug if slug != "project" else f"project-{project_id[:8]}"
+    """Папка проекта = его название (safe-slug, кириллица транслитерируется)."""
+    slug = re.sub(r"[^a-z0-9]+", "-", str(name or "").lower().translate(_TRANSLIT)).strip("-")[:48]
+    return slug if slug and slug != "project" else f"project-{project_id[:8]}"
 
 
 DEFAULT_PROJECT_HOST = (os.environ.get("HUB_DEFAULT_HOST") or "laptop").strip() or "laptop"
@@ -1483,6 +1514,88 @@ async def conversation_messages(conversation_id: str, limit: int = 200) -> dict:
     for message in items:
         message["attachments"] = [_public_attachment(a) for a in (message.get("attachments") or [])]
     return {"messages": items}
+
+
+UPLOAD_DIR_NAME = "Загрузки"
+WORKSPACE_MAP = [("R:\\AIHub", "/workspace")]
+UPLOAD_MAX_BYTES = 25 * 1024 * 1024
+
+
+def _container_workspace(path: str) -> str:
+    """Windows-путь проекта -> путь внутри контейнера (том /workspace)."""
+    value = str(path or "").strip()
+    if not value:
+        return ""
+    for win, lin in WORKSPACE_MAP:
+        if value.lower().startswith(win.lower()):
+            return lin + value[len(win):].replace("\\", "/")
+    return ""
+
+
+def _uploads_dir(project: dict) -> str:
+    """Папка «Загрузки» в рабочем пространстве проекта."""
+    mapped = _container_workspace(str(project.get("workdir") or ""))
+    if not mapped:
+        raise HTTPException(status_code=409, detail="рабочее пространство проекта не подключено")
+    folder = os.path.join(mapped, UPLOAD_DIR_NAME)
+    try:
+        os.makedirs(folder, exist_ok=True)
+    except OSError as exc:
+        raise HTTPException(status_code=409, detail=f"не удалось открыть папку загрузок: {exc}")
+    return folder
+
+
+def _safe_upload_name(name: str) -> str:
+    base = os.path.basename(str(name or "").replace("\\", "/")).strip()
+    base = re.sub(r"[^\w.\- ()\[\]]+", "_", base, flags=re.UNICODE).strip(". ") or "file"
+    return base[:180]
+
+
+@app.get("/projects/{project_id}/uploads", dependencies=[Depends(require_token)])
+async def uploads_list(project_id: str, limit: int = 20) -> dict:
+    project = await asyncio.to_thread(db.get_project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="project not found")
+    folder = _uploads_dir(project)
+    items = []
+    try:
+        entries = [e for e in os.scandir(folder) if e.is_file(follow_symlinks=False)]
+    except OSError:
+        entries = []
+    for entry in sorted(entries, key=lambda e: e.stat().st_mtime, reverse=True)[:max(1, min(100, limit))]:
+        stat = entry.stat()
+        items.append({"name": entry.name, "size": stat.st_size,
+                      "modified_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(stat.st_mtime)),
+                      "folder": UPLOAD_DIR_NAME})
+    return {"uploads": items, "folder": UPLOAD_DIR_NAME}
+
+
+@app.post("/projects/{project_id}/uploads", dependencies=[Depends(require_token)])
+async def upload_create(project_id: str, request: Request) -> dict:
+    project = await asyncio.to_thread(db.get_project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="project not found")
+    payload = await request.json()
+    name = _safe_upload_name(payload.get("filename") or "")
+    raw = str(payload.get("content_b64") or "")
+    if not raw:
+        raise HTTPException(status_code=400, detail="content_b64 is required")
+    try:
+        data = base64.b64decode(raw, validate=True)
+    except Exception:
+        raise HTTPException(status_code=400, detail="content_b64 is not valid base64")
+    if len(data) > UPLOAD_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="файл больше 25 МБ")
+    folder = _uploads_dir(project)
+    target = os.path.join(folder, name)
+    if os.path.exists(target):
+        stem, ext = os.path.splitext(name)
+        target = os.path.join(folder, f"{stem}-{int(time.time())}{ext}")
+    with open(target, "wb") as fh:
+        fh.write(data)
+    stat = os.stat(target)
+    return {"name": os.path.basename(target), "size": stat.st_size, "folder": UPLOAD_DIR_NAME,
+            "path": str(project.get("workdir") or "") + "\\" + UPLOAD_DIR_NAME + "\\" + os.path.basename(target)}
 
 
 @app.get("/projects/{project_id}/attachments", dependencies=[Depends(require_token)])

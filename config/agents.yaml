@@ -23,6 +23,11 @@ agents:
           - gpt-5.6-sol
           - gpt-5.6-terra
           - gpt-5.6-luna
+    # Уровни Codex CLI (-c model_reasoning_effort). Действуют для всех моделей канала;
+    # каталог воркера, если он есть, остаётся главнее.
+    reasoning:
+      levels: [minimal, low, medium, high, xhigh]
+      default: medium
     name: Codex CLI
     model_selection: true
     transport: cli
@@ -37,6 +42,7 @@ agents:
       streaming: {supported: false, evidence: "catalog", reason: "CLI отдаёт финальный JSON; поток в работе не используется"}
       stop: {supported: false, evidence: "catalog", reason: "подтверждённая остановка процесса не реализована"}
       output_control: {supported: true, evidence: "catalog"}
+      thinking: {supported: true, evidence: "catalog", reason: "уровни Codex CLI через -c model_reasoning_effort"}
     bridge_agent: codex
     command: "codex exec --json --skip-git-repo-check"
     notes: "бинаря нет в PATH: AppData/Local/OpenAI/Codex/bin/*/codex.exe; список моделей из ~/.codex/models_cache.json"
@@ -148,6 +154,7 @@ agents:
       streaming: {supported: false, evidence: "catalog", reason: "поток не поддерживается"}
       stop: {supported: false, evidence: "unknown", reason: "остановка не подтверждена"}
       output_control: {supported: false, evidence: "catalog", reason: "обрезка вывода делается хабом, а не каналом"}
+      thinking: {supported: false, evidence: "unknown", reason: "уровни рассуждения каналом не подтверждены"}
     bridge_agent: openclaw
     command: "openclaw agent --message-file <file> --json"
     notes: "gateway только на loopback, ходим через CLI"
@@ -253,6 +260,7 @@ agents:
       streaming: {supported: false, evidence: "catalog", reason: "не используется"}
       stop: {supported: false, evidence: "catalog", reason: "подтверждённая остановка не реализована"}
       output_control: {supported: true, evidence: "catalog"}
+      thinking: {supported: false, evidence: "unknown", reason: "уровни рассуждения каналом не подтверждены"}
     bridge_agent: hermes
     command: "hermes -z <prompt>"
     notes: "режим одного запроса; через хаб — pull-воркер ноутбука"
@@ -281,6 +289,7 @@ agents:
       streaming: {supported: false, evidence: "unknown", reason: "не подтверждено"}
       stop: {supported: false, evidence: "unknown", reason: "не подтверждено"}
       output_control: {supported: false, evidence: "catalog", reason: "вывод не ограничивается каналом"}
+      thinking: {supported: false, evidence: "unknown", reason: "уровни рассуждения каналом не подтверждены"}
     bridge_agent: qwen
     notes: "только через CDP/DOM, API нет"
 
@@ -319,6 +328,7 @@ agents:
       streaming: {supported: false, evidence: "catalog", reason: "не используется"}
       stop: {supported: false, evidence: "catalog", reason: "не реализовано"}
       output_control: {supported: true, evidence: "catalog"}
+      thinking: {supported: false, evidence: "unknown", reason: "уровни рассуждения каналом не подтверждены"}
     bridge_agent: llm-server
     model: dolphin-2.9-llama3-8b.Q4_K_M
     notes: "127.0.0.1:11434, OpenAI-совместимый; ctx 8192, max_tokens 1024"
@@ -363,6 +373,7 @@ agents:
       streaming: {supported: false, evidence: "catalog", reason: "не используется"}
       stop: {supported: false, evidence: "catalog", reason: "не реализовано"}
       output_control: {supported: true, evidence: "catalog"}
+      thinking: {supported: false, evidence: "unknown", reason: "уровни рассуждения каналом не подтверждены"}
     bridge_agent: xiaomi-ocr-server
     notes: "Локальный OCR API 127.0.0.1:8787; модель xiaomi-ocr-q8"
 
@@ -397,6 +408,7 @@ agents:
       streaming: {supported: false, evidence: "catalog", reason: "не используется"}
       stop: {supported: false, evidence: "catalog", reason: "не реализовано"}
       output_control: {supported: true, evidence: "catalog"}
+      thinking: {supported: false, evidence: "unknown", reason: "уровни рассуждения каналом не подтверждены"}
     bridge_agent: hermes-server
     command: "hermes -z <prompt>"
 
@@ -429,6 +441,7 @@ agents:
       streaming: {supported: false, evidence: "catalog", reason: "не поддерживается"}
       stop: {supported: false, evidence: "unknown", reason: "не подтверждено"}
       output_control: {supported: false, evidence: "catalog", reason: "обрезка вывода делается хабом"}
+      thinking: {supported: false, evidence: "unknown", reason: "уровни рассуждения каналом не подтверждены"}
     bridge_agent: openclaw-server
     command: "openclaw agent --message-file <file> --json"
 

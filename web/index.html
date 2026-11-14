@@ -1,10 +1,10 @@
 <!doctype html>
 <html lang="ru">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#10141c"><title>AI Hub — проекты, команда и качество</title><link rel="stylesheet" href="styles.css?v=28"><link rel="stylesheet" href="quality.css?v=3"></head>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#10141c"><title>AI Hub — проекты, команда и качество</title><link rel="stylesheet" href="styles.css?v=33"><link rel="stylesheet" href="quality.css?v=3"></head>
 <body>
 <header class="top">
   <a class="brand" href="/ui/" aria-label="AI Hub — рабочее пространство"><span class="brand-mark">AI</span><span>Hub<span class="ver" id="version"></span><span class="ver" id="build"></span></span></a>
-  <nav class="tabs" aria-label="Разделы"><button type="button" class="tab active" data-view="workspace" aria-pressed="true">Рабочее пространство</button><button type="button" class="tab" data-view="ops" aria-pressed="false">Запуски и диагностика</button><button type="button" class="tab" data-view="quality" aria-pressed="false">Качество каналов</button></nav>
+  <nav class="tabs" aria-label="Разделы"><button type="button" class="tab active" data-view="workspace" aria-pressed="true">Рабочее пространство</button><button type="button" class="tab" data-view="ops" aria-pressed="false">Запуски и диагностика</button><button type="button" class="tab" data-view="usage" aria-pressed="false">Расход</button><button type="button" class="tab" data-view="quality" aria-pressed="false">Качество каналов</button></nav>
   <div class="state"><span class="dot" id="health-dot"></span><span id="health-text">Подключение…</span></div><button type="button" class="ghost token-button" id="token-btn">Доступ</button>
 </header>
 <main id="view-workspace" class="workspace-shell">
@@ -12,26 +12,29 @@
     <section class="sidebar-projects"><div class="section-heading"><h2>Проекты</h2><button type="button" id="project-new" class="icon-button" aria-label="Создать проект">+</button></div><div id="projects-list" class="projects-list"><p class="muted">Загрузка проектов…</p></div></section>
     <section class="sidebar-chats" aria-label="Чаты проекта"><div class="section-heading"><h2>Чаты</h2><button type="button" id="conv-new" class="ghost small">+ Новый чат</button></div><label class="conv-search"><span class="sr-only">Поиск по чатам</span><input id="conv-filter" type="search" placeholder="Поиск по чатам" autocomplete="off"></label><p class="conv-summary" id="conv-summary" role="status"></p><div id="convs-list" class="convs-list"></div><button type="button" class="ghost small conv-more" id="conv-more" hidden>Показать ещё</button></section>
     <div class="sidebar-bottom"><span class="dot ok"></span><span>Контекст хранится в проекте</span></div>
+  </div>
   </aside>
   <section class="workspace-main" aria-label="Чат проекта">
     <header class="workspace-header"><div><div class="eyebrow">ПРОЕКТ</div><h1 id="project-title">AI Hub</h1><p class="project-location" id="project-location">Выберите проект</p></div><button type="button" class="ghost small" id="project-settings">Настройки проекта</button></header>
     <div class="workspace-error" id="workspace-error" role="alert" hidden><span id="workspace-error-text"></span><button type="button" class="ghost small" id="workspace-retry">Повторить</button></div>
     <div class="chat-toolbar"><div class="chat-heading"><span class="chat-indicator"></span><h2 id="chat-title">Новый чат</h2></div><label class="recipient-label">Получатель<select id="chat-target" aria-label="Роль, которой отправляется задача"></select></label><p class="chat-route-hint" id="chat-route-hint" role="status"></p></div>
     <div id="chat-log" class="chat-log" aria-live="polite"></div>
-    <div class="composer-area"><div id="selected-context" class="selected-context"></div><form id="chat-form" class="chat-form"><label class="sr-only" for="chat-input">Сообщение агенту</label><textarea id="chat-input" rows="3" placeholder="Что нужно сделать в этом проекте?" required></textarea><div class="composer-footer"><div class="composer-target"><span id="chat-role" class="composer-role">Выберите роль справа</span><button class="composer-reasoning" id="chat-reasoning" type="button" aria-expanded="false" hidden>Размышление · По умолчанию</button><div class="reasoning-menu" id="chat-reasoning-menu" popover="auto"></div></div><div class="row"><span id="chat-ctx" class="hint"></span><button class="primary send-button" id="chat-send" type="submit">Отправить <span aria-hidden="true">↑</span></button></div></div></form><p class="msg" id="chat-msg" role="status"></p><p class="composer-help">Enter — отправить · Shift + Enter — новая строка</p></div>
-    <section class="chat-context" id="context-panel" aria-labelledby="context-title" tabindex="-1">
+    <div class="composer-area"><div id="selected-context" class="selected-context"></div><form id="chat-form" class="chat-form"><label class="sr-only" for="chat-input">Сообщение агенту</label><textarea id="chat-input" rows="3" placeholder="Что нужно сделать в этом проекте?" required></textarea><div class="composer-footer"><div class="composer-target"><span id="chat-role" class="composer-role">Выберите роль справа</span><button class="composer-reasoning" id="chat-reasoning" type="button" aria-expanded="false" hidden>Размышление · По умолчанию</button><div class="reasoning-menu" id="chat-reasoning-menu" popover="auto"></div></div><div class="row"><button type="button" class="icon-button attach-button" id="chat-attach" aria-label="Прикрепить файл" title="Прикрепить файл в «Загрузки» проекта">📎</button><input id="upload-file" type="file" multiple hidden><span id="chat-ctx" class="hint"></span><button class="primary send-button" id="chat-send" type="submit">Отправить <span aria-hidden="true">↑</span></button></div></div></form><p class="msg" id="chat-msg" role="status"></p><p class="composer-help">Enter — отправить · Shift + Enter — новая строка</p></div>
+      </section>
+  <aside class="workspace-team" aria-label="Команда проекта"><div class="team-tabs" role="tablist"><button type="button" class="team-tab active" data-team="workers" role="tab" aria-selected="true">Воркеры</button><button type="button" class="team-tab" data-team="files" role="tab" aria-selected="false">Файлы</button></div><div id="team-workers">
+<div class="section-heading"><div><div class="eyebrow">НАЗНАЧЕНИЯ</div><h2>Команда проекта</h2></div><span class="count-label">6 ролей</span></div><div id="roles-list" class="roles-list"></div>
+    <section class="role-editor" id="role-editor"><div class="editor-heading"><span class="role-avatar" id="role-avatar">A</span><div><h3 id="role-editor-title">Архитектор</h3><p class="hint" id="role-description"></p></div></div>
+      <label>Агент / устройство<select id="role-agent"></select></label><label>Провайдер<select id="role-profile"></select></label><label>Модель<select id="role-model"></select></label><p class="hint" id="role-capability"></p>
+      <details class="role-instructions"><summary>Инструкции роли</summary><textarea id="role-instructions" rows="4" placeholder="За что отвечает эта роль"></textarea></details><button type="button" id="role-save" class="ghost save-role">Сохранить назначение</button><p id="role-save-status" class="hint" role="status"></p>
+    </section><section class="quota-summary"><div class="section-heading"><h3>Расходы и лимиты</h3></div><p class="hint" id="role-quota">Данные аккаунта не предоставлены каналом.</p></section><section class="quota-summary" id="project-jobs"><div class="section-heading"><div><div class="eyebrow">РАСПИСАНИЕ</div><h3>Автоматизация проекта</h3></div><button type="button" id="job-add" class="ghost">Добавить</button></div><div id="jobs-list" class="jobs-list"><p class="hint">Проект не выбран.</p></div></section>
+    </div>
+    <div id="team-files" hidden><section class="chat-context" id="context-panel" aria-labelledby="context-title" tabindex="-1">
       <div class="context-head"><div><div class="eyebrow">КОНТЕКСТ</div><h2 id="context-title">Файлы проекта</h2></div><div class="context-actions"><label class="ghost small file-label" for="att-file">+ Файл или изображение</label><input id="att-file" type="file" accept="image/png,image/jpeg,.png,.jpg,.jpeg,.txt,.md,.csv,.json,.log,.yaml,.yml,.html,.py,.js,.ts,.tsx,.jsx,.css,.sql,.toml,.ini,.xml,.sh,.ps1" multiple hidden><button type="button" class="ghost small" id="att-clear" hidden>Снять выбор</button></div></div>
       <p class="context-summary" id="context-summary" role="status">Контекст проекта загружается…</p>
       <label class="context-filter">Поиск по файлам<input id="att-filter" type="search" placeholder="Имя файла" autocomplete="off"></label>
       <div id="atts-list" class="atts-list"></div>
       <p class="hint">До 5 файлов на задачу, до 2 МБ каждый. PNG/JPEG показываются как предпросмотр; текстовые файлы передаются как UTF-8 контекст.</p>
-    </section>
-  </section>
-  <aside class="workspace-team" aria-label="Команда проекта"><div class="section-heading"><div><div class="eyebrow">НАЗНАЧЕНИЯ</div><h2>Команда проекта</h2></div><span class="count-label">6 ролей</span></div><div id="roles-list" class="roles-list"></div>
-    <section class="role-editor" id="role-editor"><div class="editor-heading"><span class="role-avatar" id="role-avatar">A</span><div><h3 id="role-editor-title">Архитектор</h3><p class="hint" id="role-description"></p></div></div>
-      <label>Агент / устройство<select id="role-agent"></select></label><label>Провайдер<select id="role-profile"></select></label><label>Модель<select id="role-model"></select></label><p class="hint" id="role-capability"></p>
-      <details class="role-instructions"><summary>Инструкции роли</summary><textarea id="role-instructions" rows="4" placeholder="За что отвечает эта роль"></textarea></details><button type="button" id="role-save" class="ghost save-role">Сохранить назначение</button><p id="role-save-status" class="hint" role="status"></p>
-    </section><section class="quota-summary"><div class="section-heading"><h3>Расходы и лимиты</h3></div><p class="hint" id="role-quota">Данные аккаунта не предоставлены каналом.</p></section><section class="quota-summary" id="project-jobs"><div class="section-heading"><div><div class="eyebrow">РАСПИСАНИЕ</div><h3>Автоматизация проекта</h3></div><button type="button" id="job-add" class="ghost">Добавить</button></div><div id="jobs-list" class="jobs-list"><p class="hint">Проект не выбран.</p></div></section>
+    </section><section class="quota-summary"><div class="section-heading"><h3>Последние 20 файлов</h3><button type="button" class="ghost small" id="uploads-refresh">Обновить</button></div><div id="uploads-list" class="uploads-list"><p class="hint">Загрузки появятся здесь.</p></div><p class="hint" id="uploads-folder"></p></section></div>
   </aside>
 </main>
 <main class="layout" id="view-ops" hidden>
@@ -127,6 +130,15 @@
   </section>
 </main>
 
+<main class="layout usage-view" id="view-usage" hidden>
+  <section class="panel usage-panel">
+    <div class="panel-head"><div><div class="eyebrow">РАСХОД</div><h2 id="usage-title">Токены по времени</h2><p class="hint">Счётчик по попыткам: вход, выход и размышление. Ноль означает «канал не сообщил данные», а не «бесплатно».</p></div>
+      <div class="usage-filters"><label>Период<select id="usage-days"><option value="1">24 часа</option><option value="7">7 дней</option><option value="30">30 дней</option></select></label><label>Провайдер<select id="usage-provider"><option value="">Все</option></select></label><label>Модель<select id="usage-model"><option value="">Все</option></select></label></div></div>
+    <div class="usage-totals" id="usage-totals"></div>
+    <div id="usage-chart" class="usage-chart"></div>
+    <div class="usage-breakdown"><section><h3>По моделям</h3><div id="usage-models" class="usage-table"></div></section><section><h3>По провайдерам</h3><div id="usage-providers" class="usage-table"></div></section></div>
+  </section>
+</main>
 <main id="view-quality" class="quality-view" hidden>
   <header class="quality-header">
     <div><div class="eyebrow">КАЧЕСТВО КАНАЛОВ</div><h1>Проверка выбранного канала</h1><p class="hint">Короткая проверка запускается сразу. Расширенные проверки находятся в раскрытом разделе.</p></div>
@@ -202,5 +214,5 @@
 <dialog id="project-dialog" class="settings-dialog"><form id="project-settings-form"><div class="dialog-heading"><h2 id="project-dialog-title">Настройки проекта</h2><button type="submit" formmethod="dialog" formnovalidate id="project-dialog-close" class="icon-button" aria-label="Закрыть настройки">×</button></div><label>Название<input id="project-name" required maxlength="120" placeholder="Название проекта"></label><div class="ws-choice"><span class="ws-choice-label">Устройство</span><span class="ws-choice-value"><i class="ws-dot"></i>Сервер</span></div><div class="ws-path"><span class="ws-path-label">Рабочая папка</span><code id="project-path">R:\AIHub\WorkSpace\…</code></div><p class="hint">Папка создаётся сама: git, .env.example, README, AGENTS.md, TASKFLOW, map, ROADMAP, DEPENDENCIES, tools, crons, backups и журнал проекта.</p><div id="project-progress" class="ws-progress" hidden><div class="ws-progress-track"><i></i></div><ol class="ws-steps"><li class="ws-step" data-state="active">Создаю папку проекта</li><li class="ws-step">Готовлю git и первый коммит</li><li class="ws-step">Раскладываю документы и карту</li><li class="ws-step">Подключаю проект к хабу</li><li class="ws-step">Проверяю готовность</li></ol></div><p id="project-dialog-error" class="err" role="alert"></p><button type="submit" class="primary">Сохранить проект</button></form></dialog>
 <div id="toast" class="toast" role="status" hidden></div>
 <div class="gate" id="gate" hidden><form class="gate-box" id="token-form"><div class="brand-mark">AI</div><h2>Подключиться к AI Hub</h2><p>Введите токен доступа к вашему хабу.</p><label class="sr-only" for="token-input">Токен доступа</label><input id="token-input" type="password" placeholder="HUB_TOKEN" autocomplete="off"><div class="row"><button class="primary" id="token-save" type="button">Подключиться</button><button class="ghost" id="token-cancel" type="button">Отмена</button><button class="ghost" id="token-diag" type="button">Диагностика</button></div><pre id="diag" class="diag" hidden></pre><p class="msg" id="token-status"></p><p class="err" id="token-err" role="alert"></p></form></div>
-<script src="app.js?v=28"></script><script src="quality.js?v=3"></script>
+<script src="app.js?v=33"></script><script src="quality.js?v=3"></script>
 </body></html>

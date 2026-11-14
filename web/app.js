@@ -1146,7 +1146,7 @@ const WS={projects:[],project:null,convs:[],conv:null,roles:{},atts:[],messages:
 function toast(message,error=false){const box=$('#toast');box.textContent=message;box.classList.toggle('error',error);box.hidden=false;clearTimeout(toast.timer);toast.timer=setTimeout(()=>box.hidden=true,5500)}
 function workspaceError(error){const text=String(error?.message||error);if(text==='unauthorized')return;$('#workspace-error-text').textContent=text.includes('404')||text==='Not Found'?'Сервер ещё не обновлён: API проектов недоступен. Обновите backend вместе с интерфейсом.':text;$('#workspace-error').hidden=false}
 function action(fn){return async(...args)=>{try{return await fn(...args)}catch(error){workspaceError(error);toast(error.message||String(error),true)}}}
-function switchView(name){WS.view=name;document.querySelectorAll('.tab').forEach(b=>{b.classList.toggle('active',b.dataset.view===name);b.setAttribute('aria-pressed',String(b.dataset.view===name))});$('#view-workspace').hidden=name!=='workspace';$('#view-ops').hidden=name!=='ops';$('#detail').hidden=true;currentJob=null;if(name==='workspace'&&token)wsRefreshAll().catch(workspaceError);if(name==='ops'&&token){loadJobs();loadRuns();loadAgents().catch(error=>{if(error.message!=='unauthorized')$('#health-text').textContent='ошибка наблюдений: '+error.message});reconLoad(false)}}
+function switchView(name){WS.view=name;document.querySelectorAll('.tab').forEach(b=>{b.classList.toggle('active',b.dataset.view===name);b.setAttribute('aria-pressed',String(b.dataset.view===name))});$('#view-workspace').hidden=name!=='workspace';$('#view-ops').hidden=name!=='ops';$('#view-usage').hidden=name!=='usage';$('#detail').hidden=true;currentJob=null;if(name==='workspace'&&token)wsRefreshAll().catch(workspaceError);if(name==='usage'&&token){usageLoad().catch(workspaceError)}if(name==='ops'&&token){loadJobs();loadRuns();loadAgents().catch(error=>{if(error.message!=='unauthorized')$('#health-text').textContent='ошибка наблюдений: '+error.message});reconLoad(false)}}
 function putOptions(select,items,value){select.replaceChildren();for(const item of items){const option=el('option','',item.name||item.id);option.value=item.id;select.append(option)}if(items.some(x=>x.id===value))select.value=value;else if(items.length)select.value=items[0].id}
 function roleInfo(id){return ROLE_META[id]||[id,'?','']}
 function selectedAssignment(){return WS.roles[WS.roleId]||{role_id:WS.roleId,agent_id:'codex',profile:'',model:'',instructions:''}}
@@ -1171,7 +1171,7 @@ async function wsRefreshAll(){
  if(!openConv&&savedConv){try{openConv=await api('/conversations/'+savedConv)}catch(error){openConv=null}}
  WS.conv=openConv||WS.convs[0]||null;
  if(WS.conv?.role_id&&ROLE_META[WS.conv.role_id])WS.roleId=WS.conv.role_id;
- $('#project-title').textContent=project.name;$('#project-location').textContent=(project.host_id==='server'?'Сервер':'Ноутбук')+' · '+(project.workdir||'Рабочая папка не указана');
+ $('#project-title').textContent=project.name;$('#project-location').textContent=(project.host_id&&project.host_id!=='laptop'&&project.host_id!=='server'?'Воркер '+project.host_id:'Сервер')+' · '+(project.workdir||'Рабочая папка не указана');
  wsRenderProjects();wsRenderConversations();wsRenderAttachments();renderRoles();wsLoadJobs();await wsEditRole(WS.roleId);await wsLoadMessages();wsStartPolling();
 }
 
@@ -1369,7 +1369,16 @@ function wsReasoningSpec(data,assignment){
  const profile=(data.profiles||[]).find(item=>item.id===(assignment?.profile||data.default_profile));
  const models=(profile?.models||[]).map(item=>typeof item==='string'?item:item?.id).filter(Boolean);
  const model=assignment?.model||models[0]||'';
- const spec=catalog.models[model];
+ let spec=catalog.models[model];
+ // Каталог воркера может не знать точную версию модели: берём ближайшую по префиксу,
+ // иначе — первый профиль каталога. Иначе переключатель размышления молча исчезает.
+ if(!spec){
+  const keys=Object.keys(catalog.models).filter(key=>key&&model&&(key.startsWith(model)||model.startsWith(key)));
+  spec=keys.map(key=>catalog.models[key]).find(item=>Array.isArray(item?.levels)&&item.levels.length);
+ }
+ if(!spec){
+  spec=Object.values(catalog.models).find(item=>Array.isArray(item?.levels)&&item.levels.length);
+ }
  if(!spec||!Array.isArray(spec.levels)||!spec.levels.length)return null;
  return {model,levels:spec.levels.slice(),default:spec.default||''}
 }
@@ -1513,8 +1522,10 @@ async function wsSend(text){
 function wsStartPolling(){clearInterval(WS.pollTimer);WS.pollTimer=setInterval(()=>{if(token&&!document.hidden&&WS.view==='workspace'&&WS.conv)wsLoadMessages().catch(error=>{if(error.message!=='unauthorized')$('#chat-msg').textContent='Не удалось обновить ответ: '+error.message})},2500)}
 
 const WS_ROOT='R:\\AIHub\\WorkSpace';
+const PROJECT_TRANSLIT={а:'a',б:'b',в:'v',г:'g',д:'d',е:'e',ё:'e',ж:'zh',з:'z',и:'i',й:'y',к:'k',л:'l',м:'m',н:'n',о:'o',п:'p',р:'r',с:'s',т:'t',у:'u',ф:'f',х:'h',ц:'ts',ч:'ch',ш:'sh',щ:'sch',ъ:'',ы:'y',ь:'',э:'e',ю:'yu',я:'ya'};
 function wsProjectSlug(name){
- const slug=String(name||'').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'').slice(0,48);
+ const translit=String(name||'').toLowerCase().replace(/[а-яё]/g,ch=>PROJECT_TRANSLIT[ch]??'');
+ const slug=translit.replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'').slice(0,48);
  return slug||'project'
 }
 function wsProjectPath(){return WS_ROOT+'\\'+wsProjectSlug($('#project-name')?.value.trim()||'project')}
@@ -1548,7 +1559,7 @@ async function wsSaveProject(event){
  if(WS.newProject)wsProjectProgress(true);
  try{
   const payload={name};
-  const project=await api(WS.newProject?'/projects':'/projects/'+WS.project.id,{method:WS.newProject?'POST':'PATCH',body:JSON.stringify(payload)});
+  const project=await api(WS.newProject?'/projects':'/projects/'+WS.project.id,{method:WS.newProject?'POST':'PATCH',body:JSON.stringify(payload),timeout:WS.newProject?180000:30000});
   wsProjectStep(4);
   storeSet('aihub.project',project.id);
   await new Promise(resolve=>setTimeout(resolve,600));
@@ -1584,5 +1595,143 @@ async function boot(){
  try{await wsRefreshAll()}catch(error){workspaceError(error)}
  startPolling();
 }
-wireGate();wsWire();wireReconciliation();$('#build').textContent=BUILD;
+wireGate();wsWire();wireReconciliation();wireExtras();$('#build').textContent=BUILD;
 if(token)boot().catch(workspaceError);else openGate('');
+
+
+/* ===== Загрузки в рабочую папку, вкладки панели, расход ===== */
+const UPLOAD_MAX = 25 * 1024 * 1024;
+function wsTeamPage(name){
+  document.querySelectorAll('.team-tab').forEach(button=>{const on=button.dataset.team===name;button.classList.toggle('active',on);button.setAttribute('aria-selected',String(on))});
+  const workers=$('#team-workers'),files=$('#team-files');
+  if(workers)workers.hidden=name!=='workers';
+  if(files)files.hidden=name!=='files';
+  if(name==='files')wsLoadUploads().catch(()=>{});
+}
+function fileToBase64(file){
+  return new Promise((resolve,reject)=>{
+    const reader=new FileReader();
+    reader.onerror=()=>reject(new Error('не удалось прочитать '+file.name));
+    reader.onload=()=>{
+      const bytes=new Uint8Array(reader.result);let binary='';const chunk=0x8000;
+      for(let i=0;i<bytes.length;i+=chunk)binary+=String.fromCharCode.apply(null,bytes.subarray(i,i+chunk));
+      resolve(btoa(binary));
+    };
+    reader.readAsArrayBuffer(file);
+  });
+}
+async function wsUploadToWorkspace(files){
+  if(!WS.project){toast('Сначала выберите проект');return}
+  const projectId=WS.project.id;
+  for(const file of files){
+    if(file.size>UPLOAD_MAX){toast(file.name+': больше 25 МБ');continue}
+    try{
+      const content_b64=await fileToBase64(file);
+      const result=await api('/projects/'+projectId+'/uploads',{method:'POST',body:JSON.stringify({filename:file.name,content_b64}),timeout:180000});
+      toast('Загружено: '+(result.name||file.name)+' → '+(result.folder||'Загрузки'));
+    }catch(error){toast('Не загрузилось: '+file.name+' · '+error.message)}
+  }
+  wsLoadUploads().catch(()=>{});
+}
+async function wsLoadUploads(){
+  const box=$('#uploads-list');if(!box)return;
+  if(!WS.project){box.replaceChildren(el('p','hint','Проект не выбран.'));return}
+  const data=await api('/projects/'+WS.project.id+'/uploads?limit=20',{timeout:15000});
+  const items=data.uploads||[];
+  const folder=$('#uploads-folder');
+  if(folder)folder.textContent=items.length?('Папка: '+(WS.project.workdir||'')+'\\'+(data.folder||'Загрузки')):'';
+  box.replaceChildren();
+  if(!items.length){box.append(el('p','hint','Пока пусто. Прикрепите файл скрепкой у строки ввода — он ляжет в папку «Загрузки» проекта.'));return}
+  for(const item of items){
+    const row=el('div','upload-row');
+    const name=el('div','upload-name',item.name);name.title=item.name;
+    const size=el('span','upload-size',wsBytes(item.size||0));
+    const meta=el('div','upload-meta',new Date(item.modified_at).toLocaleString('ru-RU'));
+    row.append(name,size,meta);box.append(row);
+  }
+}
+function usageBarLabel(bucket,days){
+  if(days<=1){const h=String(bucket).slice(11,13);return h+':00'}
+  const m=String(bucket).slice(5,10);return m.slice(3,5)+'.'+m.slice(0,2);
+}
+function usageNum(value){return (value||0).toLocaleString('ru-RU')}
+function usageFillFilters(data){
+  const list=data.models||[];const providerBox=$('#usage-provider'),modelBox=$('#usage-model');
+  if(!providerBox||!modelBox)return;
+  const providers=[...new Set(list.map(item=>item.profile).filter(Boolean))];
+  const models=[...new Set(list.map(item=>item.model).filter(Boolean))];
+  const keepP=providerBox.value,keepM=modelBox.value;
+  providerBox.replaceChildren(el('option','','Все'));providerBox.firstChild.value='';
+  for(const p of providers){const o=el('option','',p);o.value=p;providerBox.append(o)}
+  modelBox.replaceChildren(el('option','','Все'));modelBox.firstChild.value='';
+  for(const m of models){const o=el('option','',m);o.value=m;modelBox.append(o)}
+  providerBox.value=providers.includes(keepP)?keepP:'';modelBox.value=models.includes(keepM)?keepM:'';
+}
+async function usageLoad(){
+  const days=Number($('#usage-days')?.value||1);
+  const provider=$('#usage-provider')?.value||'';
+  const model=$('#usage-model')?.value||'';
+  const qs='/usage/analytics?days='+days+(provider?'&provider='+encodeURIComponent(provider):'')+(model?'&model='+encodeURIComponent(model):'');
+  const data=await api(qs,{timeout:20000});
+  const totals=data.totals||{};
+  const box=$('#usage-totals');box.replaceChildren();
+  for(const [label,value] of [['Всего токенов',totals.tokens_total],['Вход',totals.tokens_in],['Выход',totals.tokens_out],['Размышление',totals.tokens_reasoning],['Попыток',totals.attempts]]){
+    const card=el('div','usage-total');card.append(el('b','',usageNum(value)),el('span','',label));box.append(card);
+  }
+  const chart=$('#usage-chart');chart.replaceChildren();
+  const series=data.series||[];
+  const attemptsOnly=!(data.has_usage)&&(totals.attempts||0)>0;
+  const metric=attemptsOnly?'attempts':'tokens_total';
+  const title=$('#usage-title');if(title)title.textContent=attemptsOnly?'Попытки по времени':'Токены по времени';
+  const max=Math.max(1,...series.map(item=>item[metric]||0));
+  const slots=days<=1?24:days;
+  const byBucket=new Map(series.map(item=>[item.bucket,item]));
+  const now=new Date();
+  const buckets=[];
+  if(days<=1){for(let i=slots-1;i>=0;i--){const d=new Date(now.getTime()-i*3600e3);buckets.push(d.toISOString().slice(0,13).replace('T',' ')+':00')}}
+  else{for(let i=slots-1;i>=0;i--){const d=new Date(now.getTime()-i*864e5);buckets.push(d.toISOString().slice(0,10)+' 00:00')}}
+  if(attemptsOnly)chart.append(el('p','hint','Токены канал не сообщил — показано число попыток за период. Максимум: '+usageNum(max)));
+  if(!data.has_usage&&!attemptsOnly){
+    chart.append(el('p','hint','За период данных нет: счётчик заполняется при вызовах агентов.'));
+  }else{
+    for(const bucket of buckets){
+      const item=byBucket.get(bucket)||{tokens_total:0,attempts:0};
+      const bar=el('div','usage-bar');const fill=el('i');
+      const value=item[metric]||0;
+      fill.style.height=value?Math.max(2,Math.round(value/max*100))+'%':'0';
+      const tip=el('em','',usageNum(item[metric]));const label=el('span','',usageBarLabel(bucket,days));
+      bar.title=bucket+' · '+usageNum(item[metric])+(attemptsOnly?' попыток':' токенов');
+      bar.append(fill,tip,label);chart.append(bar);
+    }
+    const axis=el('div','usage-axis');
+    const step=days<=1?4:Math.ceil(buckets.length/7);
+    for(let i=0;i<buckets.length;i+=step)axis.append(el('span','',usageBarLabel(buckets[i],days)));
+    chart.append(axis);
+  }
+  const modelsBox=$('#usage-models');modelsBox.replaceChildren();
+  for(const item of (data.models||[]).slice(0,12)){
+    const row=el('div','usage-row');row.append(el('b','',item.model||'—'),el('span','',usageNum(item.tokens_total)),
+      el('small','',(item.profile||'—')+' · вход '+usageNum(item.tokens_in)+' · выход '+usageNum(item.tokens_out)+' · размышление '+usageNum(item.tokens_reasoning)+' · попыток '+usageNum(item.attempts)));
+    modelsBox.append(row);
+  }
+  if(!(data.models||[]).length)modelsBox.append(el('p','hint','Нет данных.'));
+  const providersBox=$('#usage-providers');providersBox.replaceChildren();
+  for(const item of (data.providers||[])){
+    const row=el('div','usage-row');row.append(el('b','',item.profile||'—'),el('span','',usageNum(item.tokens_total)),
+      el('small','','попыток '+usageNum(item.attempts)+' · вход '+usageNum(item.tokens_in)+' · выход '+usageNum(item.tokens_out)));
+    providersBox.append(row);
+  }
+  if(!(data.providers||[]).length)providersBox.append(el('p','hint','Нет данных.'));
+  const previous=data;
+  usageFillFilters({...data,models:(previous.models||[])});
+}
+function wireExtras(){
+  document.querySelectorAll('.team-tab').forEach(button=>button.onclick=()=>wsTeamPage(button.dataset.team||'workers'));
+  const attach=$('#chat-attach'),input=$('#upload-file');
+  if(attach&&input){
+    attach.onclick=()=>input.click();
+    input.onchange=()=>{const files=Array.from(input.files||[]);input.value='';if(files.length)wsUploadToWorkspace(files).catch(workspaceError)};
+  }
+  const refresh=$('#uploads-refresh');if(refresh)refresh.onclick=()=>wsLoadUploads().catch(()=>{});
+  for(const id of ['#usage-days','#usage-provider','#usage-model']){const node=$(id);if(node)node.onchange=()=>usageLoad().catch(()=>{})}
+}

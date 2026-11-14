@@ -1015,6 +1015,55 @@ def usage_summary(project_id: str, days: int = 30) -> dict:
     return {"project_id": project_id, "days": days, "totals": totals, "items": items,
             "has_usage": totals["tokens_total"] > 0}
 
+def usage_analytics(days: int = 1, profile: str = "", model: str = "") -> dict:
+    """Расход по времени: часы для суток, дни для 7/30; срезы по модели и провайдеру."""
+    days = max(1, min(int(days or 1), 90))
+    bucket = "hour" if days <= 1 else "day"
+    where = ["recorded_at >= now() - (:d || ' days')::interval"]
+    params = {"d": str(days)}
+    if profile:
+        where.append("coalesce(profile, '') = :prof")
+        params["prof"] = profile
+    if model:
+        where.append("coalesce(model, '') = :mod")
+        params["mod"] = model
+    clause = " and ".join(where)
+    with _lock:
+        conn = connect()
+        series = _rows(conn, _qualify(
+            "select to_char(date_trunc(:b, recorded_at), 'YYYY-MM-DD HH24:00') as bucket,"
+            " sum(tokens_in) as tokens_in, sum(tokens_out) as tokens_out,"
+            " sum(tokens_reasoning) as tokens_reasoning, count(*) as attempts"
+            " from aihub.usage_ledger where " + clause +
+            " group by 1 order by 1"), b=bucket, **params)
+        by_model = _rows(conn, _qualify(
+            "select coalesce(profile, '') as profile, coalesce(model, '') as model,"
+            " sum(tokens_in) as tokens_in, sum(tokens_out) as tokens_out,"
+            " sum(tokens_reasoning) as tokens_reasoning, count(*) as attempts"
+            " from aihub.usage_ledger where " + clause +
+            " group by 1, 2 order by (sum(tokens_in) + sum(tokens_out) + sum(tokens_reasoning)) desc"),
+            **params)
+    def pack(row: dict) -> dict:
+        tin = int(row["tokens_in"] or 0); tout = int(row["tokens_out"] or 0); tr = int(row["tokens_reasoning"] or 0)
+        return {"tokens_in": tin, "tokens_out": tout, "tokens_reasoning": tr,
+                "tokens_total": tin + tout + tr, "attempts": int(row["attempts"] or 0)}
+    points = [{"bucket": row["bucket"], **pack(row)} for row in series]
+    models = [{"profile": row["profile"], "model": row["model"], **pack(row)} for row in by_model]
+    providers: dict[str, dict] = {}
+    for item in models:
+        acc = providers.setdefault(item["profile"] or "—", {"tokens_in": 0, "tokens_out": 0,
+                                                        "tokens_reasoning": 0, "tokens_total": 0, "attempts": 0})
+        for key in ("tokens_in", "tokens_out", "tokens_reasoning", "tokens_total", "attempts"):
+            acc[key] += item[key]
+    totals = {key: sum(point[key] for point in points) for key in
+              ("tokens_in", "tokens_out", "tokens_reasoning", "tokens_total", "attempts")}
+    return {"days": days, "bucket": bucket, "series": points, "models": models,
+            "providers": [{"profile": name, **value} for name, value in providers.items()],
+            "totals": totals, "has_usage": totals["tokens_total"] > 0,
+            "options": {"providers": sorted({item["profile"] for item in models if item["profile"]}),
+                        "models": sorted({item["model"] for item in models if item["model"]})}}
+
+
 def finish_attempt(attempt_id: str, ok: bool, output: str | None, error: str | None,
                    usage: dict | None, elapsed: float | None,
                    job_id_hint: str | None = None, uncertain: bool = False) -> str:

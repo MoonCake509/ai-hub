@@ -16,8 +16,8 @@
 .workspace-shell{height:auto;min-height:calc(100dvh - 64px);align-items:start}
 .workspace-sidebar{position:sticky;top:64px;height:calc(100dvh - 64px);min-height:0;overflow-y:auto}
 .workspace-team{position:sticky;top:64px;height:calc(100dvh - 64px);overflow-y:auto}
-.workspace-main{min-height:calc(100dvh - 64px)}
-.chat-log{flex:0 1 auto;min-height:240px;max-height:min(56dvh,640px);overflow-y:auto}
+.workspace-main{height:calc(100dvh - 64px);min-height:520px;overflow:hidden}
+.chat-log{flex:1 1 auto;min-height:0;max-height:none;overflow-y:auto}
 .composer-area{flex:0 0 auto}
 .chat-context{flex:0 0 auto;margin:18px 28px 28px;padding:18px 20px;border:1px solid var(--line);border-radius:var(--radius);background:var(--panel)}
 .chat-context:focus-visible,.chat-context:focus{outline:2px solid var(--accent);outline-offset:2px}
@@ -182,3 +182,45 @@ body{background:
 @keyframes ws-slide{0%{transform:translateX(-100%)}50%{transform:translateX(70%)}100%{transform:translateX(260%)}}
 @keyframes ws-pulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.35);opacity:.55}}
 @media(prefers-reduced-motion:reduce){.ws-progress-track i,.ws-step::before{animation:none!important}.ws-progress-track i{width:100%}}
+
+
+/* TEAM-TABS: воркеры и файлы на одной панели */
+.team-tabs{display:flex;gap:4px;margin-bottom:14px;padding:3px;border:1px solid #2c445c;border-radius:9px;background:#0c151f}
+.team-tab{flex:1;font-size:11px;padding:7px 8px;border:1px solid transparent;background:transparent;color:var(--muted);border-radius:6px}
+.team-tab.active{background:linear-gradient(180deg,#1b3247,#142436);border-color:#3f6285;color:#dff8fc}
+.uploads-list{display:grid;gap:6px;max-height:320px;overflow:auto}
+.upload-row{display:grid;grid-template-columns:1fr auto;gap:2px 8px;padding:8px 9px;border:1px solid #2c445c;border-radius:8px;background:#0e1a26;font-size:11px}
+.upload-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#dceaf7}
+.upload-meta{font-size:10px;color:var(--faint)}
+.upload-size{font-size:10px;color:#8fb6d6;white-space:nowrap}
+.attach-button{font-size:16px;padding:6px 9px;border-color:#3d5f7c;background:#121e2e}
+.attach-button:hover{background:#1b2c40;border-color:var(--accent)}
+
+/* USAGE-VIEW */
+.usage-view{grid-template-columns:minmax(0,1fr);max-width:1400px}
+.usage-panel{display:grid;gap:16px}
+.usage-filters{display:flex;gap:8px;flex-wrap:wrap;align-items:end}
+.usage-filters label{display:grid;gap:4px;font-size:10px;color:var(--muted)}
+.usage-filters select{min-width:130px;font-size:11px;padding:6px 8px}
+.usage-totals{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px}
+.usage-total{padding:12px 13px;border:1px solid #2c445c;border-radius:10px;background:linear-gradient(180deg,#111d2c,#0d1725)}
+.usage-total b{display:block;font-size:20px;color:var(--accent);letter-spacing:-.02em}
+.usage-total span{font-size:10px;color:var(--faint);text-transform:uppercase;letter-spacing:.08em}
+.usage-chart{display:flex;align-items:end;gap:3px;height:220px;padding:10px 8px 22px;border:1px solid #2c445c;border-radius:10px;overflow:hidden;background:#0b1520 repeating-linear-gradient(180deg,rgba(116,146,184,.10) 0 1px,transparent 1px 44px)}
+.usage-bar{flex:1 0 8px;min-width:8px;display:flex;flex-direction:column;justify-content:end;height:100%;position:relative}
+.usage-bar i{display:block;border-radius:3px 3px 0 0;background:linear-gradient(180deg,#4fe6f8,#1e9fb8)}
+.usage-bar:hover i{background:linear-gradient(180deg,#8ff2ff,#2fc3dd)}
+.usage-bar span{position:absolute;bottom:-16px;left:50%;transform:translateX(-50%);font-size:8px;color:var(--faint);white-space:nowrap;display:none}
+.usage-bar.tick span{display:block}
+.usage-bar em{position:absolute;top:-2px;left:50%;transform:translateX(-50%);font-size:8px;color:#9fe9f5;opacity:0}
+.usage-bar:hover em{opacity:1}
+.usage-breakdown{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.usage-breakdown h3{font-size:12px;margin-bottom:8px}
+.usage-row{display:grid;grid-template-columns:1fr auto;gap:2px 8px;padding:7px 8px;border-bottom:1px solid #22364a;font-size:11px}
+.usage-row b{font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.usage-row span{color:var(--accent);font-variant-numeric:tabular-nums}
+.usage-row small{grid-column:1/-1;color:var(--faint);font-size:10px}
+@media(max-width:900px){.usage-breakdown{grid-template-columns:1fr}.usage-chart{height:170px}}
+
+.usage-axis{position:absolute;left:10px;right:10px;bottom:4px;display:flex;justify-content:space-between;font-size:9px;color:#93aec9}
+.usage-chart{position:relative}

@@ -34,3 +34,6 @@ agents/laptop/worker.lock
 agents/laptop/outbox/
 agents/laptop/inbox/
 agents/laptop/worker-*.lock
+
+# навыки agents (modern-web-guidance): установка npx modern-web-guidance@latest install
+.agents/

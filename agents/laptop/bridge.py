@@ -160,11 +160,13 @@ def codex_model_catalog(force: bool = False) -> dict:
 # These are actual per-run provider IDs from the installed Hermes config. The
 # model catalog itself is generated from the installed clients' local metadata
 # and contains identifiers only (never credentials or endpoint URLs).
+# Hermes CLI знает провайдеров ровно по именам из config.yaml (дефис, не подчёркивание).
 HERMES_PROFILE_PROVIDERS = {
     "claudehub": "claudehub",
-    "router-cheap": "router_cheap",
-    "router_cheap": "router_cheap",
-    "pishnye": "pishnye",
+    "router-cheap": "router-cheap",
+    "router_cheap": "router-cheap",
+    "pishnye": "pishnye-ai-ru",
+    "pishnye-ai-ru": "pishnye-ai-ru",
 }
 
 _URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.I)
@@ -220,7 +222,7 @@ PROVIDER_CATALOG = _load_provider_catalog()
 
 def _provider_models(client: str) -> dict[str, set[str]]:
     client_data = (PROVIDER_CATALOG.get("laptop") or {}).get(client) or {}
-    return {
+    models = {
         str(provider.get("id")): {
             str(model.get("id")) for model in provider.get("models", [])
             if isinstance(model, dict) and model.get("id")
@@ -228,6 +230,11 @@ def _provider_models(client: str) -> dict[str, set[str]]:
         for provider in client_data.get("providers", [])
         if isinstance(provider, dict) and provider.get("id")
     }
+    # Каталог хранит id как `router_cheap`, а CLI принимает `router-cheap`:
+    # считаем дефис и подчёркивание одним и тем же провайдером.
+    for key, value in list(models.items()):
+        models.setdefault(key.replace("_", "-"), value)
+    return models
 
 
 def _clean_cwd(cwd: str | None) -> str | None:
@@ -273,8 +280,12 @@ def _hermes_model(model: str | None, profile: str | None) -> tuple[str | None, s
         provider = matches[0]
     if not provider or provider not in providers:
         raise ValueError(f"Hermes provider '{provider or ''}' отсутствует в локальном каталоге")
-    if not model_id or model_id not in providers[provider]:
-        raise ValueError(f"Hermes model '{model_id}' не зарегистрирована у provider '{provider}'")
+    if not model_id:
+        raise ValueError("Hermes model не указана")
+    if model_id not in providers[provider]:
+        # Каталог может отставать от провайдера: не блокируем выбор, а пробуем
+        # напрямую — если модели нет, CLI вернёт понятную ошибку сам.
+        log(f"warn hermes model {model_id!r} отсутствует в каталоге {provider}, пробуем напрямую")
     return provider, model_id
 
 

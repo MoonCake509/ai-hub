@@ -309,7 +309,7 @@ agents:
           - kimi-code/kimi-for-coding-highspeed
     name: Kimi Code (сервер)
     transport: http
-    host: server
+    host: laptop
     bridge_agent: kimi
     configured: true
     supports_workdir: true
@@ -412,6 +412,7 @@ agents:
 
   - id: hermes-server
     model_selection: true
+    supports_workdir: true
     default_profile: claudehub
     profiles:
       - id: claudehub
@@ -430,7 +431,7 @@ agents:
           - qwen3.8-max
     name: Hermes (сервер)
     transport: cli
-    host: server
+    host: laptop
     configured: true
     capabilities:
       text: {supported: true, evidence: "catalog"}
@@ -442,7 +443,7 @@ agents:
       stop: {supported: false, evidence: "catalog", reason: "не реализовано"}
       output_control: {supported: true, evidence: "catalog"}
       thinking: {supported: false, evidence: "unknown", reason: "уровни рассуждения каналом не подтверждены"}
-    bridge_agent: hermes-server
+    bridge_agent: hermes
     command: "hermes -z <prompt>"
 
   - id: openclaw-server
@@ -464,7 +465,7 @@ agents:
           - qwen3.8-max
     name: OpenClaw (сервер)
     transport: cli
-    host: server
+    host: laptop
     configured: true
     capabilities:
       text: {supported: true, evidence: "catalog"}
@@ -476,7 +477,7 @@ agents:
       stop: {supported: false, evidence: "unknown", reason: "не подтверждено"}
       output_control: {supported: false, evidence: "catalog", reason: "обрезка вывода делается хабом"}
       thinking: {supported: true, evidence: "help:openclaw agent --thinking", reason: "CLI принимает --thinking и --model"}
-    bridge_agent: openclaw-server
+    bridge_agent: openclaw
     command: "openclaw agent --message-file <file> --json"
 
   - id: qwen-server
@@ -492,7 +493,7 @@ agents:
           - qwen3.8-flash
     name: Qwen Desktop (сервер)
     transport: cdp
-    host: server
+    host: laptop
     configured: true
     capabilities:
       text: {supported: true, evidence: "catalog"}
@@ -504,7 +505,7 @@ agents:
       stop: {supported: false, evidence: "unknown", reason: "не подтверждено"}
       output_control: {supported: false, evidence: "catalog", reason: "вывод не ограничивается каналом"}
       thinking: {supported: true, evidence: "fixture:qwen-thinking-dom", reason: "переключение Auto/Fast/Thinking проверено в DOM Qwen Desktop"}
-    bridge_agent: qwen-server
+    bridge_agent: qwen
     notes: "Выбери указанную модель в Qwen Chat на сервере. Адаптер сверит её перед отправкой."
 
 # Пассивные пробы сервисов, которые видит контейнер хаба (DIAG-02).

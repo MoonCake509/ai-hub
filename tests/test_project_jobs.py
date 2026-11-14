@@ -57,6 +57,9 @@ def main() -> int:
     check("пробный запуск без ожидания", "/jobs/{job_id}/run" in main_py)
     check("тик планировщика подключён", "await _schedule_project_jobs()" in main_py)
     check("промпт запрещает удаление", "ничего не удалять" in main_py)
+    check("промпт ограничен по времени и файлам", "не больше 5 минут и не больше 20 файлов" in main_py)
+    check("жёсткий таймаут архивариуса", "ARCHIVIST_TIMEOUT_S = 300" in main_py
+          and "sha, 1800," not in main_py)
     check("отчёты по дням в ops/archivist", "ops/archivist/<YYYY-MM-DD>/" in main_py)
     check("основной канал — дешёвый router.cheap 1017",
           'ARCHIVIST_MODEL = "deepseek-v4.1-flash-1017"' in main_py)

@@ -96,14 +96,20 @@ async def _schedule_index_sweep() -> None:
 
 # --- Автоматизация проекта: архивариус по расписанию (05:00 МСК по умолчанию) ---
 ARCHIVIST_PROMPT = (
-    "Ты архивариус проекта. Наведи порядок и разложи документы по местам. "
-    "Правила: ничего не удалять; спорное — только предложить в отчёте. "
-    "Навигацию по проекту веди в папке map (карта файлов и назначение каждого). "
-    "Отчёт сложи в ops/archivist/<YYYY-MM-DD>/: summary.md (что перемещено/переименовано), "
-    "deletions-proposed.md (что предлагаешь убрать), run.json (модель, время, токены, статус). "
-    "Дополни ops/archivist/INDEX.md строкой: дата → проект → что сделано → что предложено убрать."
+    "Ты архивариус проекта. Работай быстро и ограниченно: не больше 5 минут и не больше 20 файлов.\n"
+    "1. Посмотри только папки ops/ и map/ в корне проекта — листинг, без чтения всех файлов.\n"
+    "2. Если их нет: создай ops/archivist/<YYYY-MM-DD>/ и map/INDEX.md, запиши summary.md "
+    "«структура создана» и закончи.\n"
+    "3. Если есть: разложи только явно неразобранные файлы внутри ops/ по датам. "
+    "Код, docs/ и config/ не трогай.\n"
+    "4. Отчёт в ops/archivist/<YYYY-MM-DD>/: summary.md (что сделано), deletions-proposed.md "
+    "(что предлагаешь убрать), run.json (модель, время, статус).\n"
+    "5. В ops/archivist/INDEX.md добавь строку: дата → проект → что сделано → что предложено убрать.\n"
+    "Правила: ничего не удалять и не перемещать вне ops/; не читать файлы целиком, если хватает "
+    "имени и размера; не запускать тесты и сборки; в конце верни итог до 10 строк."
 )
 
+ARCHIVIST_TIMEOUT_S = 300
 ARCHIVIST_AGENT = "hermes-server"
 ARCHIVIST_PROFILE = "router-cheap"
 ARCHIVIST_MODEL = "deepseek-v4.1-flash-1017"
@@ -112,6 +118,11 @@ ARCHIVIST_FALLBACK_PROFILE = "router-cheap"
 ARCHIVIST_FALLBACK_MODEL = "qwen3.8-27b"
 
 _project_jobs_busy = False
+
+
+async def _project_workdir(project_id: str) -> str:
+    project = await asyncio.to_thread(db.get_project, project_id)
+    return str((project or {}).get("workdir") or "").strip()
 
 
 async def _schedule_project_jobs() -> None:
@@ -127,10 +138,16 @@ async def _schedule_project_jobs() -> None:
         due = await asyncio.to_thread(db.due_project_jobs)
         for item in due:
             try:
+                if not await _project_workdir(item["project_id"]):
+                    # Без рабочей папки архивариус ничего не разложит: лучше честный
+                    # отказ, чем «успех» с пустым ответом.
+                    await asyncio.to_thread(db.finish_project_run, item["run_id"], "failed",
+                                            "рабочая папка проекта не задана")
+                    continue
                 prompt = item.get("prompt") or ARCHIVIST_PROMPT
                 sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
                 job, _created = await asyncio.to_thread(
-                    db.create_job, item["agent_id"], prompt, sha, 1800,
+                    db.create_job, item["agent_id"], prompt, sha, ARCHIVIST_TIMEOUT_S,
                     f"cron:{item['id']}:{item['slot']}", None,
                     item.get("model"), item.get("profile"),
                     {"project_id": item["project_id"], "role_id": "archivist"}, "agent", None)
@@ -139,7 +156,8 @@ async def _schedule_project_jobs() -> None:
                 await asyncio.to_thread(db.finish_project_run, item["run_id"], "failed", str(exc)[:400])
                 print(f"project job {item.get('id')} failed to queue: {exc}", flush=True)
     finally:
-        ARCHIVIST_AGENT = "hermes-server"
+        ARCHIVIST_TIMEOUT_S = 300
+ARCHIVIST_AGENT = "hermes-server"
 ARCHIVIST_PROFILE = "router-cheap"
 ARCHIVIST_MODEL = "deepseek-v4.1-flash-1017"
 ARCHIVIST_FALLBACK_AGENT = "hermes-server"
@@ -148,6 +166,11 @@ ARCHIVIST_FALLBACK_MODEL = "qwen3.8-27b"
 
 _project_jobs_busy = False
 
+
+async def _project_workdir(project_id: str) -> str:
+    project = await asyncio.to_thread(db.get_project, project_id)
+    return str((project or {}).get("workdir") or "").strip()
+
 async def _poll_project_fallbacks() -> None:
     """Если основной канал не взял задачу за 10 минут или упал — передать резерву."""
     for item in await asyncio.to_thread(db.fallback_candidates):
@@ -155,7 +178,7 @@ async def _poll_project_fallbacks() -> None:
             prompt = item.get("prompt") or ARCHIVIST_PROMPT
             sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
             job, _created = await asyncio.to_thread(
-                db.create_job, item["fallback_agent_id"], prompt, sha, 1800,
+                db.create_job, item["fallback_agent_id"], prompt, sha, ARCHIVIST_TIMEOUT_S,
                 f"cron:{item['job_id']}:fb:{item['run_id']}", None,
                 item.get("fallback_model"), item.get("fallback_profile"),
                 {"project_id": item["project_id"], "role_id": "archivist"}, "agent", None)
@@ -910,12 +933,18 @@ async def project_job_run(project_id: str, job_id: str) -> dict:
     job = await asyncio.to_thread(db.get_project_job, job_id)
     if not job or job.get("project_id") != project_id:
         raise HTTPException(status_code=404, detail="job not found")
+    workdir = await _project_workdir(project_id)
+    if not workdir:
+        raise HTTPException(status_code=409, detail={
+            "code": "no_workdir",
+            "message": "у проекта не задана рабочая папка — архивариусу нечего разбирать",
+        })
     prompt = job.get("prompt") or ARCHIVIST_PROMPT
     sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
     run_id = await asyncio.to_thread(db.record_manual_run, job_id)
     try:
         agent_job, _created = await asyncio.to_thread(
-            db.create_job, job["agent_id"], prompt, sha, 1800,
+            db.create_job, job["agent_id"], prompt, sha, ARCHIVIST_TIMEOUT_S,
             f"cron:{job_id}:manual:{uuid.uuid4().hex[:8]}", None,
             job.get("model"), job.get("profile"),
             {"project_id": project_id, "role_id": "archivist"}, "agent", None)

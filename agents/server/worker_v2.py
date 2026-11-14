@@ -175,8 +175,19 @@ def run_hermes(prompt: str, timeout: int, job: dict | None = None) -> dict:
                           timeout=timeout, cwd=cwd)
     out = ANSI_RE.sub("", proc.stdout.decode("utf-8", "replace")).strip()
     err = ANSI_RE.sub("", proc.stderr.decode("utf-8", "replace")).strip()
-    return {"output": out or err[-2000:], "usage": {}, "exit_code": proc.returncode,
-            "elapsed": round(time.time() - started, 2)}
+    # Тихий режим добавляет строку с идентификатором сессии — это не ответ.
+    lines = [line for line in out.splitlines()
+             if not re.match(r"^\s*session(?:\s+id)?\s*[:=]", line, re.I)]
+    final = "\n".join(lines).strip()
+    exit_code = proc.returncode
+    error = None
+    if exit_code == 0 and not final:
+        # Пустой ответ — это не успех: иначе «архивариус отработал» врёт.
+        exit_code = 1
+        error = err or "Hermes CLI returned no final answer"
+    return {"output": final or err[-2000:], "usage": {}, "exit_code": exit_code,
+            "elapsed": round(time.time() - started, 2),
+            **({"error": error} if error else {})}
 
 
 SERVER_MODEL_ROUTES = {

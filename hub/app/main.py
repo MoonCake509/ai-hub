@@ -104,6 +104,13 @@ ARCHIVIST_PROMPT = (
     "Дополни ops/archivist/INDEX.md строкой: дата → проект → что сделано → что предложено убрать."
 )
 
+ARCHIVIST_AGENT = "hermes-server"
+ARCHIVIST_PROFILE = "router-cheap"
+ARCHIVIST_MODEL = "deepseek-v4.1-flash-1017"
+ARCHIVIST_FALLBACK_AGENT = "qwen-server"
+ARCHIVIST_FALLBACK_PROFILE = "qwen-sub"
+ARCHIVIST_FALLBACK_MODEL = "qwen3.8-flash"
+
 _project_jobs_busy = False
 
 
@@ -132,7 +139,32 @@ async def _schedule_project_jobs() -> None:
                 await asyncio.to_thread(db.finish_project_run, item["run_id"], "failed", str(exc)[:400])
                 print(f"project job {item.get('id')} failed to queue: {exc}", flush=True)
     finally:
-        _project_jobs_busy = False
+        ARCHIVIST_AGENT = "hermes-server"
+ARCHIVIST_PROFILE = "router-cheap"
+ARCHIVIST_MODEL = "deepseek-v4.1-flash-1017"
+ARCHIVIST_FALLBACK_AGENT = "qwen-server"
+ARCHIVIST_FALLBACK_PROFILE = "qwen-sub"
+ARCHIVIST_FALLBACK_MODEL = "qwen3.8-flash"
+
+_project_jobs_busy = False
+
+async def _poll_project_fallbacks() -> None:
+    """Если основной канал не взял задачу за 10 минут или упал — передать резерву."""
+    for item in await asyncio.to_thread(db.fallback_candidates):
+        try:
+            prompt = item.get("prompt") or ARCHIVIST_PROMPT
+            sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+            job, _created = await asyncio.to_thread(
+                db.create_job, item["fallback_agent_id"], prompt, sha, 1800,
+                f"cron:{item['job_id']}:fb:{item['run_id']}", None,
+                item.get("fallback_model"), item.get("fallback_profile"),
+                {"project_id": item["project_id"], "role_id": "archivist"}, "agent", None)
+            await asyncio.to_thread(db.attach_project_run, item["run_id"], job["id"])
+            await asyncio.to_thread(db.mark_fallback, item["job_id"], item["run_id"])
+            print(f"project job {item['job_id']}: fallback -> {item['fallback_agent_id']}", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"project job {item['job_id']} fallback failed: {exc}", flush=True)
+
 
 async def _sweeper() -> None:
     while True:
@@ -140,6 +172,7 @@ async def _sweeper() -> None:
         try:
             await _schedule_index_sweep()
             await _schedule_project_jobs()
+            await _poll_project_fallbacks()
             expired = await asyncio.to_thread(db.expire_leases)
             if expired:
                 print(f"expired leases: {expired}", flush=True)
@@ -850,8 +883,20 @@ async def project_job_create(project_id: str, payload: dict) -> dict:
     body.setdefault("kind", "archivist")
     body.setdefault("prompt", ARCHIVIST_PROMPT)
     body.setdefault("schedule", "0 5 * * *")
+    # Решение владельца: архивариус не должен жечь дорогую подписку.
+    # Основной канал — дешёвый router.cheap (deepseek 1017), резерв — Qwen.
     if not body.get("agent_id"):
-        body["agent_id"] = "qwen-server"
+        body["agent_id"] = ARCHIVIST_AGENT
+    if not body.get("profile"):
+        body["profile"] = ARCHIVIST_PROFILE
+    if not body.get("model"):
+        body["model"] = ARCHIVIST_MODEL
+    if not body.get("fallback_agent_id"):
+        body["fallback_agent_id"] = ARCHIVIST_FALLBACK_AGENT
+    if not body.get("fallback_profile"):
+        body["fallback_profile"] = ARCHIVIST_FALLBACK_PROFILE
+    if not body.get("fallback_model"):
+        body["fallback_model"] = ARCHIVIST_FALLBACK_MODEL
     try:
         job = await asyncio.to_thread(db.create_project_job, project_id, body)
     except ValueError as exc:

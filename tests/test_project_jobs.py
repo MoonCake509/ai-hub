@@ -58,7 +58,15 @@ def main() -> int:
     check("тик планировщика подключён", "await _schedule_project_jobs()" in main_py)
     check("промпт запрещает удаление", "ничего не удалять" in main_py)
     check("отчёты по дням в ops/archivist", "ops/archivist/<YYYY-MM-DD>/" in main_py)
+    check("основной канал — дешёвый router.cheap 1017",
+          'ARCHIVIST_MODEL = "deepseek-v4.1-flash-1017"' in main_py)
+    check("резерв — Qwen", 'ARCHIVIST_FALLBACK_AGENT = "qwen-server"' in main_py
+          and 'ARCHIVIST_FALLBACK_MODEL = "qwen3.8-flash"' in main_py)
+    check("резерв включается один раз", "and not j.fallback_used limit 20" in src)
+    check("резерв ставится в очередь тиком", "await _poll_project_fallbacks()" in main_py)
+    check("простой 10 минут считается сбоем", "STUCK_RUN_S = 600" in src)
     check("интерфейс: список задач", "wsLoadJobs" in app_js)
+    check("интерфейс: маршрут основной → резерв", "fallback_used" in app_js)
     check("интерфейс: кнопка добавления", "#job-add" in app_js)
 
     print(("FAILED: %d" % len(FAILS)) if FAILS else "ALL OK")

@@ -197,6 +197,10 @@ DDL = [
         next_run_at timestamptz,
         last_status text,
         last_job_id text,
+        fallback_agent_id text,
+        fallback_profile text,
+        fallback_model text,
+        fallback_used boolean not null default false,
         created_at timestamptz not null default now()
     )""",
     "create index if not exists project_jobs_due on aihub.project_jobs(enabled, next_run_at)",
@@ -297,6 +301,10 @@ DDL = [
     "alter table aihub.jobs add column if not exists run_snapshot jsonb",
     # CORE-01: протокол, на котором задание поставлено и на котором его арендовали.
     "alter table aihub.jobs add column if not exists protocol int not null default 2",
+    "alter table aihub.project_jobs add column if not exists fallback_agent_id text",
+    "alter table aihub.project_jobs add column if not exists fallback_profile text",
+    "alter table aihub.project_jobs add column if not exists fallback_model text",
+    "alter table aihub.project_jobs add column if not exists fallback_used boolean not null default false",
     "alter table aihub.job_attempts add column if not exists protocol int not null default 2",
     # CORE-02b: kind отделяет агентский prompt от управляемой операции host worker.
     "alter table aihub.jobs add column if not exists kind text not null default 'agent'",
@@ -1161,12 +1169,17 @@ def create_project_job(project_id: str, payload: dict) -> dict:
         with transaction(conn):
             conn.run(_qualify(
                 "insert into aihub.project_jobs(id, project_id, name, kind, agent_id, profile,"
-                " model, prompt, schedule, timezone, enabled, next_run_at)"
-                " values (:i, :p, :n, :k, :a, :pr, :m, :t, :s, 'Europe/Moscow', :e, to_timestamp(:nx))"),
+                " model, prompt, schedule, timezone, enabled, next_run_at,"
+                " fallback_agent_id, fallback_profile, fallback_model)"
+                " values (:i, :p, :n, :k, :a, :pr, :m, :t, :s, 'Europe/Moscow', :e, to_timestamp(:nx),"
+                " :fa, :fp, :fm)"),
                 i=job_id, p=project_id, n=name, k=(payload.get("kind") or "archivist"),
                 a=agent_id, pr=payload.get("profile"), m=payload.get("model"), t=prompt,
                 s=schedule, e=bool(payload.get("enabled", True)),
-                nx=_next_daily_run(schedule, now))
+                nx=_next_daily_run(schedule, now),
+                fa=payload.get("fallback_agent_id") or None,
+                fp=payload.get("fallback_profile") or None,
+                fm=payload.get("fallback_model") or None)
     return get_project_job(job_id)
 
 
@@ -1247,6 +1260,47 @@ def record_manual_run(job_id: str) -> int:
                 "update aihub.project_jobs set last_run_at = now(), last_status = 'queued' where id = :i"),
                 i=job_id)
     return int(row["id"])
+
+
+STUCK_RUN_S = 600
+
+
+def fallback_candidates(stuck_s: int = STUCK_RUN_S) -> list[dict]:
+    """Запуски, где основной канал не взялся за работу или провалился.
+
+    Резерв включается ровно один раз на запуск: колонка fallback_used снимает
+    риск бесконечного перекладывания между каналами.
+    """
+    with _lock:
+        conn = connect()
+        rows = _rows(conn, _qualify(
+            "select r.id as run_id, r.job_id, r.agent_job_id, r.started_at,"
+            " j.fallback_agent_id, j.fallback_profile, j.fallback_model, j.project_id,"
+            " j.prompt, j.agent_id, j.fallback_used"
+            " from aihub.project_job_runs r"
+            " join aihub.project_jobs j on j.id = r.job_id"
+            " where r.status in ('queued', 'running') and j.fallback_agent_id is not null"
+            " and not j.fallback_used limit 20"))
+    out = []
+    for row in rows:
+        job = get_job(row["agent_job_id"]) if row.get("agent_job_id") else None
+        status = (job or {}).get("status")
+        age = time.time() - row["started_at"].timestamp()
+        failed = status in ("failed", "cancelled", "expired")
+        stuck = status in (None, "queued") and age > stuck_s
+        if failed or stuck:
+            out.append({**row, "primary_status": status, "age_s": int(age)})
+    return out
+
+
+def mark_fallback(job_id: str, run_id: int) -> None:
+    with _lock:
+        conn = connect()
+        with transaction(conn):
+            conn.run(_qualify("update aihub.project_jobs set fallback_used = true,"
+                              " last_status = 'fallback' where id = :i"), i=job_id)
+            conn.run(_qualify("update aihub.project_job_runs set status = 'fallback' where id = :i"),
+                     i=run_id)
 
 
 def attach_project_run(run_id: int, agent_job_id: str) -> None:

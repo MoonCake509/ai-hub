@@ -379,6 +379,7 @@ agents:
       - id: router-cheap
         name: Router.cheap (сервер)
         models:
+          - deepseek-v4.1-flash-1017
           - deepseek-v4.1-flash
           - gpt-6.1-sol
           - qwen3.8-max

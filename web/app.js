@@ -1431,7 +1431,8 @@ async function wsLoadJobs(){
   for(const job of data.jobs){
    const card=el('div','job-card');
    card.append(el('strong','',job.name));
-   card.append(el('p','hint',[job.agent_id,job.model||'модель по настройкам',job.schedule+' МСК'].join(' · ')));
+   const route=job.fallback_agent_id?job.agent_id+' → '+job.fallback_agent_id+(job.fallback_used?' (резерв уже использован)':''):job.agent_id;
+   card.append(el('p','hint',[route,(job.model||'модель по настройкам')+(job.fallback_model?' / '+job.fallback_model:''),job.schedule+' МСК'].join(' · ')));
    const last=job.last_run?('Последний запуск: '+new Date(job.last_run.started_at).toLocaleString('ru-RU')+' · '+job.last_run.status):'Ещё не запускался';
    card.append(el('p','hint',last));
    const details=el('details','role-instructions');details.append(el('summary','','Промпт'));
@@ -1444,7 +1445,7 @@ async function wsLoadJobs(){
 }
 async function wsCreateJob(){
  if(!WS.project)return;
- const body={name:'Архивариус',kind:'archivist',agent_id:'qwen-server',schedule:'0 5 * * *'};
+ const body={name:'Архивариус',kind:'archivist',agent_id:'hermes-server',profile:'router-cheap',model:'deepseek-v4.1-flash-1017',schedule:'0 5 * * *',fallback_agent_id:'qwen-server',fallback_profile:'qwen-sub',fallback_model:'qwen3.8-flash'};
  await api('/projects/'+encodeURIComponent(WS.project.id)+'/jobs',{method:'POST',body:JSON.stringify(body)});
  toast('Задача архивариуса добавлена: 05:00 МСК');
  await wsLoadJobs()

@@ -293,6 +293,39 @@ agents:
     bridge_agent: qwen
     notes: "только через CDP/DOM, API нет"
 
+  - id: kimi
+    model_selection: true
+    default_profile: kimi-code
+    reasoning: {levels: [low, high, max], default: high}
+    profiles:
+      - id: kimi-code
+        name: Kimi Code (сервер)
+        models:
+          - kimi-code/kimi-for-coding
+          - kimi-code/k3.1-pro
+          - kimi-code/k3-256k
+          - kimi-code/k3
+          - kimi-code/k3.1-pro-highspeed
+          - kimi-code/kimi-for-coding-highspeed
+    name: Kimi Code (сервер)
+    transport: http
+    host: server
+    bridge_agent: kimi
+    configured: true
+    supports_workdir: true
+    filesystem_access: true
+    context_mode: "Текст задачи + инструменты Kimi в рабочей папке проекта"
+    capabilities:
+      text: {supported: true, evidence: "api:local"}
+      patch: {supported: true, evidence: "catalog", reason: "Kimi Code правит файлы в рабочей папке"}
+      workdir: {supported: true, evidence: "api:session.cwd"}
+      commands: {supported: true, evidence: "catalog"}
+      usage: {supported: true, evidence: "wire:usage.record"}
+      streaming: {supported: false, evidence: "unknown", reason: "хаб получает ответ целиком"}
+      stop: {supported: false, evidence: "unknown", reason: "нет отмены на стороне хаба"}
+      output_control: {supported: true, evidence: "hub"}
+      thinking: {supported: true, evidence: "config:support_efforts", reason: "low, high, max"}
+
   - id: llm-server
     model_selection: true
     default_profile: local
@@ -302,7 +335,7 @@ agents:
     filesystem_access: false
     profiles:
       - id: local
-        name: Локальный llama.cpp
+        name: Локальные LLM
         input_modalities: [text]
         output_modalities: [text]
         context_mode: "Только текст prompt; файлы проекта недоступны"
@@ -378,7 +411,7 @@ agents:
     notes: "Локальный OCR API 127.0.0.1:8787; модель xiaomi-ocr-q8"
 
   - id: hermes-server
-    model_selection: false
+    model_selection: true
     default_profile: claudehub
     profiles:
       - id: claudehub
@@ -413,8 +446,9 @@ agents:
     command: "hermes -z <prompt>"
 
   - id: openclaw-server
-    model_selection: false
+    model_selection: true
     default_profile: claudehub
+    reasoning: {levels: [off, minimal, low, medium, high, xhigh], default: medium}
     profiles:
       - id: claudehub
         name: ClaudeHub (сервер)
@@ -441,7 +475,7 @@ agents:
       streaming: {supported: false, evidence: "catalog", reason: "не поддерживается"}
       stop: {supported: false, evidence: "unknown", reason: "не подтверждено"}
       output_control: {supported: false, evidence: "catalog", reason: "обрезка вывода делается хабом"}
-      thinking: {supported: false, evidence: "unknown", reason: "уровни рассуждения каналом не подтверждены"}
+      thinking: {supported: true, evidence: "help:openclaw agent --thinking", reason: "CLI принимает --thinking и --model"}
     bridge_agent: openclaw-server
     command: "openclaw agent --message-file <file> --json"
 

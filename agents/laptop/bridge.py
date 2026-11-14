@@ -25,6 +25,7 @@ import threading
 import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOKEN_FILE = os.path.join(HERE, "token.txt")
@@ -40,7 +41,8 @@ COMSPEC = os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe")
 NODE_EXE = shutil.which("node") or r"C:\Program Files\nodejs\node.exe"
 
 CREATE_NO_WINDOW = 0x08000000
-LOCKS = {name: threading.Lock() for name in ("codex", "qwen", "openclaw", "hermes")}
+LOCKS = {name: threading.Lock() for name in ("codex", "qwen", "openclaw", "hermes", "kimi")}
+OPENCLAW_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh")
 
 
 def resolve_codex_exe() -> str:
@@ -453,13 +455,9 @@ def _deep_text(obj, key_names, depth=0):
 
 
 def run_openclaw(prompt: str, timeout: int, requested_model: str | None = None,
-                 requested_profile: str | None = None, *, cwd: str | None = None) -> dict:
-    """Retain the proven legacy OpenClaw command; reject unverified selection."""
-    if requested_model or requested_profile:
-        return {
-            "output": "", "usage": {}, "exit_code": 2, "elapsed": 0.0,
-            "error": "OpenClaw per-call model/profile selection is disabled until verified",
-        }
+                 requested_profile: str | None = None, reasoning_effort: str | None = None,
+                 *, cwd: str | None = None) -> dict:
+    """OpenClaw CLI honours --model <provider/model> and --thinking <level>."""
     if cwd and str(cwd).strip():
         return {
             "output": "", "usage": {}, "exit_code": 2, "elapsed": 0.0,
@@ -473,6 +471,12 @@ def run_openclaw(prompt: str, timeout: int, requested_model: str | None = None,
         # Keep the previously used `openclaw agent` path. The newer
         # `agent exec` path is experimental and is not in live dispatch.
         cmd = [COMSPEC, "/c", OPENCLAW_CMD, "agent", "--message-file", msg_path, "--json"]
+        if requested_model:
+            model_id = requested_model if "/" in requested_model or not requested_profile else f"{requested_profile}/{requested_model}"
+            cmd += ["--model", model_id]
+        effort = (reasoning_effort or "").strip().lower()
+        if effort in {"off", "minimal", "low", "medium", "high", "xhigh"}:
+            cmd += ["--thinking", effort]
         try:
             proc = subprocess.run(
                 cmd, capture_output=True, stdin=subprocess.DEVNULL,
@@ -562,6 +566,23 @@ def run_hermes(prompt: str, timeout: int, requested_model: str | None = None,
     }
 
 
+def run_kimi(prompt: str, timeout: int, requested_model: str | None = None,
+             requested_profile: str | None = None, reasoning_effort: str | None = None,
+             *, cwd: str | None = None) -> dict:
+    """Kimi Code через локальный API приложения (без окна и CDP)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from kimi_client import KimiClient
+    started = time.time()
+    try:
+        result = KimiClient().run(prompt, model=requested_model, effort=reasoning_effort,
+                                  cwd=cwd, timeout=timeout)
+        result["elapsed"] = round(time.time() - started, 2)
+        return result
+    except Exception as exc:  # noqa: BLE001
+        return {"output": "", "usage": {}, "exit_code": 1, "elapsed": round(time.time() - started, 2),
+                "error": str(exc)}
+
+
 AGENTS = {
     "codex": {
         "name": "Codex CLI (ноутбук)",
@@ -586,6 +607,12 @@ AGENTS = {
         "runner": run_hermes,
         "path": HERMES_EXE,
         "timeout": 600,
+    },
+    "kimi": {
+        "name": "Kimi Code (API приложения)",
+        "runner": run_kimi,
+        "path": sys.executable,
+        "timeout": 900,
     },
 }
 
@@ -674,12 +701,22 @@ class Handler(BaseHTTPRequestHandler):
             self._send(429, {"error": f"agent '{agent_id}' busy"})
             return
         try:
-            if (model or profile) and agent_id not in ("codex", "qwen", "openclaw", "hermes"):
+            if (model or profile) and agent_id not in ("codex", "qwen", "openclaw", "hermes", "kimi"):
                 self._send(400, {"error": f"agent '{agent_id}' does not support model selection"})
                 return
             if reasoning_effort:
                 if agent_id == "qwen":
                     qwen_desktop_mode(reasoning_effort)
+                elif agent_id == "kimi":
+                    if reasoning_effort not in ("low", "high", "max"):
+                        self._send(400, {"error": f"unsupported reasoning_effort '{reasoning_effort}'",
+                                         "supported": ["low", "high", "max"]})
+                        return
+                elif agent_id == "openclaw":
+                    if reasoning_effort not in OPENCLAW_LEVELS:
+                        self._send(400, {"error": f"unsupported reasoning_effort '{reasoning_effort}'",
+                                         "supported": list(OPENCLAW_LEVELS)})
+                        return
                 else:
                     levels = ((codex_model_catalog().get("models") or {}).get(model or "") or {}).get("levels") or []
                     if agent_id != "codex" or not levels:
@@ -697,7 +734,10 @@ class Handler(BaseHTTPRequestHandler):
             elif agent_id == "qwen":
                 result = spec["runner"](prompt, timeout, model, profile, cwd=cwd,
                                          reasoning_effort=reasoning_effort)
-            elif agent_id in ("openclaw", "hermes"):
+            elif agent_id in ("openclaw", "kimi"):
+                result = spec["runner"](prompt, timeout, model, profile, cwd=cwd,
+                                        reasoning_effort=reasoning_effort)
+            elif agent_id == "hermes":
                 result = spec["runner"](prompt, timeout, model, profile, cwd=cwd)
             else:
                 result = spec["runner"](prompt, timeout)

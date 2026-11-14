@@ -123,14 +123,22 @@ def _deep_text(obj, keys, depth=0):
     return None
 
 
-def run_openclaw(prompt: str, timeout: int) -> dict:
+def run_openclaw(prompt: str, timeout: int, job: dict | None = None) -> dict:
+    job = job or {}
+    model = (job.get("model") or "").strip()
+    profile = (job.get("profile") or "").strip()
+    effort = (job.get("reasoning_effort") or "").strip().lower()
     started = time.time()
     fd, msg_path = tempfile.mkstemp(prefix="aihub-oc-", suffix=".txt", text=True)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write(prompt)
     try:
-        proc = subprocess.run([COMSPEC, "/c", OPENCLAW_CMD, "agent", "--message-file", msg_path, "--json"],
-                              capture_output=True, stdin=subprocess.DEVNULL, timeout=timeout)
+        cmd = [COMSPEC, "/c", OPENCLAW_CMD, "agent", "--message-file", msg_path, "--json"]
+        if model:
+            cmd += ["--model", model if "/" in model or not profile else f"{profile}/{model}"]
+        if effort in {"off", "minimal", "low", "medium", "high", "xhigh"}:
+            cmd += ["--thinking", effort]
+        proc = subprocess.run(cmd, capture_output=True, stdin=subprocess.DEVNULL, timeout=timeout)
     finally:
         try:
             os.unlink(msg_path)
@@ -301,7 +309,7 @@ def run_llm(prompt: str, timeout: int, job: dict | None = None) -> dict:
 
 AGENTS = {
     "qwen-server": {"runner": run_qwen, "timeout": 600, "job_args": True},
-    "openclaw-server": {"runner": run_openclaw, "timeout": 600},
+    "openclaw-server": {"runner": run_openclaw, "timeout": 600, "job_args": True},
     "hermes-server": {"runner": run_hermes, "timeout": 600, "job_args": True, "supports_workdir": True},
     "llm-server": {"runner": run_llm, "timeout": 300, "job_args": True},
     "xiaomi-ocr-server": {"runner": run_llm, "timeout": 600, "job_args": True},

@@ -390,8 +390,14 @@ function tail(mainText, n = 1500) {
       const ans = extractAnswer(after.slice(before.length)) || extractAnswer(after);
       console.log(ans || '(пусто)');
     } else if (cmd === 'ask-json') {
-      const [expectedModel, requestedMode, ...prompt] = rest;
-      const result = await askStructured(evaluate, expectedModel, prompt.join(' '), requestedMode);
+      const [expectedModel, ...tail] = rest;
+      let requestedMode = 'auto';
+      // Старый вызов (модель, промпт) должен остаться рабочим: режим передаём
+      // только если вторым аргументом идёт известное значение.
+      if (tail.length && QWEN_THINKING_MODES.has(String(tail[0]).trim().toLowerCase())) {
+        requestedMode = String(tail.shift()).trim().toLowerCase();
+      }
+      const result = await askStructured(evaluate, expectedModel, tail.join(' '), requestedMode);
       console.log(JSON.stringify(result));
     } else if (cmd === 'read') {
       const t = (await evaluate(READ)).value || '';

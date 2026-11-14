@@ -57,12 +57,25 @@ TOKEN = os.environ.get("HUB_TOKEN") or read("token.txt", "")
 WORKER = os.environ.get("COMPUTERNAME", "server") + "-host"
 
 
+def qwen_desktop_mode(reasoning_effort) -> str:
+    """Уровень AI Hub -> фактический режим Qwen Desktop (Auto/Fast/Thinking)."""
+    value = str(reasoning_effort or "").strip().lower()
+    if not value:
+        return "auto"
+    if value in ("low", "fast"):
+        return "fast"
+    if value in ("medium", "high", "xhigh", "max", "ultra", "thinking"):
+        return "thinking"
+    raise ValueError(f"unsupported reasoning_effort for Qwen Desktop: {reasoning_effort}")
+
+
 def run_qwen(prompt: str, timeout: int, job: dict) -> dict:
     env = dict(os.environ)
     env["QWEN_CDP_PORT"] = os.environ.get("QWEN_CDP_PORT", "9333")
     started = time.time()
+    mode = qwen_desktop_mode(job.get("reasoning_effort"))
     proc = subprocess.run(
-        [NODE, QWEN_JS, "ask-json", job.get("requested_model") or "", prompt],
+        [NODE, QWEN_JS, "ask-json", job.get("requested_model") or "", mode, prompt],
         capture_output=True, stdin=subprocess.DEVNULL, timeout=timeout,
         env=env, creationflags=CREATE_NO_WINDOW,
     )

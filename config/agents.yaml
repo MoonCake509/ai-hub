@@ -42,6 +42,7 @@ agents:
     notes: "бинаря нет в PATH: AppData/Local/OpenAI/Codex/bin/*/codex.exe; список моделей из ~/.codex/models_cache.json"
 
   - id: openclaw-laptop
+    enabled: false
     model_selection: false
     model_selection_reason: "Выбор модели проходит проверку: отдельный запуск превысил 300с; доступен штатный канал без выбора"
     default_profile: router-cheap
@@ -152,6 +153,7 @@ agents:
     notes: "gateway только на loopback, ходим через CLI"
 
   - id: hermes-laptop
+    enabled: false
     model_selection: true
     supports_workdir: true
     default_profile: router-cheap
@@ -256,6 +258,7 @@ agents:
     notes: "режим одного запроса; через хаб — pull-воркер ноутбука"
 
   - id: qwen-code
+    enabled: false
     model_selection: false
     default_profile: qwen-sub
     profiles:
@@ -451,6 +454,7 @@ agents:
       streaming: {supported: false, evidence: "unknown", reason: "не подтверждено"}
       stop: {supported: false, evidence: "unknown", reason: "не подтверждено"}
       output_control: {supported: false, evidence: "catalog", reason: "вывод не ограничивается каналом"}
+      thinking: {supported: true, evidence: "fixture:qwen-thinking-dom", reason: "переключение Auto/Fast/Thinking проверено в DOM Qwen Desktop"}
     bridge_agent: qwen-server
     notes: "Выбери указанную модель в Qwen Chat на сервере. Адаптер сверит её перед отправкой."
 

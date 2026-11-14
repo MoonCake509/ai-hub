@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 CAPABILITIES = ("text", "patch", "workdir", "commands", "usage", "streaming",
-                "stop", "output_control")
+                "stop", "output_control", "thinking")
 
 # Человеческие названия для API и интерфейса.
 LABELS = {
@@ -21,6 +21,7 @@ LABELS = {
     "streaming": "потоковый вывод",
     "stop": "подтверждённая остановка",
     "output_control": "ограничение вывода",
+    "thinking": "режим размышления",
 }
 
 DEFAULT_REASON = {
@@ -32,6 +33,7 @@ DEFAULT_REASON = {
     "streaming": "потоковый вывод не подтверждён",
     "stop": "подтверждённая остановка не реализована",
     "output_control": "ограничение вывода не подтверждено",
+    "thinking": "канал не подтвердил переключение режима размышления",
 }
 
 

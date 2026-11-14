@@ -182,6 +182,8 @@ def with_observations(item: dict, summary: dict | None = None) -> dict:
     data = dict(item)
     data.setdefault("model_selection_reason", None)
     data.setdefault("supports_workdir", False)
+    # Скрытые дубли ноутбука остаются в реестре для истории, но не предлагаются в выборе.
+    data["enabled"] = bool(item.get("enabled", True))
     observed = summary if summary is not None else observations.evaluate_one(
         data, None, VERSION)
     data["status"] = observed.get("status") or data.get("status")
@@ -190,6 +192,39 @@ def with_observations(item: dict, summary: dict | None = None) -> dict:
     data["effective_reason"] = observed.get("effective_reason")
     data["observations_checked_at"] = observed.get("checked_at")
     return data
+
+
+# Qwen Desktop переключает режим размышления через DOM, а не через CLI-каталог.
+# Уровни берутся из подтверждённой возможности `thinking`, иначе меню нечего показать.
+QWEN_THINKING_LEVELS = ("auto", "fast", "thinking")
+
+
+def declared_reasoning(item: dict) -> dict | None:
+    thinking = ((item.get("capabilities") or {}).get("thinking") or {})
+    if not thinking.get("supported"):
+        return None
+    models: dict[str, dict] = {}
+    for profile in item.get("profiles") or []:
+        for model in profile.get("models") or []:
+            mid = model if isinstance(model, str) else (model or {}).get("id")
+            if mid:
+                models[str(mid)] = {"levels": list(QWEN_THINKING_LEVELS), "default": "auto"}
+    if not models:
+        return None
+    return {"models": models, "worker_id": None, "cli_version": None,
+            "updated_at": None, "state": "ok", "source": "catalog"}
+
+
+def reasoning_for(item: dict, agent_id: str) -> dict | None:
+    """Каталог воркера главнее: он подтверждён живым CLI."""
+    return workers.reasoning_catalog(agent_id) or declared_reasoning(item)
+
+
+def reasoning_levels_for(item: dict, agent_id: str, model: str) -> list[str]:
+    catalog = reasoning_for(item, agent_id) or {}
+    spec = (catalog.get("models") or {}).get(model or "") or {}
+    levels = spec.get("levels")
+    return [str(x) for x in levels] if isinstance(levels, list) else []
 
 
 @app.get("/agents")
@@ -243,7 +278,7 @@ async def agent_profiles(agent_id: str) -> dict:
         "capabilities": await asyncio.to_thread(capabilities.describe, item),
         # Уровни рассуждения приходят с воркера (codex debug models), а не из
         # реестра: интерфейс показывает только то, что подтверждает эта версия CLI.
-        "reasoning": await asyncio.to_thread(workers.reasoning_catalog, agent_id),
+        "reasoning": await asyncio.to_thread(reasoning_for, item, agent_id),
         **prof,
     }
 
@@ -1487,7 +1522,7 @@ async def conversation_send(conversation_id: str, request: Request) -> JSONRespo
         raise HTTPException(status_code=400, detail="reasoning_effort must be a string")
     reasoning_effort = (raw_effort or "").strip() or None
     if reasoning_effort:
-        levels = await asyncio.to_thread(workers.reasoning_levels, agent_id, model or "")
+        levels = await asyncio.to_thread(reasoning_levels_for, item, agent_id, model or "")
         if not levels:
             raise HTTPException(
                 status_code=400,

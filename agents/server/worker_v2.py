@@ -154,10 +154,25 @@ def run_openclaw(prompt: str, timeout: int) -> dict:
             "elapsed": round(time.time() - started, 2)}
 
 
-def run_hermes(prompt: str, timeout: int) -> dict:
+def run_hermes(prompt: str, timeout: int, job: dict | None = None) -> dict:
+    """One-shot Hermes с явными провайдером и моделью.
+
+    Старый вызов `hermes -z <prompt>` игнорировал выбор модели и мог ждать
+    интерактивного ввода, поэтому задание «дешёвая модель» фактически шло на
+    модели по умолчанию. Промпт передаётся через stdin, как в bridge.
+    """
+    job = job or {}
     started = time.time()
-    proc = subprocess.run([HERMES_EXE, "-z", prompt], capture_output=True,
-                          stdin=subprocess.DEVNULL, timeout=timeout)
+    cwd = job.get("workdir") or None
+    cmd = [HERMES_EXE, "chat", "--query-file", "-", "--oneshot", "--quiet", "--source", "tool"]
+    if job.get("requested_profile"):
+        cmd += ["--provider", str(job["requested_profile"])]
+    if job.get("requested_model"):
+        cmd += ["--model", str(job["requested_model"])]
+    if cwd:
+        cmd += ["--in", cwd]
+    proc = subprocess.run(cmd, capture_output=True, input=prompt.encode("utf-8"),
+                          timeout=timeout, cwd=cwd)
     out = ANSI_RE.sub("", proc.stdout.decode("utf-8", "replace")).strip()
     err = ANSI_RE.sub("", proc.stderr.decode("utf-8", "replace")).strip()
     return {"output": out or err[-2000:], "usage": {}, "exit_code": proc.returncode,
@@ -276,7 +291,7 @@ def run_llm(prompt: str, timeout: int, job: dict | None = None) -> dict:
 AGENTS = {
     "qwen-server": {"runner": run_qwen, "timeout": 600, "job_args": True},
     "openclaw-server": {"runner": run_openclaw, "timeout": 600},
-    "hermes-server": {"runner": run_hermes, "timeout": 600},
+    "hermes-server": {"runner": run_hermes, "timeout": 600, "job_args": True, "supports_workdir": True},
     "llm-server": {"runner": run_llm, "timeout": 300, "job_args": True},
     "xiaomi-ocr-server": {"runner": run_llm, "timeout": 600, "job_args": True},
 }

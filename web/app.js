@@ -471,6 +471,7 @@ const RUN_EVENT_RU = {run_created:'процесс создан', task_dispatched
   budget_exceeded:'бюджет исчерпан', run_created_existing:'повтор создания (тот же процесс)'};
 let currentRunId = '';
 let runDetailRequest = 0;
+const runTaskStates = new Map();
 let runCreatePending = false;
 try { const match = String(window.location.hash || '').match(/run=([0-9a-f]+)/); if (match) currentRunId = match[1]; } catch (e) { /* тесты без window */ }
 
@@ -607,7 +608,10 @@ async function renderRunDetail() {
   table.children[0].append(headerRow);
   const body = el('tbody');
   for (const task of run.tasks || []) {
-    const row = el('tr');
+    const previousState = runTaskStates.get(task.key);
+    const row = el('tr', 'run-step-row' + (previousState !== undefined && previousState !== task.state ? ' run-step-changed' : ''));
+    row.dataset.taskKey = task.key;
+    row.dataset.taskState = task.state || '';
     row.append(el('td', '', task.key));
     row.append(el('td', '', task.role || '—'));
     const stateCell = el('td');
@@ -635,6 +639,7 @@ async function renderRunDetail() {
   }
   table.append(body);
   box.append(table);
+  for (const task of run.tasks || []) runTaskStates.set(task.key, task.state);
   // Журнал решений и событий — последние 30.
   const eventsBox = el('div', 'run-events');
   eventsBox.append(el('strong', '', 'Журнал событий'));
@@ -1128,13 +1133,14 @@ async function renderJob(first) {
 
 // Workspace UI. Jobs and diagnostics use the same API and queue.
 const ROLE_META = {
-  architect: ['Архитектор','A','План, требования и технические решения'],
+  orchestrator: ['Оркестратор','O','Ставит задачи ролям и собирает результат'],
+  planner: ['Архитектор','A','План, требования и технические решения'],
   coder: ['Кодер','C','Реализация и изменения в проекте'],
   tester: ['Тестер','T','Проверки и воспроизведение ошибок'],
   reviewer: ['Ревьюер','R','Проверка результата и замечания'],
   archivist: ['Архивариус','D','Документация и сохранение решений'],
 };
-const WS={projects:[],project:null,convs:[],conv:null,roles:{},atts:[],messages:[],selectedAtts:new Set(),attFilter:'',roleId:'architect',profiles:new Map(),generation:0,editorGen:0,editorProfilesLoading:false,pollTimer:null,pending:null,dirty:false,sending:false,view:'workspace',newProject:false,projectSaving:false,previewUrls:new Map(),previewLoads:new Map(),previewGeneration:0,activeImageByConversation:new Map(),convFilter:'',convLimit:24,convSignature:'',convShownId:'',msgSignature:'',convCursor:'',convHasMore:false,convTotal:0,convLoading:false,convSeq:0,convFilterTimer:null};
+const WS={projects:[],project:null,convs:[],conv:null,roles:{},atts:[],messages:[],selectedAtts:new Set(),attFilter:'',roleId:'architect',profiles:new Map(),generation:0,editorGen:0,editorProfilesLoading:false,pollTimer:null,pending:null,dirty:false,sending:false,view:'workspace',newProject:false,projectSaving:false,previewUrls:new Map(),previewLoads:new Map(),previewGeneration:0,activeImageByConversation:new Map(),convFilter:'',convLimit:24,convSignature:'',convShownId:'',msgSignature:'',convCursor:'',convHasMore:false,convTotal:0,convLoading:false,convSeq:0,convFilterTimer:null,reasoning:null,reasoningKey:'',reasoningSpec:null};
 
 function toast(message,error=false){const box=$('#toast');box.textContent=message;box.classList.toggle('error',error);box.hidden=false;clearTimeout(toast.timer);toast.timer=setTimeout(()=>box.hidden=true,5500)}
 function workspaceError(error){const text=String(error?.message||error);if(text==='unauthorized')return;$('#workspace-error-text').textContent=text.includes('404')||text==='Not Found'?'Сервер ещё не обновлён: API проектов недоступен. Обновите backend вместе с интерфейсом.':text;$('#workspace-error').hidden=false}
@@ -1319,7 +1325,8 @@ async function wsUpload(files){
   if(WS.project?.id===projectId){if(isImage)for(const old of WS.atts)if(wsIsImageAttachment(old))WS.selectedAtts.delete(old.id);WS.atts.unshift(attachment);WS.selectedAtts.add(attachment.id)}
  }
  if(WS.project?.id===projectId){wsRenderAttachments();toast('Файлы добавлены в контекст')}
-}
+ }
+ function wsSetDropState(active){const panel=$('#context-panel');if(panel)panel.classList.toggle('is-drop-target',active)}
 
 async function wsLoadMessages(){if(!WS.conv){WS.messages=[];renderMessages();return}const id=WS.conv.id,gen=WS.generation;const data=await api('/conversations/'+id+'/messages?limit=200');if(WS.conv?.id!==id||gen!==WS.generation)return;WS.messages=data.messages||[];renderMessages()}
 function wsMessageSignature(){const text=JSON.stringify(WS.messages||[]);let hash=2166136261;for(let i=0;i<text.length;i++){hash^=text.charCodeAt(i);hash=Math.imul(hash,16777619)}return (WS.conv?.id||'')+'|'+text.length+'|'+(hash>>>0).toString(36)}
@@ -1354,8 +1361,53 @@ function renderMessages(){
  else box.scrollTop=previousScroll;
  wsUpdateRecipient();
 }
-function wsUpdateRecipient(){const saved=selectedAssignment();const role=WS.dirty?{...saved,agent_id:$('#role-agent').value,profile:$('#role-profile').value,model:$('#role-model').value}:saved;$('#chat-role').textContent=roleInfo(WS.roleId)[0]+' · '+agentName(role.agent_id)+(role.model?' · '+role.model:'');$('#chat-target').value=WS.roleId;const data=WS.profiles.get(role.agent_id),caps=wsModelCapabilities(data,role),selectedImage=WS.atts.some(item=>WS.selectedAtts.has(item.id)&&wsIsImageAttachment(item)),latestImage=wsLatestConversationImage(),supportsImage=!!data&&caps.input.includes('image'),requiresImage=!!data&&caps.requiresImage;const routeNotes=[];if(supportsImage&&selectedImage)routeNotes.push('Новое изображение заменит предыдущее в этом чате.');else if(requiresImage&&latestImage)routeNotes.push('Будет повторно использовано изображение из этого чата: '+(latestImage.filename||'предыдущее изображение')+'.');else if(requiresImage)routeNotes.push('Для первого распознавания в этом чате добавьте PNG/JPEG.');if(!supportsImage&&(selectedImage||latestImage))routeNotes.push('Изображения не передаются текстовому маршруту; ответы распознавания остаются в истории.');if(supportsImage&&!requiresImage&&!selectedImage)routeNotes.push('Изображение можно приложить к этой модели по желанию.');if(caps.contextMode)routeNotes.push(caps.contextMode);if(caps.filesystemAccess===false&&!/файл|file/i.test(caps.contextMode))routeNotes.push('Без доступа к файлам проекта и файловых инструментов.');if(agents.find(item=>item.id===role.agent_id)?.transport!=='http'&&caps.supportsWorkdir===false)routeNotes.push('Этот канал пока не запускает задачи в папке проекта.');$('#chat-route-hint').textContent=[...new Set(routeNotes)].join(' ');$('#chat-send').disabled=WS.sending||!WS.project||(requiresImage&&!selectedImage&&!latestImage)}
-function renderRoles(){const box=$('#roles-list');box.replaceChildren();const target=$('#chat-target');putOptions(target,Object.entries(ROLE_META).map(([id,meta])=>({id,name:meta[0]})),WS.roleId);for(const [id,meta] of Object.entries(ROLE_META)){const role=WS.roles[id]||{agent_id:'codex'},button=el('button','role-card'+(WS.roleId===id?' active':''));button.type='button';button.setAttribute('aria-pressed',String(WS.roleId===id));button.append(el('span','role-avatar',meta[1]));const text=el('span','role-text');text.append(el('span','role-name',meta[0]),el('span','role-meta',agentName(role.agent_id)+(role.model?' · '+role.model:'')));button.append(text,el('span','role-chevron','›'));button.onclick=action(()=>wsEditRole(id));box.append(button)}wsUpdateRecipient()}
+const REASONING_LABELS={minimal:'Минимальный',low:'Низкий',medium:'Средний',high:'Высокий',xhigh:'Очень высокий',max:'Максимальный'};
+function wsReasoningLabel(level){return REASONING_LABELS[level]||level}
+function wsReasoningSpec(data,assignment){
+ const catalog=data&&data.reasoning;if(!catalog||!catalog.models)return null;
+ const profile=(data.profiles||[]).find(item=>item.id===(assignment?.profile||data.default_profile));
+ const models=(profile?.models||[]).map(item=>typeof item==='string'?item:item?.id).filter(Boolean);
+ const model=assignment?.model||models[0]||'';
+ const spec=catalog.models[model];
+ if(!spec||!Array.isArray(spec.levels)||!spec.levels.length)return null;
+ return {model,levels:spec.levels.slice(),default:spec.default||''}
+}
+function wsReasoningText(){return WS.reasoning?'Размышление · '+wsReasoningLabel(WS.reasoning):'Размышление · По умолчанию'}
+function wsReasoningMenuOpen(menu){if(!menu)return false;if(menu._reasoningOpen!==undefined)return menu._reasoningOpen;if(typeof menu.matches==='function')return menu.matches(':popover-open');return !menu.hidden}
+function wsPositionReasoningMenu(menu,button){if(!menu||!button)return;const rect=button.getBoundingClientRect(),width=Math.min(300,window.innerWidth-24),left=Math.max(12,Math.min(rect.left,window.innerWidth-width-12));menu.style.left=left+'px';menu.style.bottom=Math.max(12,window.innerHeight-rect.top+8)+'px';menu.style.top='auto';menu.style.right='auto'}
+function wsShowReasoningMenu(menu,button){
+ if(!menu)return;
+ wsPositionReasoningMenu(menu,button);
+ menu._reasoningOpen=true;
+ if(typeof menu.showPopover==='function'){try{menu.showPopover()}catch(error){menu.hidden=false}}
+ else menu.hidden=false;
+ button?.setAttribute('aria-expanded','true')
+}
+function wsHideReasoningMenu(menu,button){
+ if(!menu)return;
+ menu._reasoningOpen=false;
+ if(typeof menu.hidePopover==='function'){try{menu.hidePopover()}catch(error){menu.hidden=true}}
+ else menu.hidden=true;
+ button?.setAttribute('aria-expanded','false')
+}
+function wsBuildReasoningMenu(){
+ const menu=$('#chat-reasoning-menu'),spec=WS.reasoningSpec;if(!menu||!spec)return;
+ menu.replaceChildren();const add=(value,label,title)=>{const button=el('button','reasoning-option'+(WS.reasoning===value?' active':''));button.type='button';button.setAttribute('role','option');button.setAttribute('aria-selected',String(WS.reasoning===value));button.textContent=label;if(title)button.title=title;button.onclick=()=>{WS.reasoning=value;wsHideReasoningMenu(menu,$('#chat-reasoning'));wsUpdateRecipient();$('#chat-input')?.focus()};menu.append(button)};
+ add(null,'По умолчанию',spec.default?'Уровень модели по умолчанию: '+spec.default:'');
+ for(const level of spec.levels)add(level,wsReasoningLabel(level)+' · '+level,level)
+}
+function wsSyncReasoning(role,data){
+ const key=[WS.roleId||'',role?.agent_id||'',role?.profile||'',role?.model||''].join('|');
+ if(WS.reasoningKey!==key){WS.reasoningKey=key;WS.reasoning=null}
+ const button=$('#chat-reasoning'),menu=$('#chat-reasoning-menu');if(!button||!menu)return;
+ if(menu._reasoningOpen===undefined)menu._reasoningOpen=false;
+ const spec=wsReasoningSpec(data,role);WS.reasoningSpec=spec;
+ if(!spec){button.hidden=true;wsHideReasoningMenu(menu,button);return}
+ button.hidden=false;button.textContent=wsReasoningText();button.setAttribute('aria-expanded',String(wsReasoningMenuOpen(menu)));
+ if(wsReasoningMenuOpen(menu))wsBuildReasoningMenu()
+}
+function wsUpdateRecipient(){const saved=selectedAssignment();const role=WS.dirty?{...saved,agent_id:$('#role-agent').value,profile:$('#role-profile').value,model:$('#role-model').value}:saved;$('#chat-role').textContent=roleInfo(WS.roleId)[0]+' · '+agentName(role.agent_id)+(role.model?' · '+role.model:'');$('#chat-target').value=WS.roleId;const data=WS.profiles.get(role.agent_id),caps=wsModelCapabilities(data,role),selectedImage=WS.atts.some(item=>WS.selectedAtts.has(item.id)&&wsIsImageAttachment(item)),latestImage=wsLatestConversationImage(),supportsImage=!!data&&caps.input.includes('image'),requiresImage=!!data&&caps.requiresImage;const routeNotes=[];if(supportsImage&&selectedImage)routeNotes.push('Новое изображение заменит предыдущее в этом чате.');else if(requiresImage&&latestImage)routeNotes.push('Будет повторно использовано изображение из этого чата: '+(latestImage.filename||'предыдущее изображение')+'.');else if(requiresImage)routeNotes.push('Для первого распознавания в этом чате добавьте PNG/JPEG.');if(!supportsImage&&(selectedImage||latestImage))routeNotes.push('Изображения не передаются текстовому маршруту; ответы распознавания остаются в истории.');if(supportsImage&&!requiresImage&&!selectedImage)routeNotes.push('Изображение можно приложить к этой модели по желанию.');if(caps.contextMode)routeNotes.push(caps.contextMode);if(caps.filesystemAccess===false&&!/файл|file/i.test(caps.contextMode))routeNotes.push('Без доступа к файлам проекта и файловых инструментов.');if(agents.find(item=>item.id===role.agent_id)?.transport!=='http'&&caps.supportsWorkdir===false)routeNotes.push('Этот канал пока не запускает задачи в папке проекта.');$('#chat-route-hint').textContent=[...new Set(routeNotes)].join(' ');$('#chat-send').disabled=WS.sending||!WS.project||(requiresImage&&!selectedImage&&!latestImage);wsSyncReasoning(role,data)}
+function renderRoles(){const box=$('#roles-list');box.replaceChildren();const target=$('#chat-target');const roleEntries=Object.entries(ROLE_META).sort(([a],[b])=>a==='orchestrator'?-1:b==='orchestrator'?1:0);putOptions(target,roleEntries.map(([id,meta])=>({id,name:meta[0]})),WS.roleId);for(const [id,meta] of roleEntries){const role=WS.roles[id]||{agent_id:'codex'},selected=WS.roleId===id,button=el('button','role-card role-'+id+(selected?' active':''));button.type='button';button.dataset.role=id;button.setAttribute('aria-pressed',String(selected));button.setAttribute('aria-label',meta[0]+' · '+(selected?'выбранный получатель':'назначение'));button.append(el('span','role-avatar',meta[1]));const text=el('span','role-text');text.append(el('span','role-name',meta[0]),el('span','role-meta',agentName(role.agent_id)+(role.model?' · '+role.model:'')));button.append(text,el('span','role-chevron','›'));button.onclick=action(()=>wsEditRole(id));box.append(button)}wsUpdateRecipient()}
 async function wsGetProfiles(agentId){if(!WS.profiles.has(agentId))WS.profiles.set(agentId,await api('/agent-profiles/'+encodeURIComponent(agentId)));return WS.profiles.get(agentId)}
 async function wsEditRole(id){WS.roleId=id;WS.dirty=false;renderRoles();const role=selectedAssignment();const meta=roleInfo(id);$('#role-editor-title').textContent=meta[0];$('#role-avatar').textContent=meta[1];$('#role-description').textContent=meta[2];$('#role-instructions').value=role.instructions||'';$('#role-save-status').textContent='';putOptions($('#role-agent'),agents.map(a=>({id:a.id,name:a.name+' · '+(a.host==='server'?'сервер':'ноутбук')})),role.agent_id||'codex');await wsPopulateRoleProfiles($('#role-agent').value,role.profile,role.model);wsUpdateRecipient()}
 function wsSetRoleProfilesLoading(loading){WS.editorProfilesLoading=loading;$('#role-save').disabled=loading;$('#role-save-status').textContent=loading?'Загружаю провайдеры и модели…':WS.dirty?'Есть несохранённые настройки':''}
@@ -1386,17 +1438,19 @@ async function wsSend(text){
  const savedAssignment=wasDirty?await wsSaveRole({projectId,roleId,draft:roleDraft}):selected;
  const assignment={...savedAssignment};
  const data=await wsGetProfiles(assignment.agent_id),agent=agents.find(a=>a.id===assignment.agent_id)||{};
+ const reasoningSpec=wsReasoningSpec(data,assignment),reasoningEffort=reasoningSpec&&WS.reasoning&&reasoningSpec.levels.includes(WS.reasoning)?WS.reasoning:null;
  const capabilities=wsModelCapabilities(data,assignment);
  const supportsImage=capabilities.input.includes('image');
  if(capabilities.requiresImage&&!selectedImages.length&&!previousConversationImage)throw Error('Для этой модели нужно PNG/JPEG. Прикрепите изображение или продолжите чат, где оно уже распознавалось.');
  const omittedImages=supportsImage?[]:selectedImages;let attachments=selectedAttachments.filter(item=>!wsIsImageAttachment(item)||supportsImage).map(item=>item.id);
  if(!conversationId){const conversation=await api('/projects/'+projectId+'/conversations',{method:'POST',body:JSON.stringify({role_id:roleId,title:text.slice(0,65)})});conversationId=conversation.id;if(WS.project?.id===projectId&&!WS.conv){WS.convs.unshift(conversation);WS.conv=conversation;storeSet(conversationStorageKey(),conversation.id);wsRenderConversations()}}
- const fingerprint=JSON.stringify({project:projectId,conversation:conversationId,role:roleId,text,agent:assignment.agent_id,profile:assignment.profile,model:assignment.model,attachments:[...attachments].sort()});
+ const fingerprint=JSON.stringify({project:projectId,conversation:conversationId,role:roleId,text,agent:assignment.agent_id,profile:assignment.profile,model:assignment.model,reasoning:reasoningEffort,attachments:[...attachments].sort()});
  const activePending=WS.project?.id===projectId?WS.pending:null;
  const pending=activePending?.fingerprint===fingerprint?activePending:{fingerprint,key:newKey()};
  if(WS.project?.id===projectId)WS.pending=pending;
  const payload={project_id:projectId,text,role_id:roleId,agent_id:assignment.agent_id,timeout_s:assignment.timeout_s||600,attachments,idempotency_key:pending.key};
  if(data.model_selection??agent.model_selection){if(assignment.profile)payload.profile=assignment.profile;if(assignment.model)payload.model=assignment.model}
+ if(reasoningEffort)payload.reasoning_effort=reasoningEffort;
  const response=await api('/conversations/'+conversationId+'/send',{method:'POST',body:JSON.stringify(payload),timeout:20000});
  const warnings=Array.isArray(response.context_warnings)?[...response.context_warnings]:[];
  if(omittedImages.length)warnings.push('Выбранное изображение не передано текстовому маршруту; ответы OCR остаются в истории чата.');
@@ -1424,10 +1478,14 @@ function wsWire(){
  $('#workspace-retry').onclick=action(wsRefreshAll);$('#conv-new').onclick=action(wsNewConversation);$('#project-new').onclick=()=>wsProjectDialog(true);$('#project-settings').onclick=()=>wsProjectDialog(!WS.project);$('#project-settings-form').onsubmit=wsSaveProject;
  $('#role-agent').onchange=action(async()=>{const roleId=WS.roleId,agentId=$('#role-agent').value;setDraftDirty();await wsPopulateRoleProfiles(agentId,'','');if(WS.roleId===roleId&&$('#role-agent').value===agentId)setDraftDirty()});$('#role-profile').onchange=action(async()=>{const roleId=WS.roleId,agentId=$('#role-agent').value,profileId=$('#role-profile').value;const data=await wsGetProfiles(agentId);if(WS.roleId!==roleId||$('#role-agent').value!==agentId||$('#role-profile').value!==profileId)return;wsPopulateRoleModels(data,profileId,'');$('#role-capability').textContent=wsUpdateRoleCapability(agentId,profileId,$('#role-model').value);setDraftDirty()});$('#role-model').onchange=()=>{$('#role-capability').textContent=wsUpdateRoleCapability($('#role-agent').value,$('#role-profile').value,$('#role-model').value);setDraftDirty()};$('#role-instructions').oninput=setDraftDirty;$('#role-save').onclick=action(async()=>{await wsSaveRole();toast('Настройки роли сохранены')});$('#chat-target').onchange=action(()=>wsEditRole($('#chat-target').value));
  $('#att-file').onchange=action(async event=>{const files=Array.from(event.target.files||[]);try{await wsUpload(files)}finally{event.target.value=''}});
+ const dropPanel=$('#context-panel');if(dropPanel){let dragDepth=0;dropPanel.addEventListener('dragenter',event=>{if(!event.dataTransfer?.types?.includes('Files'))return;event.preventDefault();dragDepth+=1;wsSetDropState(true)});dropPanel.addEventListener('dragover',event=>{if(!event.dataTransfer?.types?.includes('Files'))return;event.preventDefault();event.dataTransfer.dropEffect='copy';wsSetDropState(true)});dropPanel.addEventListener('dragleave',event=>{if(!event.dataTransfer?.types?.includes('Files'))return;event.preventDefault();dragDepth=Math.max(0,dragDepth-1);if(!dragDepth)wsSetDropState(false)});dropPanel.addEventListener('drop',event=>{if(!event.dataTransfer?.files?.length)return;event.preventDefault();dragDepth=0;wsSetDropState(false);action(()=>wsUpload(Array.from(event.dataTransfer.files)))().catch(workspaceError)})}
  const filterBox=$('#att-filter');if(filterBox)filterBox.oninput=event=>{WS.attFilter=event.target.value||'';wsRenderAttachments()}; const clearButton=$('#att-clear');if(clearButton)clearButton.onclick=()=>{WS.selectedAtts.clear();wsRenderAttachments()};
  const convFilter=$('#conv-filter');if(convFilter)convFilter.oninput=event=>{WS.convFilter=event.target.value||'';WS.convSeq++;WS.convCursor='';WS.convHasMore=false;WS.convLoading=true;WS.convs=[];delete WS.convSignature;wsRenderConversations();clearTimeout(WS.convFilterTimer);WS.convFilterTimer=setTimeout(()=>{wsLoadConversations({reset:true}).catch(workspaceError)},260)};const convMore=$('#conv-more');if(convMore)convMore.onclick=()=>wsLoadMoreConversations().catch(workspaceError);
+ $('#chat-reasoning').onclick=event=>{event.stopPropagation();const menu=$('#chat-reasoning-menu'),button=$('#chat-reasoning');if(!WS.reasoningSpec){wsHideReasoningMenu(menu,button);return}if(wsReasoningMenuOpen(menu)){wsHideReasoningMenu(menu,button)}else{wsBuildReasoningMenu();wsShowReasoningMenu(menu,button)}};
+ window.addEventListener('resize',()=>{const menu=$('#chat-reasoning-menu'),button=$('#chat-reasoning');if(wsReasoningMenuOpen(menu))wsPositionReasoningMenu(menu,button)});
+ document.addEventListener('click',event=>{const menu=$('#chat-reasoning-menu'),button=$('#chat-reasoning');if(!wsReasoningMenuOpen(menu))return;if(button&&button.contains(event.target))return;if(menu.contains(event.target))return;wsHideReasoningMenu(menu,button)});
  $('#chat-form').onsubmit=async event=>{event.preventDefault();const input=$('#chat-input'),draft=input.value,text=draft.trim(),submittedProjectId=WS.project?.id,submittedConversationId=WS.conv?.id;if(!text||WS.sending)return;WS.sending=true;wsUpdateRecipient();$('#chat-msg').className='msg';$('#chat-msg').textContent='Передаю задачу…';try{const response=await wsSend(text),stillInSubmittedChat=WS.project?.id===submittedProjectId&&(!submittedConversationId||WS.conv?.id===submittedConversationId);if(stillInSubmittedChat&&input.value===draft)input.value='';if(stillInSubmittedChat){const warnings=response?.context_warnings||[];if(warnings.length){$('#chat-msg').className='msg warn-text';$('#chat-msg').textContent='Задача принята. Контекст: '+warnings.join(' ')}else{$('#chat-msg').className='msg ok';$('#chat-msg').textContent='Задача принята. Ответ появится в этом чате.'}}}catch(error){if(WS.project?.id===submittedProjectId&&(!submittedConversationId||WS.conv?.id===submittedConversationId)){$('#chat-msg').className='msg error';$('#chat-msg').textContent=error.message;workspaceError(error)}}finally{WS.sending=false;wsUpdateRecipient()}};
- $('#chat-input').onkeydown=event=>{if(event.isComposing||event.keyCode===229)return;if(event.key==='Enter'&&(event.ctrlKey||event.metaKey)){event.preventDefault();$('#chat-form').requestSubmit()}};$('#token-form').onsubmit=event=>{event.preventDefault();saveToken().catch(workspaceError)};
+ $('#chat-input').onkeydown=event=>{if(event.isComposing||event.keyCode===229)return;if(event.key!=='Enter'||event.shiftKey)return;event.preventDefault();if(event.repeat)return;$('#chat-form').requestSubmit()};$('#token-form').onsubmit=event=>{event.preventDefault();saveToken().catch(workspaceError)};
 }
 
 function stopPolling(){pollTimers.forEach(clearInterval);pollTimers=[];clearInterval(WS.pollTimer)}

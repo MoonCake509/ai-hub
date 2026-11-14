@@ -216,6 +216,44 @@ async function readStructuredAnswer(expectedCount, expectedText, endMarker) {
   return output.slice(0, markerLine).replace(/\r\n?/g, '\n').replace(/\n+$/, '') + '\n';
 }
 
+// Qwen Desktop имеет собственную шкалу режима: Auto, Thinking, Fast.
+// Уровни AI Hub преобразуются в неё до отправки, а выбранный пункт перечитывается.
+const QWEN_THINKING_MODES = new Set(['auto', 'thinking', 'fast']);
+
+async function switchThinking(read, requestedMode = 'auto') {
+  const want = String(requestedMode || 'auto').trim().toLowerCase();
+  if (!QWEN_THINKING_MODES.has(want)) throw new Error(`Unsupported Qwen Desktop mode: ${requestedMode}`);
+  for (let round = 0; round < 4; round++) {
+    const current = (await read(`(document.querySelector('.qwen-thinking-selector .qwen-chat-v2-dropdown-menu-select-label')?.innerText || '').trim()`)).toLowerCase();
+    if (current === want) return current;
+    const opened = await read(`(() => {
+      const b = document.querySelector('.qwen-thinking-selector .qwen-chat-v2-dropdown-menu-select');
+      if (!b) return 'NO_SELECTOR';
+      b.click();
+      return 'OPEN';
+    })()`);
+    if (opened === 'NO_SELECTOR') throw new Error('Qwen Desktop thinking selector is unavailable');
+    await sleep(250);
+    let clicked = 'NOT_FOUND';
+    for (let wait = 0; wait < 8 && clicked === 'NOT_FOUND'; wait++) {
+      clicked = await read(`(() => {
+        const w = ${JSON.stringify(want)};
+        const items = [...document.querySelectorAll('.qwen-chat-v2-dropdown-menu-popup [role="menuitem"]')];
+        const item = items.find(e => (e.innerText || '').trim().toLowerCase() === w);
+        if (!item) return 'NOT_FOUND';
+        item.click();
+        return 'CLICKED';
+      })()`);
+      if (clicked === 'NOT_FOUND') await sleep(150);
+    }
+    if (clicked === 'NOT_FOUND') throw new Error(`Qwen Desktop mode ${requestedMode} is not available`);
+    await sleep(350);
+  }
+  const final = (await read(`(document.querySelector('.qwen-thinking-selector .qwen-chat-v2-dropdown-menu-select-label')?.innerText || '').trim()`)).toLowerCase();
+  if (final !== want) throw new Error(`Qwen Desktop mode mismatch: expected ${want}, selected ${final || '(unknown)'}`);
+  return final;
+}
+
 // Переключение модели через интерфейс. Воркер не полагается на то, что приложение
 // запомнило прошлый выбор: кликает селектор, затем перечитывает название из триггера.
 async function switchModel(read, want) {
@@ -249,7 +287,7 @@ async function switchModel(read, want) {
   return final === wantText;
 }
 
-async function askStructured(evaluate, expectedModel, prompt) {
+async function askStructured(evaluate, expectedModel, prompt, requestedMode = 'auto') {
   async function read(expression) {
     const result = await evaluate(expression);
     if (result.error) throw new Error(result.error);
@@ -270,6 +308,7 @@ async function askStructured(evaluate, expectedModel, prompt) {
     throw new Error(`Qwen Chat model mismatch: expected ${expectedModel || 'a named model'}, selected ${before.model || '(unknown)'}`);
   }
   if (before.draft || before.stop) throw new Error('Qwen Chat is busy or contains an unsent draft');
+  const mode = await switchThinking(read, requestedMode);
   const endMarker = `AIHUB-END-${crypto.randomUUID().slice(0, 8)}`;
   const framedPrompt = `${prompt}\n\nAfter the complete answer, close any code fence and put this marker on its own final line: ${endMarker}`;
   const sent = await submit(evaluate, framedPrompt);
@@ -296,7 +335,7 @@ async function askStructured(evaluate, expectedModel, prompt) {
     }
     requireEndMarker(state.text, endMarker);
     const output = await read(`(${readStructuredAnswer})(${state.count}, ${JSON.stringify(state.text)}, ${JSON.stringify(endMarker)})`);
-    return { output, model, model_label: state.model };
+    return { output, model, model_label: state.model, thinking_mode: mode };
   }
 
   const sentAt = Date.now();
@@ -316,7 +355,7 @@ async function askStructured(evaluate, expectedModel, prompt) {
     stable += 1;
     if (finished && stable >= 4 && state.count === before.count + 1) {
       const output = await read(`(${readStructuredAnswer})(${state.count}, ${JSON.stringify(state.text)}, ${JSON.stringify(endMarker)})`);
-      return { output, model, model_label: before.model };
+      return { output, model, model_label: before.model, thinking_mode: mode };
     }
     // Ответ не растёт, «стоп» нет, маркера нет. Так выглядит и оборванная генерация,
     // и ответ, который окно не дорисовало: и то и другое перечитываем из истории.
@@ -351,8 +390,8 @@ function tail(mainText, n = 1500) {
       const ans = extractAnswer(after.slice(before.length)) || extractAnswer(after);
       console.log(ans || '(пусто)');
     } else if (cmd === 'ask-json') {
-      const [expectedModel, ...prompt] = rest;
-      const result = await askStructured(evaluate, expectedModel, prompt.join(' '));
+      const [expectedModel, requestedMode, ...prompt] = rest;
+      const result = await askStructured(evaluate, expectedModel, prompt.join(' '), requestedMode);
       console.log(JSON.stringify(result));
     } else if (cmd === 'read') {
       const t = (await evaluate(READ)).value || '';

@@ -254,6 +254,7 @@ DDL = [
     "alter table aihub.job_attempts add column if not exists protocol int not null default 2",
     # CORE-02b: kind отделяет агентский prompt от управляемой операции host worker.
     "alter table aihub.jobs add column if not exists kind text not null default 'agent'",
+    "alter table aihub.jobs add column if not exists reasoning_effort text",
     "create index if not exists jobs_kind_status on aihub.jobs(kind, status, created_at)",
     """create table if not exists aihub.workspace_receipts (
         idempotency_key text primary key,
@@ -535,7 +536,8 @@ def create_job(agent_id: str, prompt: str, prompt_sha: str, timeout_s: int,
                requested_model: str | None = None,
                requested_profile: str | None = None,
                workspace: dict | None = None,
-               kind: str = "agent") -> tuple[dict, bool]:
+               kind: str = "agent",
+               reasoning_effort: str | None = None) -> tuple[dict, bool]:
     """Возвращает (job, created). При совпадении ключа с другим телом — ValueError."""
     job_id = uuid.uuid4().hex
     with _lock:
@@ -554,7 +556,8 @@ def create_job(agent_id: str, prompt: str, prompt_sha: str, timeout_s: int,
                             or existing["agent_id"] != agent_id
                             or int(existing["timeout_s"]) != int(timeout_s)
                             or (existing.get("requested_model") or None) != (requested_model or None)
-                            or (existing.get("requested_profile") or None) != (requested_profile or None)):
+                            or (existing.get("requested_profile") or None) != (requested_profile or None)
+                            or (existing.get("reasoning_effort") or None) != (reasoning_effort or None)):
                         raise ValueError("idempotency_key_conflict")
                     return existing, False
             if max_queue:
@@ -564,12 +567,13 @@ def create_job(agent_id: str, prompt: str, prompt_sha: str, timeout_s: int,
             workspace = workspace or {}
             conn.run(_qualify(
                 "insert into aihub.jobs(id, agent_id, prompt, prompt_sha, timeout_s, idempotency_key,"
-                " requested_model, requested_profile, project_id, conversation_id, role_id, run_snapshot, kind)"
-                " values (:i, :a, :p, :s, :t, :k, :rm, :rp, :pr, :cv, :ri, :sn::jsonb, :kd)"),
+                " requested_model, requested_profile, project_id, conversation_id, role_id, run_snapshot,"
+                " kind, reasoning_effort)"
+                " values (:i, :a, :p, :s, :t, :k, :rm, :rp, :pr, :cv, :ri, :sn::jsonb, :kd, :re)"),
                 i=job_id, a=agent_id, p=prompt, s=prompt_sha, t=timeout_s, k=idempotency_key,
                 rm=requested_model, rp=requested_profile, pr=workspace.get("project_id"),
                 cv=workspace.get("conversation_id"), ri=workspace.get("role_id"),
-                sn=json.dumps(workspace, ensure_ascii=False), kd=kind,
+                sn=json.dumps(workspace, ensure_ascii=False), kd=kind, re=reasoning_effort,
             )
             conn.run(_qualify("insert into aihub.job_events(job_id, event) values (:j, 'queued')"), j=job_id)
         return get_job(job_id), True
@@ -743,7 +747,7 @@ def lease_job(worker: str, lease_seconds: int = 300, agents: str = "",
                         where j.id = :i and j.status = 'queued'
                       returning j.id, j.agent_id, j.prompt, j.timeout_s, j.attempts,
                                 j.requested_model, j.requested_profile, j.run_snapshot,
-                                j.project_id, j.protocol, j.kind""",
+                                j.project_id, j.protocol, j.kind, j.reasoning_effort""",
                     lease=str(int(lease_seconds)), w=worker, i=cand["id"],
                 )
                 if not row:
@@ -1075,11 +1079,12 @@ def expire_leases() -> int:
 # 9.2: проекты, роли, чаты, вложения
 # ============================================================
 
-ROLE_IDS = ("planner", "coder", "tester", "reviewer", "archivist")
+ROLE_IDS = ("orchestrator", "planner", "coder", "tester", "reviewer", "archivist")
 
 # Идентификатор роли в данных — planner, как в шаблонах и назначениях; в интерфейсе
 # и документах подпись «Архитектор». architect принимается только как старый алиас.
 ROLE_LABELS = {
+    "orchestrator": "Оркестратор",
     "architect": "Архитектор",
     "planner": "Архитектор",
     "coder": "Кодер",
@@ -1090,6 +1095,7 @@ ROLE_LABELS = {
 ROLE_ALIASES = {"architect": "planner"}
 
 ROLE_RU = {
+    "orchestrator": "Оркестратор",
     "architect": "Архитектор",
     "coder": "Кодер",
     "tester": "Тестер",
@@ -1122,6 +1128,14 @@ def seed_workspace() -> dict:
                     conn.run(_qualify(
                         "insert into aihub.roles(project_id, role_id, agent_id, profile, model, instructions)"
                         " values ('ai-hub', :r, 'codex', null, null, '')"), r=rid)
+            # Новые роли добавляются в уже существующие проекты отдельным идемпотентным проходом.
+            for project_row in _rows(conn, _qualify("select id from aihub.projects")):
+                for rid in ROLE_IDS:
+                    conn.run(_qualify(
+                        "insert into aihub.roles(project_id, role_id, agent_id, profile, model, instructions)"
+                        " values (:p, :r, 'codex', null, null, '')"
+                        " on conflict (project_id, role_id) do nothing"),
+                        p=project_row["id"], r=rid)
             conn.run("commit")
         except Exception:
             conn.run("rollback")
@@ -1397,6 +1411,39 @@ def create_conversation(project_id: str, role_id: str = "", title: str = "") -> 
         return {"id": cid, "project_id": project_id, "role_id": role_id, "title": title}
 
 
+def pipeline_conversation(project_id: str, role_id: str) -> dict:
+    """Один служебный чат роли на проект, куда падают задачи конвейера и ответы."""
+    title = "Конвейер · " + ROLE_LABELS.get(role_id, role_id)
+    with _lock:
+        conn = connect()
+        row = _one(conn, _qualify(
+            "select id, project_id, role_id, title from aihub.conversations"
+            " where project_id = :p and role_id = :r and title = :t"
+            " order by created_at limit 1"), p=project_id, r=role_id, t=title)
+        if row:
+            return row
+        cid = uuid.uuid4().hex
+        conn.run(_qualify(
+            "insert into aihub.conversations(id, project_id, role_id, title)"
+            " values (:c, :p, :r, :t)"), c=cid, p=project_id, r=role_id, t=title)
+        return {"id": cid, "project_id": project_id, "role_id": role_id, "title": title}
+
+
+def mirror_run_message(run_id: str, role_id: str, author: str, body: str, suffix: str,
+                       job_id: str | None = None, state: str = "done") -> dict | None:
+    """Копия шага конвейера в чат роли. Идемпотентно по run_id+suffix."""
+    if role_id not in ROLE_IDS:
+        return None
+    with _lock:
+        run = _one(connect(), _qualify(
+            "select project_id from aihub.runs where id = :i"), i=run_id)
+    if not run or not run.get("project_id"):
+        return None
+    conv = pipeline_conversation(run["project_id"], role_id)
+    return add_message(conv["id"], author, (body or "")[:8000], job_id=job_id, state=state,
+                       idempotency_key=f"run:{run_id}:{suffix}")
+
+
 def get_messages(conversation_id: str, limit: int = 200) -> list[dict]:
     with _lock:
         conn = connect()
@@ -1586,12 +1633,13 @@ def create_chat_job(agent_id: str, prompt: str, prompt_sha: str, timeout_s: int,
                     idempotency_key: str | None, max_queue: int | None,
                     requested_model: str | None, requested_profile: str | None,
                     project_id: str, conversation_id: str, role_id: str,
-                    run_snapshot: dict) -> tuple[dict, bool]:
+                    run_snapshot: dict, reasoning_effort: str | None = None) -> tuple[dict, bool]:
     """Запуск из чата: job + связь с проектом/ролью/снимок назначения."""
     workspace = dict(run_snapshot)
     workspace.update(project_id=project_id, conversation_id=conversation_id, role_id=role_id)
     return create_job(agent_id, prompt, prompt_sha, timeout_s, idempotency_key,
-                      max_queue, requested_model, requested_profile, workspace)
+                      max_queue, requested_model, requested_profile, workspace,
+                      reasoning_effort=reasoning_effort)
 
 
 def _iso(value):

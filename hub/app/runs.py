@@ -688,6 +688,17 @@ def dispatch(run_id: str, resolve_agent, max_queue: int = 50) -> dict:
                                    ensure_ascii=False),
                     i=task["id"])
                 _bump_budget(conn, run_id, "dispatches")
+                try:
+                    db.mirror_run_message(
+                        run_id, task.get("role") or "", "orchestrator",
+                        "Задача этапа «" + db.ROLE_LABELS.get(task.get("role") or "",
+                                                              task.get("role") or "")
+                        + "» (запуск " + run_id[:8] + ", попытка " + str(attempt) + ")\n\n"
+                        + (task.get("prompt") or ""),
+                        f"task:{task['id']}:task", job_id=job["id"])
+                except Exception as exc:  # зеркало не должно мешать конвейеру
+                    event(conn, run_id, task["id"], "chat_mirror_failed",
+                          {"stage": "task", "error": str(exc)[:200]})
                 event(conn, run_id, task["id"], "task_dispatched",
                       {"job_id": job["id"], "attempt": attempt, "agent": agent_id,
                        "bridge_agent": bridge_agent, "model": assignment.get("model"),
@@ -912,6 +923,15 @@ def _apply_task_result(job_id: str, ok: bool, error: str | None = None) -> dict 
             else:
                 _fail_task(conn, run, task, error)
             _maybe_finish_run(conn, task["run_id"])
+        try:
+            body = output if state == "done" else (error or output or "шаг завершился без результата")
+            db.mirror_run_message(
+                task["run_id"], task.get("role") or "", task.get("role") or "",
+                body, f"task:{task['id']}:result", job_id=job_id,
+                state="done" if state == "done" else "failed")
+        except Exception as exc:  # зеркало не должно мешать конвейеру
+            event(conn, task["run_id"], task["id"], "chat_mirror_failed",
+                  {"stage": "result", "error": str(exc)[:200]})
     return {"run_id": task["run_id"], "task": task["key"], "state": state}
 
 

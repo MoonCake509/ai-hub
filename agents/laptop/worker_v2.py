@@ -30,7 +30,7 @@ import urllib.request
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-from bridge import AGENTS, TOKEN, _agent_path, log  # noqa: E402
+from bridge import AGENTS, TOKEN, _agent_path, codex_model_catalog, log  # noqa: E402
 
 # CORE-02b: управляемые операции рабочего пространства на этом устройстве.
 # Модуль необязателен: без него воркер обслуживает только kind=agent.
@@ -283,6 +283,12 @@ def worker_heartbeat_payload() -> dict:
             item["ready"] = ready
             if not ready:
                 item["problem"] = "CLI не найден по зарегистрированному пути"
+        if agent_id == "codex":
+            # Каталог уровней рассуждения приходит из установленного CLI, а не
+            # из реестра: хаб не должен угадывать, что поддерживает эта версия.
+            catalog = codex_model_catalog()
+            if catalog.get("available"):
+                item["catalog"] = {"kind": "reasoning", "models": catalog.get("models") or {}}
         served.append(item)
     return {
         "worker_id": WORKER,
@@ -515,7 +521,8 @@ def main() -> int:
                          daemon=True).start()
 
         log(f"job {job_id} attempt={attempt_id} agent={agent_id} timeout={timeout} "
-            f"profile={requested_profile} model={requested_model}")
+            f"profile={requested_profile} model={requested_model} "
+            f"effort={job.get('reasoning_effort')}")
         started = time.time()
         try:
             if agent_id == "codex":
@@ -523,7 +530,12 @@ def main() -> int:
                 # requested_profile and keyword-only cwd while legacy positional
                 # model/workdir calls remain supported.
                 result = spec["runner"](
-                    prompt, timeout, requested_model, requested_profile, cwd=workdir)
+                    prompt, timeout, requested_model, requested_profile, cwd=workdir,
+                    reasoning_effort=job.get("reasoning_effort"))
+            elif agent_id == "qwen":
+                result = spec["runner"](
+                    prompt, timeout, requested_model, requested_profile, cwd=workdir,
+                    reasoning_effort=job.get("reasoning_effort"))
             elif agent_id in ("openclaw", "hermes"):
                 result = spec["runner"](
                     prompt, timeout, requested_model, requested_profile, cwd=workdir)

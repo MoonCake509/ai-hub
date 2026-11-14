@@ -241,6 +241,9 @@ async def agent_profiles(agent_id: str) -> dict:
         "requires_image": bool(item.get("requires_image")),
         # ADAPTER-01: что канал действительно умеет — с причиной для выключенного.
         "capabilities": await asyncio.to_thread(capabilities.describe, item),
+        # Уровни рассуждения приходят с воркера (codex debug models), а не из
+        # реестра: интерфейс показывает только то, что подтверждает эта версия CLI.
+        "reasoning": await asyncio.to_thread(workers.reasoning_catalog, agent_id),
         **prof,
     }
 
@@ -1477,6 +1480,23 @@ async def conversation_send(conversation_id: str, request: Request) -> JSONRespo
         payload["role_id"] = conv["role_id"]
     item, role, agent_id, profile, model, timeout_s = _resolve_chat_target(payload, project)
     profile, model = _validate_chat_profile(item, agent_id, profile, model)
+    # Уровень рассуждения проверяется до постановки задания в очередь: иначе
+    # неподдерживаемое значение дошло бы до CLI и стоило бы попытки.
+    raw_effort = payload.get("reasoning_effort")
+    if raw_effort is not None and not isinstance(raw_effort, str):
+        raise HTTPException(status_code=400, detail="reasoning_effort must be a string")
+    reasoning_effort = (raw_effort or "").strip() or None
+    if reasoning_effort:
+        levels = await asyncio.to_thread(workers.reasoning_levels, agent_id, model or "")
+        if not levels:
+            raise HTTPException(
+                status_code=400,
+                detail=f"agent '{agent_id}' has no reasoning catalog for model '{model or ''}'")
+        if reasoning_effort not in levels:
+            raise HTTPException(
+                status_code=400,
+                detail=f"reasoning_effort '{reasoning_effort}' is not supported by '{model}'; "
+                       f"supported: {', '.join(levels)}")
     capabilities = _model_capabilities(item, agent_id, profile, model)
     raw_attachments = payload.get("attachments") or []
     if not isinstance(raw_attachments, list):
@@ -1502,7 +1522,7 @@ async def conversation_send(conversation_id: str, request: Request) -> JSONRespo
         "conversation_id": conversation_id, "project_id": project_id, "text": text,
         "agent_id": agent_id, "profile": profile, "model": model,
         "role_id": payload.get("role_id") or "", "timeout_s": timeout_s,
-        "attachments": attachment_ids,
+        "attachments": attachment_ids, "reasoning_effort": reasoning_effort or "",
     }, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
     old_job = await asyncio.to_thread(db.get_job_by_idempotency_key, idem + ":j")
     if old_job:
@@ -1518,6 +1538,7 @@ async def conversation_send(conversation_id: str, request: Request) -> JSONRespo
             "message_id": old_agent["id"] if old_agent else None,
             "job_id": old_job["id"], "status": old_job["status"], "created": False,
             "agent": agent_id, "model": model, "profile": profile,
+            "reasoning_effort": snapshot.get("reasoning_effort"),
             "context_warnings": snapshot.get("context_warnings") or [],
             "conversation_title": conversation_title,
             "active_image": snapshot.get("active_image"),
@@ -1649,6 +1670,7 @@ async def conversation_send(conversation_id: str, request: Request) -> JSONRespo
         "agent_id": agent_id,
         "provider_profile": profile,
         "model": model,
+        "reasoning_effort": reasoning_effort,
         "input_modalities": capabilities["input_modalities"],
         "output_modalities": capabilities["output_modalities"],
         "required_modalities": capabilities["required_modalities"],
@@ -1674,7 +1696,8 @@ async def conversation_send(conversation_id: str, request: Request) -> JSONRespo
         job, created = await asyncio.to_thread(
             db.create_chat_job, item.get("bridge_agent") or agent_id, full_prompt, prompt_sha,
             timeout_s, idem + ":j", MAX_QUEUE, model, profile,
-            project_id, conversation_id, run_snapshot["role_id"], run_snapshot)
+            project_id, conversation_id, run_snapshot["role_id"], run_snapshot,
+            reasoning_effort=reasoning_effort)
     except ValueError:
         raise HTTPException(status_code=409, detail="idempotency_key already used") from None
     except db.QueueFull as exc:
@@ -1695,6 +1718,7 @@ async def conversation_send(conversation_id: str, request: Request) -> JSONRespo
     return JSONResponse(status_code=202, content={
         "message_id": wait_msg["id"], "job_id": job["id"], "status": job["status"],
         "created": created, "agent": agent_id, "model": model, "profile": profile,
+        "reasoning_effort": reasoning_effort,
         "context_warnings": context_warnings,
         "conversation_title": conversation_title,
         "active_image": run_snapshot.get("active_image"),
@@ -2141,6 +2165,7 @@ async def bridge_jobs(worker: str = "", agents: str = "",
         "heartbeat_interval_s": bridge_protocol.heartbeat_interval(LEASE_SECONDS),
         "requested_model": leased.get("requested_model"),
         "requested_profile": leased.get("requested_profile"),
+        "reasoning_effort": leased.get("reasoning_effort"),
         "workdir": leased.get("workdir"),
         "host_id": leased.get("host_id"),
         "attachments": leased.get("attachments") or [],

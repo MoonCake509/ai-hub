@@ -41,6 +41,15 @@ DDL = [
     )""",
     "create index if not exists workers_hb on aihub.workers(hb_at desc)",
     "alter table aihub.workers add column if not exists hb_interval_s int",
+    # Каталог уровней рассуждения, снятый с CLI на самом воркере. Хранится
+    # отдельно от heartbeat: он большой и меняется только с версией CLI.
+    """create table if not exists aihub.agent_catalog (
+        agent_id text primary key,
+        worker_id text not null,
+        cli_version text,
+        catalog jsonb not null default '{}',
+        updated_at timestamptz not null default now()
+    )""",
 ]
 
 
@@ -114,6 +123,9 @@ def heartbeat(payload: dict, at=None, agents: list[dict] | None = None) -> dict:
             "capabilities": observations._clean_detail(item.get("capabilities") or {}),
             "ready": item.get("ready") if isinstance(item.get("ready"), bool) else None,
             "problem": str(item.get("problem") or "")[:200] or None,
+            # Каталог снимается с CLI воркера; хранится отдельной таблицей, а не
+            # в строке workers.agents.
+            "catalog": item.get("catalog") if isinstance(item.get("catalog"), dict) else None,
         })
     identity = observations._clean_detail(payload.get("identity") or {})
     capabilities = observations._clean_detail(payload.get("capabilities") or {})
@@ -131,6 +143,12 @@ def heartbeat(payload: dict, at=None, agents: list[dict] | None = None) -> dict:
         raise ProtocolError("hb_interval_s must be an integer") from None
     risk = lease_risk(hb_interval, LEASE_SECONDS)
 
+    catalogs = {}
+    for item in served:
+        catalog = item.pop("catalog", None)
+        if isinstance(catalog, dict) and (catalog.get("models") or {}):
+            catalogs[item["id"]] = catalog
+
     with db._lock:
         conn = db.connect()
         conn.run(db._qualify(
@@ -146,6 +164,18 @@ def heartbeat(payload: dict, at=None, agents: list[dict] | None = None) -> dict:
             ag=json.dumps(served, ensure_ascii=False), cap=json.dumps(capabilities, ensure_ascii=False),
             ident=json.dumps(identity, ensure_ascii=False),
             start=observations._parse(payload.get("started_at")), hb=observations._parse(moment))
+        # Пустой каталог не затирает рабочий: сбой `codex debug models` не должен
+        # лишать интерфейс уже подтверждённых уровней.
+        for agent_key, catalog in catalogs.items():
+            conn.run(db._qualify(
+                "insert into aihub.agent_catalog(agent_id, worker_id, cli_version, catalog, updated_at)"
+                " values (:a, :w, :v, :c::jsonb, :at)"
+                " on conflict (agent_id) do update set worker_id = excluded.worker_id,"
+                " cli_version = excluded.cli_version, catalog = excluded.catalog,"
+                " updated_at = excluded.updated_at"),
+                a=agent_key, w=worker_id,
+                v=next((x.get("cli_version") for x in served if x["id"] == agent_key), None),
+                c=json.dumps(catalog, ensure_ascii=False), at=observations._parse(moment))
 
     written = 0
     names = aliases(agents)
@@ -173,6 +203,43 @@ def heartbeat(payload: dict, at=None, agents: list[dict] | None = None) -> dict:
             "ttl_s": TTL_S, "hb_interval_s": hb_interval,
             "heartbeat_interval_s": recommended_heartbeat(LEASE_SECONDS),
             "lease_seconds": LEASE_SECONDS, "lease_risk": risk}
+
+
+def reasoning_catalog(agent_id: str, at=None) -> dict | None:
+    """Уровни рассуждения, подтверждённые CLI на воркере, и их свежесть."""
+    with db._lock:
+        conn = db.connect()
+        row = db._one(conn, db._qualify(
+            "select c.agent_id, c.worker_id, c.cli_version, c.catalog, c.updated_at,"
+            " w.hb_at from aihub.agent_catalog c"
+            " left join aihub.workers w on w.worker_id = c.worker_id"
+            " where c.agent_id = :a"), a=agent_id)
+    if not row:
+        return None
+    catalog = row.get("catalog")
+    if isinstance(catalog, str):
+        try:
+            catalog = json.loads(catalog)
+        except ValueError:
+            catalog = {}
+    models = (catalog or {}).get("models") or {}
+    if not models:
+        return None
+    return {
+        "models": models,
+        "worker_id": row.get("worker_id"),
+        "cli_version": row.get("cli_version"),
+        "updated_at": observations._iso(row.get("updated_at")),
+        "state": state_of(row.get("hb_at"), at),
+    }
+
+
+def reasoning_levels(agent_id: str, model: str | None) -> list[str]:
+    """Допустимые уровни для модели; пусто — каталог не подтверждает выбор."""
+    catalog = reasoning_catalog(agent_id) or {}
+    spec = (catalog.get("models") or {}).get(model or "") or {}
+    levels = spec.get("levels")
+    return [str(item) for item in levels] if isinstance(levels, list) else []
 
 
 def list_workers(at=None) -> list[dict]:

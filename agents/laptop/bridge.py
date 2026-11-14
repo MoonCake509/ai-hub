@@ -63,7 +63,24 @@ def resolve_codex_exe() -> str:
         if candidates:
             return max(candidates, key=os.path.getmtime)
 
-    # Preserve a clear missing-binary error when the trusted install root is
+    # Второй доверенный способ установки — npm-пакет @openai/codex: шим в
+    # %APPDATA%\npm\codex.cmd запускает платформенный бинарь из vendor.
+    app_data = os.environ.get("APPDATA")
+    if app_data:
+        vendor = os.path.join(app_data, "npm", "node_modules", "@openai",
+                              "codex-win32-x64", "vendor")
+        try:
+            candidates = [
+                os.path.join(vendor, entry, "bin", "codex.exe")
+                for entry in os.listdir(vendor)
+                if os.path.isfile(os.path.join(vendor, entry, "bin", "codex.exe"))
+            ]
+        except OSError:
+            candidates = []
+        if candidates:
+            return max(candidates, key=os.path.getmtime)
+
+    # Preserve a clear missing-binary error when the trusted install roots are
     # unavailable. Do not fall back to an arbitrary executable from PATH.
     return CODEX_EXE_DEFAULT
 
@@ -72,6 +89,71 @@ def _agent_path(agent_id: str, spec: dict) -> str:
     path = resolve_codex_exe() if agent_id == "codex" else spec["path"]
     spec["path"] = path
     return path
+
+
+# Каталог Codex — единственный источник допустимых уровней рассуждения для
+# конкретной модели на этой машине. `codex debug models` печатает его локально,
+# без сети и без расхода токенов; кэш привязан к mtime бинаря, поэтому после
+# обновления CLI каталог перечитывается сам.
+_CATALOG_LOCK = threading.Lock()
+_CATALOG_CACHE: dict = {"key": None, "at": 0.0, "data": None}
+CATALOG_TTL_S = 600
+
+
+def _parse_codex_catalog(raw: dict) -> dict:
+    models = {}
+    for item in raw.get("models") or []:
+        if not isinstance(item, dict):
+            continue
+        slug = str(item.get("slug") or "").strip()
+        if not slug:
+            continue
+        levels = []
+        for level in item.get("supported_reasoning_levels") or []:
+            effort = str((level or {}).get("effort") or "").strip() if isinstance(level, dict) else ""
+            if effort and effort not in levels:
+                levels.append(effort)
+        models[slug] = {
+            "default": str(item.get("default_reasoning_level") or "").strip(),
+            "levels": levels,
+        }
+    return models
+
+
+def codex_model_catalog(force: bool = False) -> dict:
+    """Срез каталога Codex: {models: {slug: {default, levels}}, cli, error}."""
+    exe = resolve_codex_exe()
+    try:
+        stamp = (exe, os.path.getmtime(exe))
+    except OSError:
+        return {"available": False, "models": {}, "cli": exe,
+                "error": "Codex CLI не найден по зарегистрированному пути"}
+    with _CATALOG_LOCK:
+        cached = _CATALOG_CACHE
+        if (not force and cached["data"] is not None and cached["key"] == stamp
+                and time.time() - cached["at"] < CATALOG_TTL_S):
+            return cached["data"]
+        try:
+            proc = subprocess.run(
+                [exe, "debug", "models"],
+                capture_output=True, timeout=60, stdin=subprocess.DEVNULL,
+                creationflags=CREATE_NO_WINDOW,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"available": False, "models": {}, "cli": exe,
+                    "error": f"{type(exc).__name__}: {exc}"}
+        if proc.returncode != 0:
+            err = (proc.stderr or b"").decode("utf-8", "replace").strip()[-400:]
+            return {"available": False, "models": {}, "cli": exe,
+                    "error": err or f"codex debug models exited {proc.returncode}"}
+        try:
+            models = _parse_codex_catalog(json.loads(proc.stdout.decode("utf-8", "replace")))
+        except Exception as exc:  # noqa: BLE001
+            return {"available": False, "models": {}, "cli": exe,
+                    "error": f"catalog parse failed: {exc}"}
+        data = {"available": bool(models), "models": models, "cli": exe, "error": None}
+        _CATALOG_CACHE.update(key=stamp, at=time.time(), data=data)
+        return data
 
 # These are actual per-run provider IDs from the installed Hermes config. The
 # model catalog itself is generated from the installed clients' local metadata
@@ -246,7 +328,8 @@ def parse_codex(stdout: str) -> dict:
 
 def run_codex(prompt: str, timeout: int, requested_model: str | None = None,
               requested_profile: str | None = None, *, cwd: str | None = None,
-              model: str | None = None, workdir: str | None = None) -> dict:
+              model: str | None = None, workdir: str | None = None,
+              reasoning_effort: str | None = None) -> dict:
     # Модель применяется флагом конкретного запуска, а не правкой глобального конфига.
     if requested_profile and requested_profile != "openai":
         # Older callers passed workdir as the fourth positional argument.
@@ -262,6 +345,13 @@ def run_codex(prompt: str, timeout: int, requested_model: str | None = None,
     model = requested_model
     if model:
         cmd += ["-m", model]
+    # Уровень рассуждения — на один этот вызов, глобальный конфиг не трогаем.
+    # Значение проверено хабом по каталогу; здесь только защита от подстановки.
+    effort = (reasoning_effort or "").strip()
+    if effort:
+        if not re.fullmatch(r"[a-z]{2,16}", effort):
+            raise ValueError(f"invalid reasoning_effort '{effort}'")
+        cmd += ["-c", f'model_reasoning_effort="{effort}"']
     # Default is explicitly read-only. File writes are enabled only for a
     # caller-supplied, existing workspace path, never by widening global policy.
     try:
@@ -275,6 +365,8 @@ def run_codex(prompt: str, timeout: int, requested_model: str | None = None,
     else:
         cmd += ["--sandbox", "read-only"]
     # Промпт через stdin: Codex читает его как входные данные, а не как флаг.
+    # Аргументы (без промпта) пишем в лог: по нему видно, что именно исполнено.
+    log("codex exec args: " + " ".join(cmd[1:]))
     started = time.time()
     try:
         proc = subprocess.run(
@@ -297,8 +389,22 @@ def run_codex(prompt: str, timeout: int, requested_model: str | None = None,
     return parsed
 
 
-def run_qwen(prompt: str, timeout: int) -> dict:
-    cmd = [NODE_EXE, QWEN_JS, "ask", prompt]
+def qwen_desktop_mode(reasoning_effort: str | None) -> str:
+    value = str(reasoning_effort or '').strip().lower()
+    if not value:
+        return 'auto'
+    if value in {'low', 'fast'}:
+        return 'fast'
+    if value in {'medium', 'high', 'xhigh', 'max', 'ultra', 'thinking'}:
+        return 'thinking'
+    raise ValueError(f'unsupported Qwen Desktop reasoning level: {reasoning_effort}')
+
+
+def run_qwen(prompt: str, timeout: int, requested_model: str | None = None,
+             requested_profile: str | None = None, *, cwd: str | None = None,
+             reasoning_effort: str | None = None) -> dict:
+    mode = qwen_desktop_mode(reasoning_effort)
+    cmd = [NODE_EXE, QWEN_JS, "ask-json", requested_model or "", mode, prompt]
     started = time.time()
     try:
         proc = subprocess.run(
@@ -312,12 +418,14 @@ def run_qwen(prompt: str, timeout: int) -> dict:
         return _timeout_result(exc, started)
     out = proc.stdout.decode("utf-8", "replace").strip()
     err = proc.stderr.decode("utf-8", "replace").strip()
-    return {
-        "output": out or err[-2000:],
-        "usage": {},
-        "exit_code": proc.returncode,
-        "elapsed": round(time.time() - started, 2),
-    }
+    try:
+        result = json.loads(out) if out else {}
+    except json.JSONDecodeError:
+        result = {"output": out}
+    result.setdefault("output", err[-2000:] if err else "")
+    result["exit_code"] = proc.returncode
+    result["elapsed"] = round(time.time() - started, 2)
+    return result
 
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
@@ -505,6 +613,12 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             self._send(200, {"status": "ok", "service": "aihub-bridge", "host": os.environ.get("COMPUTERNAME", "")})
             return
+        if self.path == "/catalog/codex":
+            if not self._authorized():
+                self._send(401, {"error": "unauthorized"})
+                return
+            self._send(200, codex_model_catalog())
+            return
         if self.path == "/agents":
             if not self._authorized():
                 self._send(401, {"error": "unauthorized"})
@@ -553,19 +667,36 @@ class Handler(BaseHTTPRequestHandler):
         timeout = int(payload.get("timeout") or spec["timeout"])
         model = (payload.get("model") or "").strip() or None
         profile = (payload.get("profile") or "").strip() or None
+        reasoning_effort = (payload.get("reasoning_effort") or "").strip() or None
         cwd = payload.get("cwd")
         lock = LOCKS.setdefault(agent_id, threading.Lock())
         if not lock.acquire(blocking=False):
             self._send(429, {"error": f"agent '{agent_id}' busy"})
             return
         try:
-            if (model or profile) and agent_id not in ("codex", "openclaw", "hermes"):
+            if (model or profile) and agent_id not in ("codex", "qwen", "openclaw", "hermes"):
                 self._send(400, {"error": f"agent '{agent_id}' does not support model selection"})
                 return
+            if reasoning_effort:
+                if agent_id == "qwen":
+                    qwen_desktop_mode(reasoning_effort)
+                else:
+                    levels = ((codex_model_catalog().get("models") or {}).get(model or "") or {}).get("levels") or []
+                    if agent_id != "codex" or not levels:
+                        self._send(400, {"error": "reasoning_effort is not supported for this agent/model"})
+                        return
+                    if reasoning_effort not in levels:
+                        self._send(400, {"error": f"unsupported reasoning_effort '{reasoning_effort}'",
+                                         "supported": levels})
+                        return
             log(f"run {agent_id} prompt_len={len(prompt)} timeout={timeout} "
-                f"profile={profile} model={model}")
+                f"profile={profile} model={model} effort={reasoning_effort}")
             if agent_id == "codex":
-                result = spec["runner"](prompt, timeout, model, profile, cwd=cwd)
+                result = spec["runner"](prompt, timeout, model, profile, cwd=cwd,
+                                        reasoning_effort=reasoning_effort)
+            elif agent_id == "qwen":
+                result = spec["runner"](prompt, timeout, model, profile, cwd=cwd,
+                                         reasoning_effort=reasoning_effort)
             elif agent_id in ("openclaw", "hermes"):
                 result = spec["runner"](prompt, timeout, model, profile, cwd=cwd)
             else:

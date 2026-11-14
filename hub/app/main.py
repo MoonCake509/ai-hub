@@ -769,6 +769,19 @@ async def projects() -> dict:
     return {"projects": items}
 
 
+@app.get("/projects/{project_id}/usage", dependencies=[Depends(require_token)])
+async def project_usage(project_id: str, days: int = 30) -> dict:
+    """Расход в токенах по проекту.
+
+    Единица учёта — токены (решение владельца 2026-11-14), а не деньги: цены
+    и курсы не выдумываются. Каналы без usage честно помечаются «нет данных».
+    """
+    project = await asyncio.to_thread(db.get_project, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail=f"project '{project_id}' not found")
+    return await asyncio.to_thread(db.usage_summary, project_id, days)
+
+
 @app.get("/projects/{project_id}", dependencies=[Depends(require_token)])
 async def project(project_id: str) -> dict:
     data = await asyncio.to_thread(db.get_project, project_id)

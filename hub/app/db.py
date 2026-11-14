@@ -165,6 +165,21 @@ DDL = [
         usage jsonb
     )""",
     "create index if not exists attempts_job on aihub.job_attempts(job_id, attempt_no desc)",
+    """create table if not exists aihub.usage_ledger (
+        attempt_id text primary key,
+        job_id text,
+        project_id text,
+        role_id text,
+        agent_id text,
+        profile text,
+        model text,
+        tokens_in bigint not null default 0,
+        tokens_out bigint not null default 0,
+        tokens_reasoning bigint not null default 0,
+        source text not null default 'absent',
+        recorded_at timestamptz not null default now()
+    )""",
+    "create index if not exists usage_ledger_project on aihub.usage_ledger(project_id, recorded_at desc)",
     """create table if not exists aihub.late_results (
         id bigserial primary key,
         job_id text,
@@ -905,6 +920,62 @@ def _store_late(conn, job_id: str | None, attempt_id: str, attempt_status: str |
         raise ValueError("late_result_attempt_conflict")
 
 
+def _usage_numbers(usage: dict | None) -> tuple[int, int, int, str]:
+    """Токены из отчёта канала. Ноль — «нет данных», а не «бесплатно»."""
+    data = usage or {}
+    def pick(*names):
+        for name in names:
+            value = data.get(name)
+            if isinstance(value, (int, float)) and value > 0:
+                return int(value)
+        return 0
+    t_in = pick("tokens_in", "input_tokens", "prompt_tokens")
+    t_out = pick("tokens_out", "output_tokens", "completion_tokens")
+    t_reason = pick("tokens_reasoning", "reasoning_tokens")
+    return t_in, t_out, t_reason, ("reported" if (t_in or t_out or t_reason) else "absent")
+
+
+def _record_usage(conn, job: dict, attempt_id: str, usage: dict | None) -> None:
+    """append-only журнал: одна строка на попытку, повтор не удваивает счёт."""
+    t_in, t_out, t_reason, source = _usage_numbers(usage)
+    conn.run(_qualify(
+        "insert into aihub.usage_ledger(attempt_id, job_id, project_id, role_id, agent_id,"
+        " profile, model, tokens_in, tokens_out, tokens_reasoning, source)"
+        " values (:a, :j, :p, :r, :ag, :pr, :m, :ti, :to, :tr, :s)"
+        " on conflict (attempt_id) do nothing"),
+        a=attempt_id, j=job.get("id"), p=job.get("project_id"), r=job.get("role_id"),
+        ag=job.get("agent_id"), pr=job.get("requested_profile"),
+        m=(usage or {}).get("reported_model") or (usage or {}).get("model") or job.get("effective_model"),
+        ti=t_in, to=t_out, tr=t_reason, s=source)
+
+
+def usage_summary(project_id: str, days: int = 30) -> dict:
+    """Расход в токенах по проекту: всего и разрез провайдер → модель."""
+    with _lock:
+        conn = connect()
+        rows = _rows(conn, _qualify(
+            "select coalesce(agent_id, '') as agent_id, coalesce(profile, '') as profile,"
+            " coalesce(model, '') as model, sum(tokens_in) as tokens_in,"
+            " sum(tokens_out) as tokens_out, sum(tokens_reasoning) as tokens_reasoning,"
+            " count(*) as attempts, max(recorded_at) as last_at"
+            " from aihub.usage_ledger where project_id = :p"
+            " and recorded_at >= now() - (:d || ' days')::interval"
+            " group by 1, 2, 3 order by (sum(tokens_in) + sum(tokens_out)) desc"),
+            p=project_id, d=str(max(1, min(int(days or 30), 365))))
+    items = [{
+        "agent_id": row["agent_id"], "profile": row["profile"], "model": row["model"],
+        "tokens_in": int(row["tokens_in"] or 0), "tokens_out": int(row["tokens_out"] or 0),
+        "tokens_reasoning": int(row["tokens_reasoning"] or 0),
+        "tokens_total": int((row["tokens_in"] or 0) + (row["tokens_out"] or 0) + (row["tokens_reasoning"] or 0)),
+        "attempts": int(row["attempts"] or 0),
+        "last_at": row["last_at"].isoformat() if row.get("last_at") else None,
+        "source": "reported" if (row["tokens_in"] or row["tokens_out"] or row["tokens_reasoning"]) else "absent",
+    } for row in rows]
+    totals = {k: sum(item[k] for item in items) for k in
+              ("tokens_in", "tokens_out", "tokens_reasoning", "tokens_total", "attempts")}
+    return {"project_id": project_id, "days": days, "totals": totals, "items": items,
+            "has_usage": totals["tokens_total"] > 0}
+
 def finish_attempt(attempt_id: str, ok: bool, output: str | None, error: str | None,
                    usage: dict | None, elapsed: float | None,
                    job_id_hint: str | None = None, uncertain: bool = False) -> str:
@@ -1001,6 +1072,9 @@ def finish_attempt(attempt_id: str, ok: bool, output: str | None, error: str | N
                 j=job["id"], a=attempt_id, e=status,
                 p=json.dumps({"elapsed": elapsed}, ensure_ascii=False),
             )
+            # Расход в токенах фиксируется там же, где закрывается попытка:
+            # повторный результат не создаёт вторую строку (primary key attempt_id).
+            _record_usage(conn, job, attempt_id, usage)
             # CORE-02: задание закрыто — его checkout свободен для следующего.
             from . import resources
             resources.release_for_job(conn, job["id"])

@@ -162,17 +162,50 @@ def run_openclaw(prompt: str, timeout: int, job: dict | None = None) -> dict:
             "elapsed": round(time.time() - started, 2)}
 
 
+def _hermes_json_result(stdout: str) -> tuple[str, dict, str | None] | None:
+    """Разбирает `--format stream-json`: текст ответа, токены, фактическая модель."""
+    import json as _json
+    text, usage, model = "", {}, None
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = _json.loads(line)
+        except ValueError:
+            continue
+        kind = event.get("type")
+        if kind == "system" and event.get("model"):
+            model = model or str(event["model"])
+        elif kind == "result":
+            text = str(event.get("text") or "")
+            model = str(event.get("model") or model or "") or None
+            tokens = event.get("tokens") or {}
+            if isinstance(tokens, dict) and tokens:
+                usage = {
+                    "input_tokens": int(tokens.get("input") or 0),
+                    "output_tokens": int(tokens.get("output") or 0),
+                    "total_tokens": int(tokens.get("total") or 0),
+                    "cache_read_tokens": int(tokens.get("cache_read") or 0),
+                }
+                if model:
+                    usage["reported_model"] = model
+    if not text and not usage:
+        return None
+    return text.strip(), usage, model
+
+
 def run_hermes(prompt: str, timeout: int, job: dict | None = None) -> dict:
     """One-shot Hermes с явными провайдером и моделью.
 
-    Старый вызов `hermes -z <prompt>` игнорировал выбор модели и мог ждать
-    интерактивного ввода, поэтому задание «дешёвая модель» фактически шло на
-    модели по умолчанию. Промпт передаётся через stdin, как в bridge.
+    Вывод снимается в stream-json: плоский текст не содержит токенов и
+    фактической модели, из-за чего задание закрывалось без расхода.
     """
     job = job or {}
     started = time.time()
     cwd = job.get("workdir") or None
-    cmd = [HERMES_EXE, "chat", "--query-file", "-", "--oneshot", "--quiet", "--source", "tool"]
+    cmd = [HERMES_EXE, "chat", "--query-file", "-", "--oneshot", "--quiet",
+           "--source", "tool", "--format", "stream-json"]
     if job.get("requested_profile"):
         cmd += ["--provider", str(job["requested_profile"])]
     if job.get("requested_model"):
@@ -181,30 +214,25 @@ def run_hermes(prompt: str, timeout: int, job: dict | None = None) -> dict:
         cmd += ["--in", cwd]
     proc = subprocess.run(cmd, capture_output=True, input=prompt.encode("utf-8"),
                           timeout=timeout, cwd=cwd)
-    out = ANSI_RE.sub("", proc.stdout.decode("utf-8", "replace")).strip()
+    raw = proc.stdout.decode("utf-8", "replace")
+    parsed = _hermes_json_result(raw)
     err = ANSI_RE.sub("", proc.stderr.decode("utf-8", "replace")).strip()
-    # Тихий режим добавляет строку с идентификатором сессии — это не ответ.
-    lines = [line for line in out.splitlines()
-             if not re.match(r"^\s*session(?:\s+id)?\s*[:=]", line, re.I)]
-    final = "\n".join(lines).strip()
+    if parsed:
+        final, usage, model_used = parsed
+    else:
+        out = ANSI_RE.sub("", raw).strip()
+        lines = [line for line in out.splitlines()
+                 if not re.match(r"^\s*session(?:\s+id)?\s*[:=]", line, re.I)]
+        final, usage, model_used = "\n".join(lines).strip(), {}, None
     exit_code = proc.returncode
     error = None
     if exit_code == 0 and not final:
         # Пустой ответ — это не успех: иначе «архивариус отработал» врёт.
         exit_code = 1
         error = err or "Hermes CLI returned no final answer"
-    return {"output": final or err[-2000:], "usage": {}, "exit_code": exit_code,
-            "elapsed": round(time.time() - started, 2),
+    return {"output": final or err[-2000:], "usage": usage, "model": model_used,
+            "exit_code": exit_code, "elapsed": round(time.time() - started, 2),
             **({"error": error} if error else {})}
-
-
-SERVER_MODEL_ROUTES = {
-    ("llm-server", "local", "dolphin-2.9-llama3-8b.Q4_K_M"):
-        ("chat", "http://127.0.0.1:11434/v1/chat/completions"),
-    ("xiaomi-ocr-server", "local", "xiaomi-ocr-q8"):
-        ("ocr", "http://127.0.0.1:8787/api/ocr"),
-}
-
 
 def _reported_model(data: dict, usage: dict) -> str | None:
     for value in (data.get("model"), usage.get("model")):

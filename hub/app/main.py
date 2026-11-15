@@ -160,20 +160,10 @@ async def _schedule_project_jobs() -> None:
                 await asyncio.to_thread(db.finish_project_run, item["run_id"], "failed", str(exc)[:400])
                 print(f"project job {item.get('id')} failed to queue: {exc}", flush=True)
     finally:
-        ARCHIVIST_TIMEOUT_S = 300
-ARCHIVIST_AGENT = "hermes-server"
-ARCHIVIST_PROFILE = "router-cheap"
-ARCHIVIST_MODEL = "deepseek-v4.1-flash-1017"
-ARCHIVIST_FALLBACK_AGENT = "hermes-server"
-ARCHIVIST_FALLBACK_PROFILE = "router-cheap"
-ARCHIVIST_FALLBACK_MODEL = "qwen3.8-27b"
+        # Флаг снимается всегда: иначе планировщик отрабатывает один раз за
+        # жизнь процесса и больше не ставит задачи по расписанию.
+        _project_jobs_busy = False
 
-_project_jobs_busy = False
-
-
-async def _project_workdir(project_id: str) -> str:
-    project = await asyncio.to_thread(db.get_project, project_id)
-    return str((project or {}).get("workdir") or "").strip()
 
 async def _poll_project_fallbacks() -> None:
     """Если основной канал не взял задачу за 10 минут или упал — передать резерву."""
@@ -198,6 +188,9 @@ async def _sweeper() -> None:
         await asyncio.sleep(SWEEP_INTERVAL_S)
         try:
             await _schedule_index_sweep()
+            # Сначала закрыть историю по уже завершившимся заданиям, потом
+            # решать про резерв: иначе успешный прогон висит «в очереди».
+            await asyncio.to_thread(db.sync_project_runs)
             await _schedule_project_jobs()
             await _poll_project_fallbacks()
             expired = await asyncio.to_thread(db.expire_leases)

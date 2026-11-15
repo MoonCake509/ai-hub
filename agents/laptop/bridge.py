@@ -533,15 +533,50 @@ def run_openclaw(prompt: str, timeout: int, requested_model: str | None = None,
     }
 
 
+def _hermes_json_result(stdout: str) -> tuple[str, dict, str | None] | None:
+    """Разбирает `--format stream-json`: текст ответа, токены, фактическая модель."""
+    import json as _json
+    text, usage, model = "", {}, None
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = _json.loads(line)
+        except ValueError:
+            continue
+        kind = event.get("type")
+        if kind == "system" and event.get("model"):
+            model = model or str(event["model"])
+        elif kind == "result":
+            text = str(event.get("text") or "")
+            model = str(event.get("model") or model or "") or None
+            tokens = event.get("tokens") or {}
+            if isinstance(tokens, dict) and tokens:
+                usage = {
+                    "input_tokens": int(tokens.get("input") or 0),
+                    "output_tokens": int(tokens.get("output") or 0),
+                    "total_tokens": int(tokens.get("total") or 0),
+                    "cache_read_tokens": int(tokens.get("cache_read") or 0),
+                }
+                if model:
+                    usage["reported_model"] = model
+    if not text and not usage:
+        return None
+    return text.strip(), usage, model
+
+
 def run_hermes(prompt: str, timeout: int, requested_model: str | None = None,
                requested_profile: str | None = None, *, cwd: str | None = None) -> dict:
-    """Hermes one-shot with per-invocation provider/model; prompt goes over stdin."""
+    """Hermes one-shot with per-invocation provider/model; prompt goes over stdin.
+
+    Вывод снимается в stream-json: в плоском тексте нет токенов и фактической
+    модели, поэтому задание закрывалось с пустым effective_model и без расхода.
+    """
     cwd = _clean_cwd(cwd)
     provider, model = _hermes_model(requested_model, requested_profile)
-    # Legacy bridge callers without a selection continue to use the configured
-    # default; queued AI Hub jobs carry both profile and model.
     cmd = [HERMES_EXE, "chat", "--query-file", "-", "--oneshot", "--quiet",
-           "--source", "tool"]
+           "--source", "tool", "--format", "stream-json"]
     if provider:
         cmd += ["--provider", provider]
     if model:
@@ -556,13 +591,17 @@ def run_hermes(prompt: str, timeout: int, requested_model: str | None = None,
         )
     except subprocess.TimeoutExpired as exc:
         return _timeout_result(exc, started)
-    out = ANSI_RE.sub("", proc.stdout.decode("utf-8", "replace"))
+    raw = proc.stdout.decode("utf-8", "replace")
+    parsed = _hermes_json_result(raw)
     err = ANSI_RE.sub("", proc.stderr.decode("utf-8", "replace")).strip()
-    # Quiet mode emits the final answer plus a session locator. Keep only the
-    # answer text; this avoids storing CLI metadata or tool chatter as chat output.
-    final_lines = [line for line in out.splitlines()
-                   if not re.match(r"^\s*session(?:\s+id)?\s*[:=]", line, re.I)]
-    final = "\n".join(final_lines).strip()
+    if parsed:
+        final, usage, model_used = parsed
+    else:
+        # Старый плоский режим — на случай, если JSON-поток не пришёл.
+        out = ANSI_RE.sub("", raw)
+        lines = [line for line in out.splitlines()
+                 if not re.match(r"^\s*session(?:\s+id)?\s*[:=]", line, re.I)]
+        final, usage, model_used = "\n".join(lines).strip(), {}, None
     exit_code = proc.returncode
     error = None
     if exit_code == 0 and not final:
@@ -570,12 +609,12 @@ def run_hermes(prompt: str, timeout: int, requested_model: str | None = None,
         error = err or "Hermes CLI returned no final answer"
     return {
         "output": final or err[-2000:],
-        "usage": {},
+        "usage": usage,
         "exit_code": exit_code,
+        "model": model_used,
         **({"error": error} if error else {}),
         "elapsed": round(time.time() - started, 2),
     }
-
 
 def run_kimi(prompt: str, timeout: int, requested_model: str | None = None,
              requested_profile: str | None = None, reasoning_effort: str | None = None,

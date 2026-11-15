@@ -1395,12 +1395,48 @@ def attach_project_run(run_id: int, agent_job_id: str) -> None:
                  a=agent_job_id, i=run_id)
 
 
+def sync_project_runs() -> int:
+    """Закрывает историю запусков по фактическому статусу задания.
+
+    Без этого успешный прогон архивариуса навсегда остаётся «в очереди»:
+    задание закрыто, а строка истории и карточка задачи — нет.
+    """
+    terminal = ("succeeded", "failed", "cancelled", "expired", "unknown")
+    with _lock:
+        conn = connect()
+        rows = _rows(conn, _qualify(
+            "select r.id as run_id, r.job_id, r.agent_job_id, j.status, j.started_at,"
+            " j.finished_at, j.result_error, j.result_output"
+            " from aihub.project_job_runs r join aihub.jobs j on j.id = r.agent_job_id"
+            " where r.status in ('queued', 'running', 'fallback') limit 50"))
+        changed = 0
+        for row in rows:
+            if row["status"] not in terminal:
+                continue
+            summary = (row.get("result_error") or row.get("result_output") or "").strip()
+            conn.run(_qualify(
+                "update aihub.project_job_runs set status = :s, finished_at = :f, summary = :m"
+                " where id = :i"),
+                s=row["status"], f=row.get("finished_at"), m=summary[:500] or None, i=row["run_id"])
+            conn.run(_qualify(
+                "update aihub.project_jobs set last_status = :s, last_job_id = :j, last_run_at = :t"
+                " where id = :i"),
+                s=row["status"], j=row["agent_job_id"], t=row.get("started_at"), i=row["job_id"])
+            changed += 1
+    return changed
+
+
 def finish_project_run(run_id: int, status: str, summary: str | None = None) -> None:
     with _lock:
         conn = connect()
         conn.run(_qualify(
             "update aihub.project_job_runs set status = :s, finished_at = now(), summary = :m where id = :i"),
             s=status, m=summary, i=run_id)
+        # Карточка задачи обязана показать отказ, а не остаться «в очереди».
+        conn.run(_qualify(
+            "update aihub.project_jobs pj set last_status = :s"
+            " from aihub.project_job_runs r where r.id = :i and pj.id = r.job_id"),
+            s=status, i=run_id)
 
 def cancel_job(job_id: str) -> str:
     """queued → cancelled сразу; running → cancel_requested (подтверждает исполнитель)."""

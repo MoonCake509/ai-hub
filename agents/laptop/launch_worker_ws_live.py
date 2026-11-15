@@ -27,6 +27,11 @@ os.environ.update({
     "HUB_URL": "http://127.0.0.1:8090",
     "HUB_TOKEN": token,
     "BRIDGE_TOKEN": token,
+    # Ярлык хаба, а не имя машины: workspace-задания арендуются по host_id
+    # проекта (server), и capabilities/registry тоже индексируются по нему.
+    # Без этого воркер опрашивает host=WIN-V76QC2G60Q1 и server-задания
+    # остаются в очереди (регресс af0e4d7).
+    "AIHUB_HOST_ID": "server",
     "AIHUB_WORKSPACE_DIR": r"C:\Users\user\AppData\Local\aihub\workspaces",
     "QWEN_JS": r"C:\Users\user\bin\qwen.js",
     "AIHUB_LOCAL_LLM": "http://127.0.0.1:11434",

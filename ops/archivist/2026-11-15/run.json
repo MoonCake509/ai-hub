@@ -1,0 +1,27 @@
+{
+  "date": "2026-11-15",
+  "project": "AI-Hub",
+  "root": "R:/AI-Hub",
+  "role": "archivist",
+  "model": "deepseek-v4.1-flash-1017",
+  "provider": "custom",
+  "platform": "cli",
+  "started_at": "2026-11-15T11:41:04+03:00",
+  "timezone": "UTC+03:00",
+  "status": "ok",
+  "scope": {"dirs_inspected": ["ops/", "map/"], "dirs_touched": ["ops/archivist/", "map/"], "dirs_untouched": ["docs/", "config/", "hub/", "agents/", "web/", "backlog/", "bugs/"]},
+  "input_state": {"ops": "exists, 1 file (INDEX.md, 16926 B, 218 lines)", "map": "absent"},
+  "actions": [
+    "created map/INDEX.md",
+    "created ops/archivist/2026-11-15/{summary.md,deletions-proposed.md,run.json}",
+    "created ops/archivist/INDEX.md with first row"
+  ],
+  "untouched_files": ["ops/INDEX.md"],
+  "deleted": 0,
+  "moved": 0,
+  "files_touched": 5,
+  "tests_run": false,
+  "builds_run": false,
+  "proposals": {"deletion_candidates": 3, "bytes": 149335, "list": ["hub/app/db.py.bak-core02b", "hub/app/main.py.bak-core02b", "agents/laptop/worker_v2.py.bak-core02b"]},
+  "notes": "Раскладка по датам не выполнялась: неразобранных файлов в ops/ нет."
+}

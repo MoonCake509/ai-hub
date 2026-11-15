@@ -124,9 +124,57 @@ ARCHIVIST_FALLBACK_MODEL = "qwen3.8-27b"
 _project_jobs_busy = False
 
 
+def _bridge_agent(agent_id: str) -> str:
+    """Имя, которое объявляет воркер в поллинге (bridge_agent), а не id реестра.
+
+    С `hermes-server` в job.agent_id задание не арендует ни один воркер:
+    bridge-воркер объявляет `hermes`, серверный — `hermes-server`.
+    """
+    agent = find_agent(agent_id) or {}
+    return str(agent.get("bridge_agent") or agent_id)
+
+
 async def _project_workdir(project_id: str) -> str:
     project = await asyncio.to_thread(db.get_project, project_id)
     return str((project or {}).get("workdir") or "").strip()
+
+
+
+def _archivist_payload() -> dict:
+    """Задача архивации по умолчанию: 05:00 МСК, дешёвый канал, резерв Qwen."""
+    return {
+        "name": "Архивариус",
+        "kind": "archivist",
+        "agent_id": ARCHIVIST_AGENT,
+        "profile": ARCHIVIST_PROFILE,
+        "model": ARCHIVIST_MODEL,
+        "fallback_agent_id": ARCHIVIST_FALLBACK_AGENT,
+        "fallback_profile": ARCHIVIST_FALLBACK_PROFILE,
+        "fallback_model": ARCHIVIST_FALLBACK_MODEL,
+        "prompt": ARCHIVIST_PROMPT,
+        "schedule": "0 5 * * *",
+        "timezone": "Europe/Moscow",
+    }
+
+
+def _ensure_archivist(project_id: str) -> bool:
+    """У проекта обязана быть архивация: создаём, если её ещё нет."""
+    for item in db.list_project_jobs(project_id):
+        if (item.get("kind") or "archivist") == "archivist":
+            return False
+    db.create_project_job(project_id, _archivist_payload())
+    return True
+
+
+def _ensure_all_archivists() -> int:
+    created = 0
+    for project in db.list_projects():
+        try:
+            if _ensure_archivist(project["id"]):
+                created += 1
+        except Exception as exc:  # noqa: BLE001 — один проект не должен ломать старт
+            print(f"archivist ensure skipped for {project.get('id')}: {exc}", flush=True)
+    return created
 
 
 async def _schedule_project_jobs() -> None:
@@ -151,7 +199,7 @@ async def _schedule_project_jobs() -> None:
                 prompt = item.get("prompt") or ARCHIVIST_PROMPT
                 sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
                 job, _created = await asyncio.to_thread(
-                    db.create_job, item["agent_id"], prompt, sha, ARCHIVIST_TIMEOUT_S,
+                    db.create_job, _bridge_agent(item["agent_id"]), prompt, sha, ARCHIVIST_TIMEOUT_S,
                     f"cron:{item['id']}:{item['slot']}", None,
                     item.get("model"), item.get("profile"),
                     {"project_id": item["project_id"], "role_id": "archivist"}, "agent", None)
@@ -172,7 +220,7 @@ async def _poll_project_fallbacks() -> None:
             prompt = item.get("prompt") or ARCHIVIST_PROMPT
             sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
             job, _created = await asyncio.to_thread(
-                db.create_job, item["fallback_agent_id"], prompt, sha, ARCHIVIST_TIMEOUT_S,
+                db.create_job, _bridge_agent(item["fallback_agent_id"]), prompt, sha, ARCHIVIST_TIMEOUT_S,
                 f"cron:{item['job_id']}:fb:{item['run_id']}", None,
                 item.get("fallback_model"), item.get("fallback_profile"),
                 {"project_id": item["project_id"], "role_id": "archivist"}, "agent", None)
@@ -226,6 +274,12 @@ async def lifespan(app: FastAPI):
         db.seed_workspace()
     except Exception as e:
         print("seed_workspace failed:", e)
+    try:
+        made = await asyncio.to_thread(_ensure_all_archivists)
+        if made:
+            print(f"archivist jobs created: {made}", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        print("archivist ensure failed:", exc, flush=True)
     task = asyncio.create_task(_sweeper())
     try:
         yield
@@ -1052,7 +1106,7 @@ async def project_job_run(project_id: str, job_id: str) -> dict:
     run_id = await asyncio.to_thread(db.record_manual_run, job_id)
     try:
         agent_job, _created = await asyncio.to_thread(
-            db.create_job, job["agent_id"], prompt, sha, ARCHIVIST_TIMEOUT_S,
+            db.create_job, _bridge_agent(job["agent_id"]), prompt, sha, ARCHIVIST_TIMEOUT_S,
             f"cron:{job_id}:manual:{uuid.uuid4().hex[:8]}", None,
             job.get("model"), job.get("profile"),
             {"project_id": project_id, "role_id": "archivist"}, "agent", None)
@@ -1458,6 +1512,8 @@ async def project_create(request: Request) -> dict:
     project = await asyncio.to_thread(
         db.create_project, name[:200], host_id, workdir, settings,
         status="preparing", request_key=key or None, project_id=project_id)
+    # Архивация появляется вместе с проектом, а не отдельным действием.
+    await asyncio.to_thread(_ensure_archivist, project_id)
     return await _prepare_project(project, name, host_id, settings)
 
 
@@ -1497,6 +1553,7 @@ async def project_import(request: Request) -> dict:
     project = await asyncio.to_thread(
         db.create_project, name, host_id, path, {"imported": True},
         status="preparing", request_key=key or None)
+    await asyncio.to_thread(_ensure_archivist, project["id"])
     project = await asyncio.to_thread(
         db.project_prepared, project["id"],
         repo_root=report.get("root") or path,

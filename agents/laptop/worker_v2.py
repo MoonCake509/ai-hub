@@ -548,21 +548,24 @@ def main() -> int:
             f"effort={job.get('reasoning_effort')}")
         started = time.time()
         try:
-            if agent_id == "codex":
+            # Ветку выбираем по реальному раннеру: codex-laptop — это codex,
+            # иначе он уходил в else без cwd и работал в папке запуска воркера.
+            runner_id = AGENT_ALIASES.get(agent_id, agent_id)
+            if runner_id == "codex":
                 # Preserve Codex model/cwd behavior; the updated bridge accepts
                 # requested_profile and keyword-only cwd while legacy positional
                 # model/workdir calls remain supported.
                 result = spec["runner"](
                     prompt, timeout, requested_model, requested_profile, cwd=workdir,
                     reasoning_effort=job.get("reasoning_effort"))
-            elif agent_id == "qwen":
+            elif runner_id == "qwen":
                 result = spec["runner"](
                     prompt, timeout, requested_model, requested_profile, cwd=workdir,
                     reasoning_effort=job.get("reasoning_effort"))
-            elif agent_id in ("openclaw", "hermes"):
+            elif runner_id in ("openclaw", "hermes"):
                 result = spec["runner"](
                     prompt, timeout, requested_model, requested_profile, cwd=workdir)
-            elif agent_id == "channel":
+            elif runner_id == "channel":
                 # Ключ канала воркер не получает: запрос к провайдеру делает хаб.
                 result = spec["runner"](
                     prompt, timeout, requested_model, requested_profile, cwd=workdir)

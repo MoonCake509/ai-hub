@@ -2102,11 +2102,18 @@ async def conversation_send(conversation_id: str, request: Request) -> JSONRespo
             "active_image_source": (snapshot.get("active_image") or {}).get("source"),
             "active_image_reused": (snapshot.get("active_image") or {}).get("reused", False),
         })
+    workdir_advisory = None
     if (item.get("transport") != "http" and project.get("workdir")
             and not capabilities.get("supports_workdir")):
-        raise HTTPException(status_code=400,
-                            detail=f"agent '{agent_id}' cannot run in the project's workdir; "
-                                   "choose a workdir-capable agent or clear the project workdir")
+        # Оркестратор планирует по переданному контексту и файлы не правит:
+        # запрещать ему запуск из-за рабочей папки — значит ломать выбор модели.
+        if (role.get("role_id") or "") == "orchestrator":
+            workdir_advisory = (f"{item.get('name') or agent_id} не работает с файлами проекта: "
+                                "план строится по переданному контексту")
+        else:
+            raise HTTPException(status_code=400,
+                                detail=f"agent '{agent_id}' cannot run in the project's workdir; "
+                                       "choose a workdir-capable agent or clear the project workdir")
     try:
         quality.ensure_channel_enabled(agent_id, profile, model)
     except ValueError as exc:
@@ -2122,7 +2129,7 @@ async def conversation_send(conversation_id: str, request: Request) -> JSONRespo
     history_was_tail_limited = len(history) >= 20
     if prior_user_msg:
         history = [h for h in history if h.get("id") != prior_user_msg.get("id")]
-    context_warnings = []
+    context_warnings = [workdir_advisory] if workdir_advisory else []
     role_instructions = (role.get("instructions") or "").strip()
     selected_rows: dict[str, dict] = {}
     for aid in attachment_ids:

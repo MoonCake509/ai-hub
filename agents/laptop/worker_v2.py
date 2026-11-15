@@ -268,11 +268,17 @@ def _cli_version(agent_id: str, path: str) -> str | None:
 
 def worker_heartbeat_payload() -> dict:
     served = []
-    for agent_id, spec in AGENTS.items():
+    # Объявляем только то, что реально арендуем: иначе карточка воркера
+    # показывает чужие агенты, и любой расчёт по полю agents выдаст ему задание.
+    wanted = [a for a in POLL_AGENTS if a not in ("workspace",)]
+    for agent_id in wanted:
+        spec = AGENTS.get(agent_id) or AGENTS.get(AGENT_ALIASES.get(agent_id, ""))
+        if not spec:
+            continue
         item = {"id": agent_id, "capabilities": {"workdir": True}}
         # Путь берём тем же резолвером, которым запускается CLI: закреплённый в
         # реестре путь устаревает после обновления Codex.
-        path = _agent_path(agent_id, spec)
+        path = _agent_path(AGENT_ALIASES.get(agent_id, agent_id), spec)
         if path:
             item["cli_path"] = path
             try:
@@ -281,14 +287,14 @@ def worker_heartbeat_payload() -> dict:
                 item["cli_mtime"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(st.st_mtime))
             except OSError:
                 pass
-            version = _cli_version(agent_id, path)
+            version = _cli_version(AGENT_ALIASES.get(agent_id, agent_id), path)
             if version:
                 item["cli_version"] = version
             ready = os.path.exists(path)
             item["ready"] = ready
             if not ready:
                 item["problem"] = "CLI не найден по зарегистрированному пути"
-        if agent_id == "codex":
+        if AGENT_ALIASES.get(agent_id, agent_id) == "codex":
             # Каталог уровней рассуждения приходит из установленного CLI, а не
             # из реестра: хаб не должен угадывать, что поддерживает эта версия.
             catalog = codex_model_catalog()

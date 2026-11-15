@@ -79,7 +79,12 @@ services:
       - ../hub/app:/app/app:ro
       - ./certs:/certs:ro
       # Рабочее пространство проектов: загрузки и архив удалённых проектов.
-      - R:/AIHub:/workspace
+      # Данные (WorkSpace/Archive), а не репозиторий: main.py сопоставляет
+      # R:\AIHub -> /workspace. Короткий синтаксис с буквой диска Docker
+      # разбирает по ':' и падает с «invalid volume specification».
+      - type: bind
+        source: R:\AIHub
+        target: /workspace
     logging:
       options:
         max-size: "10m"

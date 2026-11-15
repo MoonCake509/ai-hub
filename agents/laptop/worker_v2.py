@@ -58,6 +58,8 @@ _last_401 = 0.0
 OUTBOX = os.path.join(HERE, "outbox")
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "3"))
 WORKER = os.environ.get("AIHUB_WORKER_NAME") or os.environ.get("COMPUTERNAME", "laptop")
+# Хост-ярлык хаба: по нему фильтруются workspace-задания.
+HOST_ID = os.environ.get("AIHUB_HOST_ID") or platform.node()
 os.makedirs(OUTBOX, exist_ok=True)
 
 
@@ -442,7 +444,7 @@ def main() -> int:
         try:
             code, job = http("GET", f"{base}/bridge/jobs?worker={WORKER}"
                                     f"&agents={','.join(POLL_AGENTS)}&protocol={PROTOCOL}"
-                                    f"&kinds={','.join(KINDS)}", timeout=45)
+                                    f"&kinds={','.join(KINDS)}&host={HOST_ID}", timeout=45)
         except Exception as exc:  # noqa: BLE001
             log(f"poll error: {exc}")
             time.sleep(5)

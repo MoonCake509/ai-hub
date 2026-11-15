@@ -2798,7 +2798,7 @@ async def workers_list() -> dict:
 @app.get("/bridge/jobs", dependencies=[Depends(require_token)])
 async def bridge_jobs(worker: str = "", agents: str = "",
                       protocol_ver: str | None = Query(None, alias="protocol"),
-                      kinds: str = "agent") -> JSONResponse:
+                      kinds: str = "agent", host: str = "") -> JSONResponse:
     # Версия протокола обязательна. Старый poller (v1) не арендует задания v2:
     # иначе он получал бы задание, не умея ни durable-ack, ни heartbeat, и
     # «терял» бы его при первом падении. Отказ явный — 426, а не пустая очередь.
@@ -2813,7 +2813,7 @@ async def bridge_jobs(worker: str = "", agents: str = "",
         })
     client_protocol = int(bridge_protocol.version_of(protocol_ver))
     leased = await asyncio.to_thread(db.lease_job, worker or "unknown", LEASE_SECONDS, agents,
-                                     client_protocol, kinds)
+                                     client_protocol, kinds, host)
     if not leased:
         return JSONResponse({"job": None, "protocol": client_protocol,
                              "heartbeat_interval_s": bridge_protocol.heartbeat_interval(LEASE_SECONDS)})

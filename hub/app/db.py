@@ -771,7 +771,7 @@ def _checkout_key(conn, row: dict) -> str | None:
 
 
 def lease_job(worker: str, lease_seconds: int = 300, agents: str = "",
-              client_protocol: int = 0, kinds: str = "agent") -> dict | None:
+              client_protocol: int = 0, kinds: str = "agent", host: str = "") -> dict | None:
     """Атомарно берёт задание из очереди, создаёт попытку. None — очередь пуста.
 
     Аренда возможна только клиентом, который говорит на протоколе не ниже
@@ -794,10 +794,13 @@ def lease_job(worker: str, lease_seconds: int = 300, agents: str = "",
                       and protocol <= :cp
                       and kind = any(string_to_array(:kinds, ','))
                       and (:agents = '' or agent_id = any(string_to_array(:agents, ',')))
+                      and (:host = '' or case when kind = 'workspace'
+                            then coalesce(prompt::jsonb ->> 'host_id', '') = :host
+                            else true end)
                     order by (kind = 'workspace') desc, created_at
                     limit :n""",
                 cp=int(client_protocol), kinds=kinds or "agent", agents=agents,
-                n=CANDIDATES,
+                host=str(host or "").strip(), n=CANDIDATES,
             )
             row = None
             resource = None

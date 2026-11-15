@@ -241,6 +241,9 @@ async def _sweeper() -> None:
             await asyncio.to_thread(db.sync_project_runs)
             await _schedule_project_jobs()
             await _poll_project_fallbacks()
+            stale = await asyncio.to_thread(db.fail_stale_queued)
+            if stale:
+                print(f"stale queued jobs failed: {stale}", flush=True)
             expired = await asyncio.to_thread(db.expire_leases)
             if expired:
                 print(f"expired leases: {expired}", flush=True)

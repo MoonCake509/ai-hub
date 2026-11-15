@@ -288,9 +288,16 @@ def call(channel: dict, model: str, prompt: str, timeout: int = 120,
     key = decrypt(channel.get("api_key") or "")
     if not key:
         raise RuntimeError("ключ канала не найден на сервере — введите его заново")
+    route = (
+        f"Ты отвечаешь внутри AI Hub через API-канал «{channel.get('name') or 'канал'}». "
+        f"Фактическая модель этого запроса: {model}. "
+        "Если спрашивают, на какой модели ты работаешь, называй именно её "
+        "и не приписывай себе другую модель или компанию."
+    )
     body = {
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": [{"role": "system", "content": route},
+                     {"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "temperature": 0.2,
         "stream": False,

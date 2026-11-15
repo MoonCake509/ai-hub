@@ -1033,6 +1033,23 @@ def usage_summary(project_id: str, days: int = 30) -> dict:
     return {"project_id": project_id, "days": days, "totals": totals, "items": items,
             "has_usage": totals["tokens_total"] > 0}
 
+def fail_stale_queued(minutes: int = 15) -> int:
+    """Задание, которое никто не взял, не должно висеть «в очереди» вечно.
+
+    Если исполнитель не подключён (воркер убит, задача не запущена), чат
+    показывает бесконечное «В очереди…» — владелец читает это как зависание.
+    """
+    with _lock:
+        conn = connect()
+        rows = _rows(conn, _qualify(
+            "update aihub.jobs set status = 'failed', finished_at = now(),"
+            " result_error = :r where status = 'queued' and attempts = 0"
+            " and created_at < now() - (:m || ' minutes')::interval returning id"),
+            r=f"исполнитель не взял задание за {minutes} мин — проверьте, запущен ли воркер",
+            m=str(minutes))
+    return len(rows or [])
+
+
 def fail_orphan_jobs(reason: str = "прогон прерван перезапуском хаба") -> int:
     """Хаб перезапустился — аренда потеряна; такие задания больше некому завершить."""
     with _lock:

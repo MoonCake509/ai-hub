@@ -27,6 +27,7 @@ from . import db, workers, security_policy
 
 OPS = {
     "init_project": "рабочая папка проекта: шаблон, git init и первый коммит",
+    "archive_project": "перенос рабочей папки проекта в архив рядом с корнем проектов",
     "write_reports": "живые отчёты проекта в ops/: журнал и черновики PR",
     "create_backup": "точка восстановления: zip коммита и строка в ops/BACKUPS.md",
     "refresh_index": "карта проекта ops/INDEX.md по зафиксированному коммиту",
@@ -56,7 +57,7 @@ OPS = {
 # управляемую область воркера и не должны блокировать кодеров.
 WRITES_ROOT = {"apply_patch"}
 # Операции, меняющие управляемое состояние: им нужен idempotency key по умолчанию.
-MUTATING = {"snapshot", "apply_patch", "package", "init_project", "write_reports",
+MUTATING = {"snapshot", "apply_patch", "package", "init_project", "archive_project", "write_reports",
             "create_backup", "refresh_index", "task_start", "task_merge", "setup_env",
             "archive_artifacts", "publish_branch"}
 
@@ -372,6 +373,10 @@ def validate(op: str, args: dict | None) -> dict:
                 raise OpError("bad_arg", "template_files: больше 512 КБ")
             files[_str(rel, "path", 400)] = content
         clean["template_files"] = files
+        return clean
+
+    if op == "archive_project":
+        clean["label"] = _str(args.get("label"), "label", 64)
         return clean
 
     if op == "snapshot":

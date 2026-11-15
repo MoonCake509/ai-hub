@@ -1142,6 +1142,32 @@ async def project_job_run(project_id: str, job_id: str) -> dict:
 ARCHIVE_DIR_NAME = "Archive"
 
 
+async def _archive_on_host(project_id: str, host_id: str, workdir: str) -> dict:
+    """Переносит папку проекта в архив силами воркера хоста (не сервера).
+
+    Хаб видит только серверный диск, поэтому папка проекта на ноутбуке
+    архивируется операцией archive_project на самом хосте.
+    """
+    try:
+        created = await asyncio.to_thread(
+            workspace.create_op_job, "archive_project", {"root": workdir},
+            host_id, project_id, None, 120)
+    except workspace.OpError as exc:
+        return {"moved": False, "error": exc.message}
+    job_id = created["job"]["id"]
+    for _ in range(90):
+        res = await asyncio.to_thread(workspace.job_result, job_id)
+        status = (res or {}).get("status")
+        if status in ("succeeded", "failed", "cancelled", "expired"):
+            receipt = (res or {}).get("result") or {}
+            if status == "succeeded" and receipt.get("moved"):
+                return {"moved": True, "archived_to": str(receipt.get("archived_to") or "")}
+            return {"moved": False,
+                    "error": str((res or {}).get("error") or receipt.get("error") or status)}
+        await asyncio.sleep(1)
+    return {"moved": False, "error": "воркер не ответил за 90 с"}
+
+
 @app.delete("/projects/{project_id}", dependencies=[Depends(require_token)])
 async def project_delete(project_id: str) -> dict:
     """Удаляет проект из хаба, а его папку переносит в архив на сервере (без стирания)."""
@@ -1164,6 +1190,18 @@ async def project_delete(project_id: str) -> dict:
             archived_to = WORKSPACE_MAP[0][0] + "\\" + ARCHIVE_DIR_NAME + "\\" + os.path.basename(target)
         except OSError as exc:
             raise HTTPException(status_code=409, detail=f"не удалось перенести папку в архив: {exc}")
+    if not moved:
+        host_id = str(project.get("host_id") or "server")
+        workdir = str(project.get("workdir") or "")
+        if host_id != "server" and workdir:
+            remote = await _archive_on_host(project_id, host_id, workdir)
+            if not remote.get("moved"):
+                raise HTTPException(
+                    status_code=409,
+                    detail="не удалось перенести папку в архив на хосте "
+                           f"{host_id}: {remote.get('error') or 'неизвестная ошибка'}")
+            moved = True
+            archived_to = str(remote.get("archived_to") or "")
     deleted = await asyncio.to_thread(db.delete_project, project_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="project not found")

@@ -33,7 +33,7 @@ import time
 import uuid
 import zipfile
 
-OPS = ["init_project", "write_reports", "create_backup", "refresh_index", "task_start", "verify_task", "task_merge", "setup_env",
+OPS = ["init_project", "archive_project", "write_reports", "create_backup", "refresh_index", "task_start", "verify_task", "task_merge", "setup_env",
        "archive_artifacts", "publish_branch",
        "search_git", "read_at", "describe_files", "inspect", "snapshot", "list_files", "read_files",
        "apply_patch", "run_checks", "package", "semantic_index", "semantic_embed",
@@ -400,6 +400,37 @@ def op_init_project(root: str, args: dict) -> dict:
 REPORTS_MAX_FILES = 40
 REPORTS_MAX_BYTES = 512 * 1024
 
+
+def op_archive_project(root: str, args: dict) -> dict:
+    """Переносит рабочую папку проекта в архив рядом с корнем проектов.
+
+    Удаление проекта не должно стирать файлы: папка целиком уезжает в
+    <корень>/Archive/<имя>-<метка времени> и остаётся доступной.
+    """
+    import shutil
+    import time as _time
+
+    source = os.path.realpath(root)
+    if not os.path.isdir(source):
+        raise OpFail("not_found", f"нет рабочей папки: {source}")
+    base = os.path.basename(source.rstrip("\\/")) or "project"
+    parent = os.path.dirname(source)
+    if not parent or os.path.realpath(parent) == source:
+        raise OpFail("bad_path", "не удалось определить корень проектов")
+    archive_root = os.path.join(parent, "Archive")
+    if os.path.realpath(archive_root) == source:
+        raise OpFail("bad_path", "сам архив переносить нельзя")
+    os.makedirs(archive_root, exist_ok=True)
+    stamp = _time.strftime("%Y%m%d-%H%M%S")
+    target = os.path.join(archive_root, f"{base}-{stamp}")
+    if os.path.exists(target):
+        target = os.path.join(archive_root, f"{base}-{stamp}-{int(_time.time()) % 1000:03d}")
+    try:
+        shutil.move(source, target)
+    except OSError as exc:
+        raise OpFail("archive_failed", f"не удалось перенести папку в архив: {exc}")
+    return {"moved": True, "archived_to": target, "name": base,
+            "archive_root": archive_root}
 
 def op_write_reports(root: str, args: dict) -> dict:
     """Записать живые отчёты проекта (ops/): журнал и черновики PR.
@@ -1895,6 +1926,7 @@ def op_verify_evidence(root: str, args: dict) -> dict:
 
 HANDLERS = {
     "init_project": op_init_project,
+    "archive_project": op_archive_project,
     "write_reports": op_write_reports,
     "create_backup": op_create_backup,
     "refresh_index": op_refresh_index,

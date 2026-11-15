@@ -7,6 +7,11 @@
 
 agents:
   - id: codex
+    # Вход Codex живёт на ноутбуке (подписка ChatGPT). Серверный Codex не
+    # авторизован и падал на Responses WebSocket — оставляем карточку ради
+    # истории, но запуск запрещён. Рабочий Codex — codex-laptop.
+    enabled: false
+    disabled_reason: "серверный Codex не авторизован: вход только на ноутбуке, используйте Codex CLI (ноутбук)"
     default_profile: openai
     supports_workdir: true
     profiles:

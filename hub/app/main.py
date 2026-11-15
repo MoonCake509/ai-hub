@@ -2190,6 +2190,13 @@ async def conversation_send(conversation_id: str, request: Request) -> JSONRespo
             "active_image_source": (snapshot.get("active_image") or {}).get("source"),
             "active_image_reused": (snapshot.get("active_image") or {}).get("reused", False),
         })
+    if item.get("enabled") is False:
+        # Отключённый агент остаётся в реестре ради истории, но запускать его
+        # нельзя: иначе роль тихо шлёт задание в мёртвый канал и владелец видит
+        # «ошибка» без причины.
+        why = (item.get("disabled_reason") or item.get("notes") or "").strip()
+        raise HTTPException(status_code=409,
+                            detail=f"agent '{agent_id}' отключён" + (f": {why}" if why else ""))
     workdir_advisory = None
     if (item.get("transport") != "http" and project.get("workdir")
             and not capabilities.get("supports_workdir")):

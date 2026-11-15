@@ -1227,6 +1227,10 @@ function wsRenderConversations(){
   const button=el('button','conv'+(isActive?' active':''));button.type='button';
   button.title=wsConversationTitle(conversation);button.setAttribute('aria-current',isActive?'true':'false');
   button.append(el('span','chat-glyph','◇'),el('span','conv-text',wsConversationTitle(conversation)));
+  const del=el('span','conv-del','×');del.setAttribute('role','button');del.setAttribute('aria-label','Удалить чат «'+wsConversationTitle(conversation)+'»');del.title='Удалить чат';
+  del.onclick=e=>{e.stopPropagation();wsDeleteConversation(conversation)};
+  del.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();e.stopPropagation();wsDeleteConversation(conversation)}};
+  button.append(del);
   button.onclick=action(()=>wsOpenConversation(conversation));box.append(button)
  };
  if(pinned)add(pinned);
@@ -1237,6 +1241,7 @@ function wsRenderConversations(){
  if(current&&typeof current.scrollIntoView==='function')current.scrollIntoView({block:'nearest'});
 }
 async function wsOpenConversation(conversation){WS.conv=conversation;storeSet(conversationStorageKey(),conversation.id);WS.messages=[];WS.pending=null;if(conversation.role_id&&ROLE_META[conversation.role_id])WS.roleId=conversation.role_id;wsRenderConversations();renderRoles();await wsEditRole(WS.roleId);await wsLoadMessages();$('#chat-input').focus()}
+async function wsDeleteConversation(conversation){const title=wsConversationTitle(conversation);if(!window.confirm('Удалить чат «'+title+'»?\n\nСообщения чата будут удалены, незавершённые задания чата отменены.'))return;const wasActive=WS.conv?.id===conversation.id;try{await api('/conversations/'+conversation.id+'?project_id='+(WS.project?.id||''),{method:'DELETE',timeout:15000});WS.convs=WS.convs.filter(item=>item.id!==conversation.id);if(wasActive){WS.conv=null;WS.messages=[];delete localStorage[conversationStorageKey()];const fresh=WS.convs[0];if(fresh)await wsOpenConversation(fresh);else{wsRenderConversations();wsLoadMessages()}}else wsRenderConversations();delete WS.convSignature;toast('Чат удалён')}catch(error){toast('Не удалось удалить чат: '+(error.message||error),true)}}
 async function wsNewConversation(){if(!WS.project)throw Error('Сначала создайте или выберите проект.');const projectId=WS.project.id,button=$('#conv-new');button.disabled=true;try{const conversation=await api('/projects/'+projectId+'/conversations',{method:'POST',body:JSON.stringify({role_id:WS.roleId,title:'Новый чат'})});if(WS.project?.id!==projectId)return;WS.convFilter='';const filterBox=$('#conv-filter');if(filterBox)filterBox.value='';WS.convCursor='';WS.convHasMore=false;WS.convTotal=0;delete WS.convSignature;await wsLoadConversations({reset:true});if(WS.project?.id!==projectId)return;WS.conv=conversation;WS.convs=[conversation,...WS.convs.filter(item=>item.id!==conversation.id)];storeSet(conversationStorageKey(),conversation.id);WS.messages=[];WS.pending=null;if(conversation.role_id&&ROLE_META[conversation.role_id])WS.roleId=conversation.role_id;wsRenderConversations();renderRoles();await wsEditRole(WS.roleId);await wsLoadMessages();wsStartPolling();$('#chat-input').focus();toast('Новый чат создан')}finally{button.disabled=false}}
 
 function wsIsImageAttachment(attachment){return attachment?.kind==='image'||/^image\/(png|jpeg)$/i.test(attachment?.mime||'')}

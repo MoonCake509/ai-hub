@@ -1783,6 +1783,22 @@ async def conversation_get(conversation_id: str) -> dict:
     return conv
 
 
+@app.delete("/conversations/{conversation_id}", dependencies=[Depends(require_token)])
+async def conversation_delete(conversation_id: str, project_id: str = "") -> dict:
+    """Удаляет чат и его сообщения. Задачи чата в очереди отменяются.
+
+    project_id передаётся интерфейсом как защита: чат другого проекта не
+    удалится, даже если id угадан.
+    """
+    conv = await asyncio.to_thread(db.get_conversation, conversation_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    if project_id and conv.get("project_id") != project_id:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    await asyncio.to_thread(db.delete_conversation, conversation_id, conv.get("project_id") or "")
+    return {"deleted": conversation_id}
+
+
 @app.get("/conversations/{conversation_id}/messages", dependencies=[Depends(require_token)])
 async def conversation_messages(conversation_id: str, limit: int = 200) -> dict:
     if not await asyncio.to_thread(db.get_conversation, conversation_id):

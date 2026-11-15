@@ -1888,6 +1888,29 @@ def create_conversation(project_id: str, role_id: str = "", title: str = "") -> 
         return {"id": cid, "project_id": project_id, "role_id": role_id, "title": title}
 
 
+def delete_conversation(conversation_id: str, project_id: str = "") -> bool:
+    """Удаляет чат и его сообщения (FK ON DELETE CASCADE).
+
+    project_id — защита от удаления чата другого проекта. Висящие в очереди
+    задания чата отменяем, чтобы воркер не взял работу по удалённому чату;
+    завершённые задания (история) не трогаем.
+    """
+    with _lock:
+        conn = connect()
+        row = _one(conn, _qualify(
+            "select id, project_id from aihub.conversations where id = :c"), c=conversation_id)
+        if not row:
+            return False
+        if project_id and row.get("project_id") != project_id:
+            return False
+        conn.run(_qualify(
+            "update aihub.jobs set status = 'cancelled' where conversation_id = :c"
+            " and status = 'queued'"), c=conversation_id)
+        conn.run(_qualify(
+            "delete from aihub.conversations where id = :c"), c=conversation_id)
+        return True
+
+
 def pipeline_conversation(project_id: str, role_id: str) -> dict:
     """Один служебный чат роли на проект, куда падают задачи конвейера и ответы."""
     title = "Конвейер · " + ROLE_LABELS.get(role_id, role_id)

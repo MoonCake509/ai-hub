@@ -49,6 +49,10 @@
 .convs-list .conv{width:100%;max-width:none;flex:0 0 auto;min-height:34px}
 .conv-text{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .conv-more{flex:0 0 auto;margin-top:2px}
+.conv-del{flex:0 0 auto;margin-left:auto;align-self:center;width:18px;height:18px;display:grid;place-items:center;border-radius:5px;font-size:13px;line-height:1;color:var(--faint);opacity:0;transition:opacity .12s ease,background .12s ease,color .12s ease;cursor:pointer}
+.conv:hover .conv-del,.conv:focus-within .conv-del,.conv.active .conv-del,.conv-del:focus-visible{opacity:1}
+.conv-del:hover,.conv-del:focus-visible{background:#3d242c;color:var(--red)}
+@media(hover:none){.conv-del{opacity:.55}}
 .sidebar-bottom{flex:0 0 auto}
 @media(max-width:900px){.workspace-sidebar{overflow:visible}.sidebar-projects{max-height:none}.convs-list{max-height:240px}}
 @media(max-width:600px){.convs-list{max-height:200px;flex-wrap:nowrap}}
@@ -119,7 +123,7 @@
 .chat-context{transition:border-color .18s ease,background .18s ease,box-shadow .18s ease}.chat-context.is-drop-target{border-color:var(--accent);background:#1b3037;box-shadow:0 0 0 3px #83c8d326,inset 0 0 24px #83c8d312}
 .attachment{animation:file-row-in 260ms cubic-bezier(.22,1.2,.36,1) both}.attachment:nth-child(2){animation-delay:35ms}.attachment:nth-child(3){animation-delay:70ms}.attachment:nth-child(4){animation-delay:105ms}
 @keyframes file-row-in{from{opacity:0;transform:translateY(-5px)}to{opacity:1;transform:translateY(0)}}
-@media(prefers-reduced-motion:reduce){.reasoning-menu{animation:none}.run-step-row.run-step-changed{animation:none}.attachment{animation:none}.role-card,.chat-context{transition:none}}
+@media(prefers-reduced-motion:reduce){.reasoning-menu{animation:none}.run-step-row.run-step-changed{animation:none}.attachment{animation:none}.role-card,.chat-context{transition:none}.conv-del{transition:none}}
 
 
 /* THEME-3: видимая иерархия поверхностей, акцентные зоны, состояние создания проекта */

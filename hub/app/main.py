@@ -1794,7 +1794,11 @@ async def conversation_messages(conversation_id: str, limit: int = 200) -> dict:
 
 
 UPLOAD_DIR_NAME = "Загрузки"
-WORKSPACE_MAP = [("R:\\AIHub", "/workspace")]
+# Корень рабочих данных: по умолчанию R:\AIHub (релиз). Переменная окружения
+# HUB_WORKSPACE_ROOT позволяет поднять тестовый стенд на своей копии данных,
+# не трогая релизную папку (2026-11-15: стенд R:\AIHub-Stand-data).
+_WORKSPACE_ROOT = os.environ.get("HUB_WORKSPACE_ROOT") or "R:\\AIHub"
+WORKSPACE_MAP = [(_WORKSPACE_ROOT, "/workspace")]
 UPLOAD_MAX_BYTES = 25 * 1024 * 1024
 
 

@@ -303,7 +303,9 @@ def worker_heartbeat_payload() -> dict:
         served.append(item)
     return {
         "worker_id": WORKER,
-        "host": platform.node(),
+        # Хост-ярлык хаба, а не имя машины: проекты ссылаются на «laptop»,
+        # а capabilities ищутся по этому же значению.
+        "host": os.environ.get("AIHUB_HOST_ID") or platform.node(),
         "os_user": getpass.getuser(),
         "pid": os.getpid(),
         "protocol": PROTOCOL,

@@ -1931,7 +1931,8 @@ def capabilities() -> dict:
             "workspace_protocol": 3, "workspace_fencing": 1,
             "workspace_effect_journal": 1,
             "isolated_runner_protocol": 1 if isolated_runner_argv() else None,
-            "host": platform.node(), "kinds": ["agent", "workspace"]}
+            "host": os.environ.get("AIHUB_HOST_ID") or platform.node(),
+            "kinds": ["agent", "workspace"]}
 
 
 def run_job(job: dict, fence_check=None, hub_identity: str = "") -> dict:

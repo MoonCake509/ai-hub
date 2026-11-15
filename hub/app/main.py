@@ -2812,6 +2812,16 @@ async def bridge_jobs(worker: str = "", agents: str = "",
             "job": None,
         })
     client_protocol = int(bridge_protocol.version_of(protocol_ver))
+    if not str(host or "").strip() and worker:
+        # Старый воркер не присылает host: берём его из регистрации, иначе
+        # workspace-задание уедет на чужую машину и упадёт с path_unavailable.
+        try:
+            for item in await asyncio.to_thread(workers.list_workers):
+                if item.get("worker_id") == worker:
+                    host = str(item.get("host") or "")
+                    break
+        except Exception:  # noqa: BLE001 — регистрация не критична для аренды
+            host = ""
     leased = await asyncio.to_thread(db.lease_job, worker or "unknown", LEASE_SECONDS, agents,
                                      client_protocol, kinds, host)
     if not leased:

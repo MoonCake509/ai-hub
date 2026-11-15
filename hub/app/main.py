@@ -231,6 +231,24 @@ async def _poll_project_fallbacks() -> None:
             print(f"project job {item['job_id']} fallback failed: {exc}", flush=True)
 
 
+async def _reconcile_prepares() -> None:
+    """Дозакрыть проекты, чья подготовка успела завершиться после таймаута."""
+    rows = await asyncio.to_thread(db.list_stale_prepares)
+    for row in rows:
+        try:
+            data = json.loads(row.get("result_output") or "{}")
+        except ValueError:
+            continue
+        if not isinstance(data, dict) or not data.get("root"):
+            continue
+        await asyncio.to_thread(
+            db.project_prepared, row["project_id"],
+            repo_root=data.get("root"), git_root=data.get("git_root") or data.get("root"),
+            branch=data.get("branch") or "main", head_sha=data.get("head_sha") or "",
+            template_version=data.get("template_version") or "")
+        print(f"project prepare reconciled: {row['project_id']}", flush=True)
+
+
 async def _sweeper() -> None:
     while True:
         await asyncio.sleep(SWEEP_INTERVAL_S)
@@ -241,6 +259,7 @@ async def _sweeper() -> None:
             await asyncio.to_thread(db.sync_project_runs)
             await _schedule_project_jobs()
             await _poll_project_fallbacks()
+            await _reconcile_prepares()
             stale = await asyncio.to_thread(db.fail_stale_queued)
             if stale:
                 print(f"stale queued jobs failed: {stale}", flush=True)

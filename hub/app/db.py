@@ -1681,6 +1681,24 @@ def project_prepared(project_id: str, *, repo_root: str, git_root: str, branch: 
     return get_project(project_id)
 
 
+def list_stale_prepares(limit: int = 20) -> list[dict]:
+    """Проекты, помеченные failed, чья подготовка на самом деле завершилась.
+
+    Ожидание подготовки ограничено по времени: если задание простояло в
+    очереди дольше, карточка получает failed, а папка создаётся позже.
+    Без сверки проект навсегда остаётся «сломанным».
+    """
+    with _lock:
+        conn = connect()
+        rows = _rows(conn, _qualify(
+            "select p.id as project_id, j.id as job_id, j.result_output"
+            " from aihub.projects p"
+            " join aihub.jobs j on j.id = (p.prepare_error->>'job_id')"
+            " where p.status = 'failed' and j.status in ('succeeded', 'done')"
+            " order by p.id limit :l"), l=str(limit))
+    return [dict(r) for r in (rows or [])]
+
+
 def project_prepare_failed(project_id: str, error: dict) -> dict | None:
     """Подготовка не удалась: статус и причина остаются в карточке, папка не удаляется."""
     with _lock:

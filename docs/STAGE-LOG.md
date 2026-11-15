@@ -867,3 +867,11 @@ UI ui15 в браузере: 50 → «ещё» → 100 строк, 100 уник�
 - В реестре появился `codex-laptop` (host `laptop`, тот же Codex CLI и профиль подписки). Воркер на ноутбуке запускается с `AIHUB_AGENTS=codex-laptop` и объявляет только этот id — серверные задания Codex он не забирает.
 - `config/hub.yaml` получил `projects.host_roots`: `server → R:\AIHub\WorkSpace`, `laptop → C:\AIHub\WorkSpace`. Проект создаётся в корне своего хоста; при выдаче задания агенту с другого хоста путь переводится в его локальный корень (`_workdir_for_agent`).
 - Страховка порта: `infra/portproxy-8000.ps1` + задачи `AIHub-Port-8000` (каждые 5 минут) и `AIHub-Port-8000-Logon` — правило 8000 → WSL:8090 переживает смену IP WSL-машины.
+
+## 16.11.2026 — Codex с ноутбука: сквозной прогон закрыт
+
+- Проект «Codex Ноутбук» (host `laptop`) подготовлен воркером: `C:\AIHub\WorkSpace\codex-noutbuk`, есть `repo/` и `ops/`.
+- Причина отказа подготовки: воркер регистрировался именем машины (`DESKTOP-BHMJN55`), а хаб искал capabilities по ярлыку `laptop`. Исправлено: `AIHUB_HOST_ID`.
+- Причина работы не в папке проекта: диспетчер сравнивал `agent_id == "codex"`, `codex-laptop` попадал в общую ветку без cwd. Исправлено: ветка по разрешённому алиасу.
+- Прогон 1: `pwd = C:\AIHub\WorkSpace\codex-noutbuk`, первая строка `repo/README.md` — `# Codex Ноутбук`, 54,7 с, 70 665/261 токенов.
+- Прогон 2 (запись): Codex создал `ops/laptop-check.md`; хаб прочитал файл с ноутбука отдельной workspace-операцией `read_files` — `AIHUB-LAPTOP-OK-1547`, sha256 `3c550b78…`, 60,9 с, 73 447/275 токенов.

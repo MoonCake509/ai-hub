@@ -303,7 +303,9 @@ def read_token() -> str:
         with open(TOKEN_FILE, encoding="utf-8") as fh:
             return fh.read().strip()
     except OSError:
-        return os.environ.get("BRIDGE_TOKEN", "")
+        # На новом хосте обычно задают только HUB_TOKEN: тот же секрет, что и
+        # у остальных воркеров. Без этого падения воркер получал 401 и молчал.
+        return os.environ.get("BRIDGE_TOKEN") or os.environ.get("HUB_TOKEN", "")
 
 
 TOKEN = read_token()

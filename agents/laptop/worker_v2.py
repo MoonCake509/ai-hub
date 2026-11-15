@@ -54,6 +54,7 @@ POLL_AGENTS = (([a for a in _ALLOWED if a in AGENTS or a in AGENT_ALIASES] or li
                if "agent" in KINDS else []) + (["workspace"] if "workspace" in KINDS else [])
 
 HUB_FILE = os.path.join(HERE, "hub.txt")
+_last_401 = 0.0
 OUTBOX = os.path.join(HERE, "outbox")
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "3"))
 WORKER = os.environ.get("AIHUB_WORKER_NAME") or os.environ.get("COMPUTERNAME", "laptop")
@@ -443,6 +444,16 @@ def main() -> int:
             # Хаб требует другую версию протокола: опрос дальше бессмысленен.
             log(f"hub refused protocol {PROTOCOL}: {str(job.get('detail'))[:200]}")
             time.sleep(max(30.0, POLL_INTERVAL * 10))
+            continue
+        if code == 401:
+            # Токен не принят: регистрации не будет, в /workers воркер не появится.
+            global _last_401
+            now = time.time()
+            if now - _last_401 > 60:
+                _last_401 = now
+                log("hub rejected token (401): задайте BRIDGE_TOKEN (или HUB_TOKEN) тем же "
+                    "значением, что в infra/.env сервера")
+            time.sleep(POLL_INTERVAL)
             continue
         if code != 200:
             time.sleep(POLL_INTERVAL)

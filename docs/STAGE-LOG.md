@@ -925,6 +925,7 @@ UI ui15 в браузере: 50 → «ещё» → 100 строк, 100 уник�
 **Фикс (коммит `c913f07`):** `launch_worker_ws_live.py` (боевой, 8090) и `launch_stand_ws.py` (стенд, 8110) получили `AIHUB_HOST_ID=server` — ярлык хаба, как и ноутбучному. Воркеры перезапущены через `schtasks /run` (`AIHub_Worker_WS`, `AIHub-Stand-WS`).
 
 **Как проверено**
-- Боевой: проект «Первый Тестовый» (host `server`) создан — `init_project` ушёл `succeeded/1`, папка `R:\AIHub\WorkSpace\pervyy-testovyy` появилась.
-- Стенд: E2E `POST /projects` → `init_project succeeded/1` → `DELETE` 200 (папка уехала в `R:\AIHub-Stand-data\Archive`).
-- Воркеры: боевой `WIN-V76QC2G60Q1-live-ws` и стендовый `STAND-live-ws` регистрируются с `host=server` (heartbeat).
+- Боевой: первая попытка «Первый Тестовый» (17:27) честно упала через 15 мин («исполнитель не взял задание за 15 мин — проверьте, запущен ли воркер»), проект удалён владельцем и создан повторно; повторная попытка (job 17:30) дождалась перезапуска воркера и ушла `succeeded/1`, папка `R:\AIHub\WorkSpace\pervyy-testovyy` создана, проект `ready`.
+- Сквозной E2E на боевом: `POST /projects` → job `succeeded/1` → проект `ready` → папка скелет (repo/, ops/) → `DELETE` 200, папка в `R:\AIHub\Archive`.
+- Стенд: то же E2E `POST → init succeeded → DELETE 200` (архив `R:\AIHub-Stand-data\Archive`).
+- Воркеры: боевой `WIN-V76QC2G60Q1-live-ws` и стендовый `STAND-live-ws` регистрируются с `host=server` (heartbeat), держатся задачами `AIHub_Worker_WS` / `AIHub-Stand-WS` (каждые 5 мин, lock отбивает дубли).

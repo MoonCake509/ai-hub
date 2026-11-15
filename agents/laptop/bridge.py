@@ -681,6 +681,10 @@ def run_channel(prompt: str, timeout: int, requested_model: str | None = None,
             "elapsed": round(time.time() - started, 2)}
 
 
+# Агент с локальной копией проектов: тот же Codex, но объявляется отдельным
+# id, чтобы задания серверных проектов не уезжали на ноутбук.
+AGENT_ALIASES = {"codex-laptop": "codex"}
+
 AGENTS = {
     "codex": {
         "name": "Codex CLI (ноутбук)",

@@ -30,7 +30,7 @@ import urllib.request
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-from bridge import AGENTS, TOKEN, _agent_path, codex_model_catalog, log  # noqa: E402
+from bridge import AGENTS, AGENT_ALIASES, TOKEN, _agent_path, codex_model_catalog, log  # noqa: E402
 
 # CORE-02b: управляемые операции рабочего пространства на этом устройстве.
 # Модуль необязателен: без него воркер обслуживает только kind=agent.
@@ -47,7 +47,11 @@ KINDS = [k for k in (["agent"] + (["workspace"] if workspace_host is not None el
          if not _ONLY or k in _ONLY]
 # Служебный агент workspace: хаб адресует ему control-задания, а фильтр
 # аренды отбирает их по списку агентов поллера.
-POLL_AGENTS = (list(AGENTS) if "agent" in KINDS else []) + (["workspace"] if "workspace" in KINDS else [])
+# AIHUB_AGENTS ограничивает набор объявляемых агентов: воркер на ноутбуке
+# объявляет codex-laptop, а не общий codex, и не забирает серверные задания.
+_ALLOWED = [a.strip() for a in os.environ.get("AIHUB_AGENTS", "").split(",") if a.strip()]
+POLL_AGENTS = (([a for a in _ALLOWED if a in AGENTS or a in AGENT_ALIASES] or list(AGENTS))
+               if "agent" in KINDS else []) + (["workspace"] if "workspace" in KINDS else [])
 
 HUB_FILE = os.path.join(HERE, "hub.txt")
 OUTBOX = os.path.join(HERE, "outbox")
@@ -463,7 +467,7 @@ def main() -> int:
             drain_outbox()
             continue
 
-        spec = AGENTS.get(agent_id)
+        spec = AGENTS.get(agent_id) or AGENTS.get(AGENT_ALIASES.get(agent_id, ""))
         if spec is None:
             payload = {"job_id": job_id, "attempt_id": attempt_id, "ok": False,
                        "error": f"unknown agent '{agent_id}'"}

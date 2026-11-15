@@ -47,6 +47,47 @@ agents:
     command: "codex exec --json --skip-git-repo-check"
     notes: "бинаря нет в PATH: AppData/Local/OpenAI/Codex/bin/*/codex.exe; список моделей из ~/.codex/models_cache.json"
 
+  - id: codex-laptop
+    default_profile: openai
+    supports_workdir: true
+    profiles:
+      - id: openai
+        name: OpenAI (подписка Codex)
+        models:
+          - gpt-6.1-sol
+          - gpt-6-astra
+          - gpt-6-chat-thinking
+          - gpt-6.1-terra
+          - gpt-6-sol
+          - gpt-reserve
+          - gpt-6-luna
+          - gpt-5.6-sol
+          - gpt-5.6-terra
+          - gpt-5.6-luna
+    # Уровни Codex CLI (-c model_reasoning_effort). Действуют для всех моделей канала;
+    # каталог воркера, если он есть, остаётся главнее.
+    reasoning:
+      levels: [minimal, low, medium, high, xhigh]
+      default: medium
+    name: Codex CLI (ноутбук)
+    model_selection: true
+    transport: cli
+    host: laptop
+    configured: true
+    capabilities:
+      text: {supported: true, evidence: "catalog"}
+      patch: {supported: true, evidence: "fixture:core02b-apply-patch"}
+      workdir: {supported: true, evidence: "fixture:core02b-live"}
+      commands: {supported: true, evidence: "fixture:core02b-live"}
+      usage: {supported: true, evidence: "catalog"}
+      streaming: {supported: false, evidence: "catalog", reason: "CLI отдаёт финальный JSON; поток в работе не используется"}
+      stop: {supported: false, evidence: "catalog", reason: "подтверждённая остановка процесса не реализована"}
+      output_control: {supported: true, evidence: "catalog"}
+      thinking: {supported: true, evidence: "catalog", reason: "уровни Codex CLI через -c model_reasoning_effort"}
+    bridge_agent: codex-laptop
+    command: "codex exec --json --skip-git-repo-check"
+    notes: "бинаря нет в PATH: AppData/Local/OpenAI/Codex/bin/*/codex.exe; список моделей из ~/.codex/models_cache.json"
+
   - id: openclaw-laptop
     enabled: false
     model_selection: false

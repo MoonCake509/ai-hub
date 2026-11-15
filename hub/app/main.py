@@ -1207,6 +1207,34 @@ _TRANSLIT = str.maketrans({
 })
 
 
+def _host_roots() -> dict[str, str]:
+    """Корень проектов на каждом хосте: server — R:, ноутбук — его C:."""
+    try:
+        with open(workspace.CONFIG_FILE, encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+        projects_cfg = (data.get("projects") or {}) if isinstance(data, dict) else {}
+        roots = {str(k): str(v) for k, v in (projects_cfg.get("host_roots") or {}).items()}
+        if projects_cfg.get("root"):
+            roots.setdefault(DEFAULT_PROJECT_HOST, str(projects_cfg["root"]))
+        return roots
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def _workdir_for_agent(project: dict, agent: dict) -> str:
+    """Путь проекта в системе того хоста, где реально работает агент."""
+    path = str(project.get("workdir") or "")
+    src = str(project.get("host_id") or DEFAULT_PROJECT_HOST)
+    dst = str(agent.get("host") or "")
+    if not path or not dst or dst == src:
+        return path
+    roots = _host_roots()
+    src_root, dst_root = roots.get(src, ""), roots.get(dst, "")
+    if src_root and dst_root and path.lower().startswith(src_root.lower()):
+        return dst_root + path[len(src_root):]
+    return path
+
+
 def _project_dir_name(name: str, project_id: str) -> str:
     """Папка проекта = его название (safe-slug, кириллица транслитерируется)."""
     slug = re.sub(r"[^a-z0-9]+", "-", str(name or "").lower().translate(_TRANSLIT)).strip("-")[:48]
@@ -1508,8 +1536,11 @@ async def project_create(request: Request) -> dict:
     name = (payload.get("name") or "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="name is required")
-    # Решение владельца: выбор устройства убран, все проекты создаются на сервере.
-    host_id = DEFAULT_PROJECT_HOST
+    # По умолчанию проект создаётся на сервере; другой хост допустим только
+    # если для него задан корень в hub.yaml (например, ноутбук с C:\AIHub).
+    host_id = (payload.get("host_id") or DEFAULT_PROJECT_HOST).strip() or DEFAULT_PROJECT_HOST
+    if host_id not in _host_roots():
+        raise HTTPException(status_code=400, detail=f"unknown host '{host_id}'")
     settings = payload.get("settings") or {}
     if not isinstance(settings, dict):
         raise HTTPException(status_code=400, detail="settings must be an object")
@@ -1527,7 +1558,7 @@ async def project_create(request: Request) -> dict:
 
     project_id = uuid.uuid4().hex
     # Единое рабочее пространство: путь не выбирается и не принимается из формы.
-    root = await asyncio.to_thread(workspace.projects_root)
+    root = _host_roots().get(host_id) or await asyncio.to_thread(workspace.projects_root)
     workdir = ntpath.join(root, _project_dir_name(name, project_id))
     if await asyncio.to_thread(db.project_by_workdir, workdir):
         workdir = ntpath.join(root, f"{ntpath.basename(workdir)}-{project_id[:6]}")
@@ -2251,7 +2282,7 @@ async def conversation_send(conversation_id: str, request: Request) -> JSONRespo
         "project_name": project.get("name"),
         "conversation_title": conversation_title,
         "host_id": item.get("host") if item.get("transport") == "http" else project.get("host_id"),
-        "workdir": None if item.get("transport") == "http" else project.get("workdir"),
+        "workdir": None if item.get("transport") == "http" else _workdir_for_agent(project, item),
         "project_host_id": project.get("host_id"),
         "project_workdir": project.get("workdir"),
         "role_id": role.get("role_id") or (payload.get("role_id") or ""),

@@ -267,8 +267,8 @@ body{background:
 .channel-card-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap}
 .channel-card-title{font-size:13px;font-weight:600;letter-spacing:-.01em}
 .channel-card-url{font-family:Consolas,monospace;font-size:10px;color:var(--faint);overflow-wrap:anywhere;margin-top:3px}
-.channel-models{display:flex;flex-wrap:wrap;gap:5px}
-.channel-model{font-size:10px;padding:3px 7px;border-radius:6px;background:#1b2f3a;color:#b7e3ea;border:1px solid #2f4d5a}
+.channel-models{display:flex;flex-wrap:wrap;gap:5px;max-height:92px;overflow-y:auto}
+.channel-model{font-size:10px;padding:3px 7px;border-radius:6px;background:#1b2f3a;color:#b7e3ea;border:1px solid #2f4d5a;white-space:nowrap}
 .channel-meta{display:flex;flex-wrap:wrap;gap:10px;font-size:10px;color:var(--muted)}
 .channel-meta b{color:var(--text);font-weight:500}
 .channel-actions{display:flex;flex-wrap:wrap;gap:7px;align-items:center}

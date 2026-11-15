@@ -373,6 +373,73 @@ def probe(channel_id: str, model: str | None = None) -> dict:
     return result
 
 
+# Текстовый подмножество каталога: медиа (видео/голос/изображения/embeddings)
+# в выбор модели роли не попадают — та же конвенция, что при раскрытии каталогов.
+_MEDIA_MODEL_RE = re.compile(
+    r"(image|imagine|veo|kling|seedance|viduq|chirp|voice|omni-edit|"
+    r"nano-banana|768p|flash-preview|embedding|wan-3)", re.I)
+
+
+def models_endpoint(base_url: str) -> str:
+    base = normalize_base_url(base_url).rstrip("/")
+    if base.endswith("/models"):
+        return base
+    if base.endswith("/chat/completions"):
+        base = base[: -len("/chat/completions")]
+    return base + "/models"
+
+
+def refresh_models(channel_id: str, timeout: int = 25) -> dict:
+    """Перечитывает живой каталог провайдера (/v1/models), оставляет текстовые
+    модели и обновляет список канала. Ручные/дефолтные модели идут первыми.
+    """
+    row = _row(channel_id)
+    if not row:
+        raise KeyError(channel_id)
+    key = decrypt(row.get("api_key") or "")
+    if not key:
+        raise ValueError("ключ канала не найден — введите его заново")
+    stored = row.get("models") or []
+    if isinstance(stored, str):
+        stored = json.loads(stored)
+    url = models_endpoint(row.get("base_url") or "")
+    try:
+        response = httpx.get(url, headers={"Authorization": f"Bearer {key}"},
+                             timeout=httpx.Timeout(connect=15.0, read=timeout,
+                                                   write=15.0, pool=15.0))
+    except httpx.TimeoutException:
+        raise RuntimeError("провайдер не ответил на запрос каталога моделей") from None
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"сетевая ошибка: {exc}") from None
+    if response.status_code >= 400:
+        raise RuntimeError("провайдер не отдал каталог: " + _error_text(response))
+    try:
+        data = response.json()
+    except ValueError:
+        raise RuntimeError("провайдер вернул не JSON") from None
+    items = data.get("data", data if isinstance(data, list) else [])
+    ids: list[str] = []
+    for m in items:
+        mid = (m.get("id") if isinstance(m, dict) else m)
+        if isinstance(mid, str) and mid.strip():
+            ids.append(mid.strip())
+    live_text = [i for i in ids if not _MEDIA_MODEL_RE.search(i)]
+    if not live_text:
+        raise RuntimeError("провайдер не сообщил ни одной текстовой модели")
+    merged: list[str] = []
+    for m in stored:
+        m = str(m).strip()
+        if m and m not in merged:
+            merged.append(m)
+    for m in live_text:
+        if m not in merged:
+            merged.append(m)
+    updated = update(channel_id, models=merged)
+    return {"channel_id": channel_id, "live_total": len(ids),
+            "text_total": len(live_text), "models": updated["models"],
+            "checked_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+
+
 def agent_dict(row: dict) -> dict:
     view = public(row)
     cid = view["id"]

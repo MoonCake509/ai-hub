@@ -1840,10 +1840,14 @@ function channelsRender() {
     const testButton = el('button', 'ghost', 'Проверить');
     testButton.type = 'button';
     testButton.onclick = () => channelsTest(item.id, testButton);
+    const modelsButton = el('button', 'ghost', 'Обновить модели');
+    modelsButton.type = 'button';
+    modelsButton.title = 'Прочитать живой каталог провайдера (/v1/models) и дополнить список';
+    modelsButton.onclick = () => channelsRefreshModels(item.id, modelsButton);
     const deleteButton = el('button', 'ghost danger', 'Отключить');
     deleteButton.type = 'button';
     deleteButton.onclick = () => channelsDelete(item);
-    actions.append(testButton, deleteButton);
+    actions.append(testButton, modelsButton, deleteButton);
     card.append(actions);
 
     const block = channelTestBlock(test);
@@ -1885,6 +1889,27 @@ async function channelsTest(id, button) {
     toast('Проверка не прошла: ' + error.message, true);
     button.disabled = false;
     button.textContent = label;
+  }
+}
+
+async function channelsRefreshModels(id, button) {
+  const label = button.textContent;
+  button.disabled = true;
+  button.textContent = 'Читаю каталог…';
+  try {
+    const data = await api('/channels/' + encodeURIComponent(id) + '/refresh-models',
+      { method: 'POST', body: JSON.stringify({}), timeout: 60000 });
+    const item = Channels.items.find(row => row.id === id);
+    if (item) item.models = data.models || [];
+    WS.profiles.delete('channel:' + id);
+    channelsRender();
+    await loadAgents();
+    if (WS.roleId) await wsEditRole(WS.roleId);
+    toast('Каталог обновлён: ' + (data.models || []).length + ' моделей ' +
+      '(у провайдера ' + (data.text_total || 0) + ' текстовых)');
+  } catch (error) {
+    toast('Не удалось обновить каталог: ' + (error.message || error), true);
+    channelsRender();
   }
 }
 

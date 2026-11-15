@@ -505,6 +505,19 @@ async def channels_test(channel_id: str, request: Request) -> dict:
     return {"test": result}
 
 
+@app.post("/channels/{channel_id}/refresh-models", dependencies=[Depends(require_token)])
+async def channels_refresh_models(channel_id: str) -> dict:
+    """Перечитывает живой каталог провайдера (/v1/models) и обновляет список
+    моделей канала (только текстовые). Ключ не покидает хаб."""
+    try:
+        result = await asyncio.to_thread(channels.refresh_models, channel_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="channel not found") from None
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    return result
+
+
 @app.post("/channels/{channel_id}/chat", dependencies=[Depends(require_token)])
 async def channels_chat(channel_id: str, request: Request) -> dict:
     """Вызов модели канала. Ключ не покидает хаб; ошибка провайдера — как есть."""
@@ -556,8 +569,19 @@ async def agent_profiles(agent_id: str) -> dict:
     item = find_agent(agent_id)
     if item is None:
         raise HTTPException(status_code=404, detail=f"agent '{agent_id}' not found")
-    prof = AGENT_PROFILES.get(agent_id) or {"profiles": item.get("profiles") or [],
-                                            "default_profile": item.get("default_profile") or ""}
+    # API-каналы — данные из БД (список моделей меняется по «Обновить модели»),
+    # кэш при старте для них не годится.
+    if agent_id.startswith("channel:"):
+        prof = {
+            "agent_id": agent_id,
+            "model_selection": bool(item.get("model_selection")),
+            "model_selection_reason": item.get("model_selection_reason"),
+            "profiles": item.get("profiles") or [],
+            "default_profile": item.get("default_profile") or "",
+        }
+    else:
+        prof = AGENT_PROFILES.get(agent_id) or {"profiles": item.get("profiles") or [],
+                                                "default_profile": item.get("default_profile") or ""}
     observed = await asyncio.to_thread(observations.evaluate_one, item, None, VERSION)
     described = await asyncio.to_thread(capabilities.describe, item)
     return {
@@ -644,7 +668,13 @@ async def quality_suites() -> dict:
 
 @app.get("/quality/channels", dependencies=[Depends(require_token)])
 async def quality_channels() -> dict:
-    return {"channels": quality.channel_catalog(AGENT_PROFILES, load_agents().get("agents", []))}
+    agents = load_agents().get("agents", [])
+    profiles = {**AGENT_PROFILES, **{
+        a["id"]: {"agent_id": a["id"], "profiles": a.get("profiles") or [],
+                  "default_profile": a.get("default_profile") or ""}
+        for a in agents if str(a.get("id") or "").startswith("channel:")
+    }}
+    return {"channels": quality.channel_catalog(profiles, agents)}
 
 
 @app.patch("/quality/channels", dependencies=[Depends(require_token)])
@@ -661,7 +691,13 @@ async def quality_update_channel(request: Request) -> dict:
     channel_id = _quality_text(payload, "channel_id")
     requested_agent = _quality_text(payload, "agent_id")
     if channel_id:
-        available = quality.channel_catalog(AGENT_PROFILES, load_agents().get("agents", []))
+        agents = load_agents().get("agents", [])
+        profiles = {**AGENT_PROFILES, **{
+            a["id"]: {"agent_id": a["id"], "profiles": a.get("profiles") or [],
+                      "default_profile": a.get("default_profile") or ""}
+            for a in agents if str(a.get("id") or "").startswith("channel:")
+        }}
+        available = quality.channel_catalog(profiles, agents)
         target = next((item for item in available if item["channel_id"] == channel_id), None)
     elif requested_agent:
         item, profile, model = _resolve_quality_channel(
@@ -940,7 +976,11 @@ async def run_agent(agent_id: str, request: Request) -> JSONResponse:
             status_code=400,
             detail=f"agent '{agent_id}' does not support model selection yet; "
                    "адаптер пока игнорирует выбор провайдера/модели")
-    prof = AGENT_PROFILES.get(agent_id) or {}
+    prof = (
+        {"profiles": item.get("profiles") or [], "default_profile": item.get("default_profile") or ""}
+        if agent_id.startswith("channel:")
+        else (AGENT_PROFILES.get(agent_id) or {})
+    )
     known_profiles = prof.get("profiles") or []
     default_profile = prof.get("default_profile") or ""
     if not requested_profile:
@@ -1701,10 +1741,15 @@ async def role_update(project_id: str, role_id: str, request: Request) -> dict:
         selected_agent = find_agent(str(agent_id or (await asyncio.to_thread(db.get_role, project_id, role_id) or {}).get("agent_id", "")))
         if not selected_agent or not selected_agent.get("model_selection"):
             raise HTTPException(status_code=400, detail="selected agent does not support profile/model selection")
-        prof = AGENT_PROFILES.get(selected_agent["id"]) or {
-            "profiles": selected_agent.get("profiles") or [],
-            "default_profile": selected_agent.get("default_profile") or "",
-        }
+        prof = (
+            {"profiles": selected_agent.get("profiles") or [],
+             "default_profile": selected_agent.get("default_profile") or ""}
+            if selected_agent["id"].startswith("channel:")
+            else (AGENT_PROFILES.get(selected_agent["id"]) or {
+                "profiles": selected_agent.get("profiles") or [],
+                "default_profile": selected_agent.get("default_profile") or "",
+            })
+        )
         profile = payload.get("profile") or prof.get("default_profile") or ""
         spec = next((p for p in prof.get("profiles", []) if p.get("id") == profile), None)
         if profile and spec is None:
@@ -2038,10 +2083,14 @@ def _resolve_chat_target(payload: dict, project: dict) -> tuple[dict, dict, str,
 
 def _validate_chat_profile(item: dict, agent_id: str, profile: str, model: str | None) -> tuple[str, str | None]:
     """Валидация профиля/модели как в /run: дефолты из реестра, несовместимое — 400."""
-    prof = AGENT_PROFILES.get(agent_id) or {
-        "profiles": item.get("profiles") or [],
-        "default_profile": item.get("default_profile") or "",
-    }
+    prof = (
+        {"profiles": item.get("profiles") or [], "default_profile": item.get("default_profile") or ""}
+        if agent_id.startswith("channel:")
+        else (AGENT_PROFILES.get(agent_id) or {
+            "profiles": item.get("profiles") or [],
+            "default_profile": item.get("default_profile") or "",
+        })
+    )
     known_profiles = prof.get("profiles") or []
     default_profile = prof.get("default_profile") or ""
     if not profile:
@@ -2062,7 +2111,11 @@ def _validate_chat_profile(item: dict, agent_id: str, profile: str, model: str |
 
 
 def _model_capabilities(item: dict, agent_id: str, profile: str, model: str | None) -> dict:
-    profiles = (AGENT_PROFILES.get(agent_id) or {}).get("profiles") or item.get("profiles") or []
+    profiles = (
+        (item.get("profiles") or [])
+        if agent_id.startswith("channel:")
+        else ((AGENT_PROFILES.get(agent_id) or {}).get("profiles") or item.get("profiles") or [])
+    )
     profile_spec = next((p for p in profiles if p.get("id") == profile), {})
     model_spec = (profile_spec.get("model_capabilities") or {}).get(model) or {}
     defaults = {

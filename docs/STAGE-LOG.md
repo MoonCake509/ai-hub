@@ -929,3 +929,21 @@ UI ui15 в браузере: 50 → «ещё» → 100 строк, 100 уник�
 - Сквозной E2E на боевом: `POST /projects` → job `succeeded/1` → проект `ready` → папка скелет (repo/, ops/) → `DELETE` 200, папка в `R:\AIHub\Archive`.
 - Стенд: то же E2E `POST → init succeeded → DELETE 200` (архив `R:\AIHub-Stand-data\Archive`).
 - Воркеры: боевой `WIN-V76QC2G60Q1-live-ws` и стендовый `STAND-live-ws` регистрируются с `host=server` (heartbeat), держатся задачами `AIHub_Worker_WS` / `AIHub-Stand-WS` (каждые 5 мин, lock отбивает дубли).
+
+## 15.11.2026 — Полный прокручиваемый список моделей для API-каналов (Router.cheap)
+
+**Симптом:** при выборе подключённого API-канала `Router.cheap` (`channel:00d7e25910b54c47b4057f4c3e793fd5`) и его провайдера в списке моделей отображались только 2 модели (`deepseek-v4.1-flash-1017`, `qwen3.8-27b`), которые были указаны вручную при создании канала.
+
+**Причина**
+- В `aihub.channels.models` хранился только статический снимок, введённый при подключении, без догрузки живого каталога `/v1/models` провайдера.
+- Дополнительно `main.py` в `/agent-profiles/{agent_id}`, `/agents/{agent_id}/run`, `/quality/channels`, `/projects/{project_id}/roles/{role_id}`, `_validate_chat_profile` и `_model_capabilities` читал кэш `AGENT_PROFILES` со старта контейнера вместо свежих данных БД канала.
+
+**Сделано**
+- `hub/app/channels.py`: добавлены `_MEDIA_MODEL_RE`, `models_endpoint(base_url)` и `refresh_models(channel_id, timeout=25)` — хаб с серверным ключом запрашивает `GET {base_url}/models`, отфильтровывает медиа-модели, сохраняет ручные/текущие первыми и обновляет `aihub.channels.models`.
+- `hub/app/main.py`: добавлен `POST /channels/{channel_id}/refresh-models`; для `agent_id` с префиксом `channel:` во всех путях чтения и валидации профилей/моделей отключён устаревающий кэш `AGENT_PROFILES` в пользу актуального `find_agent(...)`.
+- `web/app.js` и `web/styles.css`: на карточку канала добавлена кнопка «Обновить модели» (`channelsRefreshModels`), сбрасывается клиентский кэш `WS.profiles`, обновляются список агентов и открытый редактор роли; блоку чипов `.channel-models` задана прокрутка (`max-height: 92px; overflow-y: auto`).
+
+**Как проверено**
+- Боевой (`8090`) и стенд (`8110`): `POST /channels/00d7e25910b54c47b4057f4c3e793fd5/refresh-models` → HTTP 200, `live_total=78`, `text_total=50`, `models=50`.
+- `GET /agent-profiles/channel:00d7e259...`, `GET /agents` и `GET /quality/channels` на обоих контурах возвращают все 50 текстовых моделей.
+- Браузер на стенде (`8110`) и боевом (`8090`): на вкладке «Каналы» отображаются 50 чипов с прокруткой (`scrollHeight=191 > clientHeight=92`, `overflowY=auto`), клик по «Обновить модели» выводит toast «Каталог обновлён: 50 моделей (у провайдера 50 текстовых)»; в редакторе роли (`#role-model`) и форме запуска (`#run-model`) доступны все 50 моделей.

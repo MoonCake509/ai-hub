@@ -487,8 +487,13 @@ def validate(op: str, args: dict | None) -> dict:
     raise OpError("unknown_op", f"неизвестная операция: {op}")
 
 
-def allowed_roots(host_id: str, project_id: str | None = None) -> list[str]:
-    """Разрешённые корни этого host: рабочие каталоги его проектов."""
+def allowed_roots(host_id: str, project_id: str | None = None, op: str = "") -> list[str]:
+    """Разрешённые корни этого host: рабочие каталоги его проектов.
+
+    archive_project дополнительно получает корень архива: папку проекта
+    переносят внутрь <корень проектов>/Archive, и операция должна иметь
+    право видеть и исходный корень, и место назначения.
+    """
     roots = []
     for proj in db.list_projects():
         if proj.get("host_id") != host_id:
@@ -499,9 +504,17 @@ def allowed_roots(host_id: str, project_id: str | None = None) -> list[str]:
         if not workdir:
             continue
         try:
-            roots.append(canon(workdir))
+            root = canon(workdir)
         except OpError:
             continue
+        roots.append(root)
+        if op == "archive_project":
+            parent = os.path.dirname(root)
+            if parent and parent != root:
+                try:
+                    roots.append(canon(os.path.join(parent, "Archive")))
+                except OpError:
+                    pass
     return roots
 
 
@@ -660,7 +673,7 @@ def create_op_job(op: str, args: dict, host_id: str, project_id: str | None = No
     if op not in supported:
         raise OpError("unsupported_op",
                       f"host {host} не объявил операцию {op} (capabilities: {supported or 'нет'})")
-    roots = allowed_roots(host, project_id)
+    roots = allowed_roots(host, project_id, op)
     if not roots:
         raise OpError("no_roots", f"у host {host} нет проектов с рабочим каталогом")
     if not any(is_within(root, clean["root"]) for root in roots):

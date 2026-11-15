@@ -1153,7 +1153,7 @@ async def _archive_on_host(project_id: str, host_id: str, workdir: str) -> dict:
             workspace.create_op_job, "archive_project", {"root": workdir},
             host_id, project_id, None, 120)
     except workspace.OpError as exc:
-        return {"moved": False, "error": exc.message}
+        return {"moved": False, "error": str(exc)}
     job_id = created["job"]["id"]
     for _ in range(90):
         res = await asyncio.to_thread(workspace.job_result, job_id)

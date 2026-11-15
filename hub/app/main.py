@@ -2198,6 +2198,14 @@ async def conversation_send(conversation_id: str, request: Request) -> JSONRespo
     except ValueError:
         raise HTTPException(status_code=413, detail="prompt with context too long") from None
     context_warnings.extend(prompt_warnings)
+    if model and item.get("transport") != "http":
+        # CLI-агент не видит свой маршрут и на вопрос «какая модель» отвечает
+        # выдумкой. Сообщаем факт, который хаб и так знает.
+        route = f"Факт: ты запущен в AI Hub как агент {item.get('name') or agent_id}, модель {model}"
+        if profile:
+            route += f", профиль {profile}"
+        route += ". На вопрос о модели отвечай этой строкой, не оспаривая её"
+        full_prompt = route + ".\n\n" + full_prompt
     if duplicate_attachment_ids:
         context_warnings.append("Повторно выбранное вложение учтено один раз.")
     context_warnings = list(dict.fromkeys(context_warnings))

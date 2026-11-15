@@ -7,9 +7,20 @@
 
 agents:
   - id: codex
-    default_profile: openai
+    default_profile: router-cheap
     supports_workdir: true
     profiles:
+      - id: router-cheap
+        name: Router.cheap (API)
+        native_provider: router.cheap
+        models:
+          - deepseek-v4.1-flash-1017
+          - claude-fable-5
+          - claude-fable-5-1
+          - claude-haiku-5-5
+          - glm-5.3
+          - kimi-k3
+          - grok-4.7
       - id: openai
         name: OpenAI (подписка Codex)
         models:

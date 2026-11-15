@@ -344,11 +344,14 @@ def run_codex(prompt: str, timeout: int, requested_model: str | None = None,
               model: str | None = None, workdir: str | None = None,
               reasoning_effort: str | None = None) -> dict:
     # Модель применяется флагом конкретного запуска, а не правкой глобального конфига.
-    if requested_profile and requested_profile != "openai":
+    # Профиль роли выбирает провайдера на один запуск: подписка OpenAI либо
+    # API-провайдер из ~/.codex/config.toml. Глобальный конфиг не переписываем.
+    provider = {"openai": None, "router-cheap": "routercheap"}.get(requested_profile or "openai", "?")
+    if provider == "?":
         # Older callers passed workdir as the fourth positional argument.
         if cwd is None and os.path.isdir(requested_profile):
             cwd = requested_profile
-            requested_profile = None
+            requested_profile, provider = None, None
         else:
             raise ValueError(f"Codex profile '{requested_profile}' is not selectable by this adapter")
     cmd = [resolve_codex_exe(), "exec", "--json", "--skip-git-repo-check"]
@@ -356,6 +359,8 @@ def run_codex(prompt: str, timeout: int, requested_model: str | None = None,
     requested_model = requested_model if requested_model is not None else model
     cwd = cwd if cwd is not None else workdir
     model = requested_model
+    if provider:
+        cmd += ["-c", f'model_provider="{provider}"']
     if model:
         cmd += ["-m", model]
     # Уровень рассуждения — на один этот вызов, глобальный конфиг не трогаем.

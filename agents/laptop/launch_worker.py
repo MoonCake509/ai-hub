@@ -19,15 +19,6 @@ if STAND.is_file():
         if line.startswith("TEST_HUB_TOKEN="):
             token = line.split("=", 1)[1].strip()
 
-# Ключи провайдеров для CLI-агентов (Codex/Qwen) берём из окружения Hermes:
-# воркер не должен зависеть от того, что кто-то вручную выставил их в сессии.
-_HERMES_ENV = Path(os.path.expanduser(r"~\AppData\Local\hermes\.env"))
-if _HERMES_ENV.is_file():
-    for _line in _HERMES_ENV.read_text(encoding="utf-8", errors="replace").splitlines():
-        if _line.startswith(("ROUTER_CHEAP_API_KEY=", "PISHNYE_AI_RU_API_KEY=", "CLAUDEHUB_API_KEY=")):
-            _k, _v = _line.split("=", 1)
-            os.environ.setdefault(_k.strip(), _v.strip().strip('"'))
-
 os.environ.update({
     "HUB_URL": "http://127.0.0.1:8102",
     "HUB_TOKEN": token,
